@@ -1,8 +1,10 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import asyncio
 import json
 import os
 import random
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -11,12 +13,12 @@ from contextlib import ExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Annotated, Any, Optional, Sequence
 
 import click
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from loguru import logger
@@ -29,14 +31,25 @@ from mineru.cli.api_client import (
     LOCAL_API_STARTUP_TIMEOUT_SECONDS,
     TASK_RESULT_TIMEOUT_SECONDS,
     TASK_STATUS_POLL_INTERVAL_SECONDS,
+    build_managed_process_popen_kwargs,
     build_http_timeout,
+    build_result_download_timeout,
     find_free_port,
     normalize_base_url,
+    stop_managed_process,
     strip_local_api_network_args,
     response_detail,
 )
 from mineru.cli.api_protocol import API_PROTOCOL_VERSION
+from mineru.cli.api_request import ParseRequestOptions, parse_request_form
 from mineru.cli.common import normalize_upload_filename
+from mineru.cli.public_http_client_policy import (
+    configure_public_http_client_policy,
+    is_public_bind_host,
+    validate_public_http_client_request,
+    warn_if_public_http_client_policy as _warn_if_public_http_client_policy,
+)
+from mineru.cli.vlm_preload import build_local_api_cli_args
 from mineru.version import __version__
 
 TASK_PENDING = "pending"
@@ -59,7 +72,10 @@ LOCAL_GPU_NONE = "none"
 HTTP_RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 UPSTREAM_FAILURE_THRESHOLD = 3
 WORKER_REFRESH_INTERVAL_SECONDS = 2.0
+WORKER_HEALTH_FAILURE_RESTART_THRESHOLD = 5
 MIN_HEALTHY_PROCESSING_WINDOW_SIZE = 1
+MINERU_ROUTER_PUBLIC_BIND_EXPOSED_ENV = "MINERU_ROUTER_PUBLIC_BIND_EXPOSED"
+MINERU_ROUTER_ALLOW_PUBLIC_HTTP_CLIENT_ENV = "MINERU_ROUTER_ALLOW_PUBLIC_HTTP_CLIENT"
 
 
 def utc_now_iso() -> str:
@@ -116,6 +132,14 @@ def is_task_terminal(status: str) -> bool:
     return status in TASK_TERMINAL_STATES
 
 
+def warn_if_public_http_client_policy(host: str, allow_public_http_client: bool) -> None:
+    _warn_if_public_http_client_policy(
+        service_name="router",
+        host=host,
+        allow_public_http_client=allow_public_http_client,
+    )
+
+
 def cleanup_path(path: str) -> None:
     try:
         if os.path.isfile(path):
@@ -168,15 +192,63 @@ def resolve_connect_host(host: str) -> str:
     return host
 
 
-def detect_visible_cuda_devices() -> list[str]:
-    configured_visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
-    if configured_visible_devices is not None:
-        return [
-            item.strip()
-            for item in configured_visible_devices.split(",")
-            if item.strip()
-        ]
+def reserve_unique_local_ports(count: int) -> list[int]:
+    """一次性占用并释放多个本地端口，降低并行启动 worker 时的端口重复风险。"""
+    if count <= 0:
+        return []
 
+    sockets: list[socket.socket] = []
+    try:
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            sockets.append(sock)
+        return [int(sock.getsockname()[1]) for sock in sockets]
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def normalize_local_device_type(device: str | None) -> str:
+    """将 get_device() 返回值规范化为基础设备类型。"""
+    if not device:
+        return "cuda"
+    return str(device).strip().lower().split(":", 1)[0]
+
+
+def get_local_device_type() -> str:
+    """懒加载读取当前设备类型，避免 router 导入阶段提前加载 torch。"""
+    try:
+        from mineru.utils.config_reader import get_device
+
+        return normalize_local_device_type(get_device())
+    except Exception as exc:
+        logger.warning("Failed to resolve local device type, fallback to cuda: {}", exc)
+        return "cuda"
+
+
+def get_local_device_visible_env_name() -> str:
+    """根据当前设备类型选择本地 worker 的可见设备环境变量。"""
+    if get_local_device_type() == "npu":
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    return "CUDA_VISIBLE_DEVICES"
+
+
+def _parse_visible_devices_env(env_name: str) -> list[str] | None:
+    """解析显式配置的可见设备列表，未配置时返回 None。"""
+    configured_visible_devices = os.getenv(env_name)
+    if configured_visible_devices is None:
+        return None
+    return [
+        item.strip()
+        for item in configured_visible_devices.split(",")
+        if item.strip()
+    ]
+
+
+def _detect_cuda_devices() -> list[str]:
+    """自动探测当前 CUDA 可见设备编号。"""
     try:
         import torch  # type: ignore
     except ImportError:
@@ -186,12 +258,35 @@ def detect_visible_cuda_devices() -> list[str]:
     return [str(index) for index in range(torch.cuda.device_count())]
 
 
+def _detect_npu_devices() -> list[str]:
+    """自动探测当前 Ascend NPU 可见设备编号。"""
+    try:
+        import torch_npu  # type: ignore
+    except ImportError:
+        return []
+    if not torch_npu.npu.is_available():
+        return []
+    return [str(index) for index in range(torch_npu.npu.device_count())]
+
+
+def detect_visible_local_devices() -> list[str]:
+    """探测当前设备类型对应的可见本地设备编号。"""
+    visible_devices_env_name = get_local_device_visible_env_name()
+    configured_visible_devices = _parse_visible_devices_env(visible_devices_env_name)
+    if configured_visible_devices is not None:
+        return configured_visible_devices
+
+    if visible_devices_env_name == "ASCEND_RT_VISIBLE_DEVICES":
+        return _detect_npu_devices()
+    return _detect_cuda_devices()
+
+
 def parse_local_gpus(local_gpus: str) -> list[str | None]:
     value = local_gpus.strip().lower()
     if value == LOCAL_GPU_NONE:
         return []
     if value == LOCAL_GPU_AUTO:
-        detected = detect_visible_cuda_devices()
+        detected = detect_visible_local_devices()
         if detected:
             return detected
         return [None]
@@ -210,6 +305,7 @@ class RouterSettings:
     upstream_urls: tuple[str, ...] = ()
     local_gpus: str = LOCAL_GPU_AUTO
     worker_host: str = "127.0.0.1"
+    enable_vlm_preload: bool = False
     worker_extra_args: tuple[str, ...] = ()
     task_retention_seconds: int = DEFAULT_TASK_RETENTION_SECONDS
     task_cleanup_interval_seconds: int = DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS
@@ -221,6 +317,10 @@ class RouterSettings:
             upstream_urls=parse_json_env("MINERU_ROUTER_UPSTREAM_URLS_JSON"),
             local_gpus=os.getenv("MINERU_ROUTER_LOCAL_GPUS", LOCAL_GPU_AUTO),
             worker_host=os.getenv("MINERU_ROUTER_WORKER_HOST", "127.0.0.1"),
+            enable_vlm_preload=env_flag_enabled(
+                "MINERU_ROUTER_ENABLE_VLM_PRELOAD",
+                default=False,
+            ),
             worker_extra_args=parse_json_env("MINERU_ROUTER_WORKER_ARGS_JSON"),
             task_retention_seconds=get_task_retention_seconds(),
             task_cleanup_interval_seconds=get_task_cleanup_interval_seconds(),
@@ -290,10 +390,12 @@ class ManagedLocalServer:
     server_id: str
     worker_host: str
     gpu: str | None
+    enable_vlm_preload: bool
     extra_cli_args: tuple[str, ...]
     connect_host: str = field(init=False)
     base_url: str | None = None
     process: subprocess.Popen[bytes] | None = None
+    process_group_id: int | None = None
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
 
     def __post_init__(self) -> None:
@@ -302,7 +404,7 @@ class ManagedLocalServer:
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
-    async def start(self, client: httpx.AsyncClient) -> None:
+    async def start(self, client: httpx.AsyncClient, port: int | None = None) -> None:
         if self.is_running():
             return
 
@@ -310,14 +412,18 @@ class ManagedLocalServer:
         output_root = Path(self.temp_dir.name) / "output"
         output_root.mkdir(parents=True, exist_ok=True)
 
-        resolved_port = find_free_port()
+        resolved_port = port if port is not None else find_free_port()
         remaining_cli_args = strip_local_api_network_args(self.extra_cli_args)
+        worker_cli_args = build_local_api_cli_args(
+            remaining_cli_args,
+            enable_vlm_preload=self.enable_vlm_preload,
+        )
         self.base_url = f"http://{self.connect_host}:{resolved_port}"
         env = os.environ.copy()
         env["MINERU_API_OUTPUT_ROOT"] = str(output_root)
         env["MINERU_API_DISABLE_ACCESS_LOG"] = "1"
         if self.gpu is not None:
-            env["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
+            env[get_local_device_visible_env_name()] = str(self.gpu)
 
         command = [
             sys.executable,
@@ -327,9 +433,15 @@ class ManagedLocalServer:
             self.worker_host,
             "--port",
             str(resolved_port),
-            *remaining_cli_args,
+            *worker_cli_args,
         ]
-        self.process = subprocess.Popen(command, cwd=os.getcwd(), env=env)
+        self.process = subprocess.Popen(
+            command,
+            cwd=os.getcwd(),
+            env=env,
+            **build_managed_process_popen_kwargs(),
+        )
+        self.process_group_id = self.process.pid
 
         try:
             await self.wait_until_ready(client)
@@ -368,15 +480,17 @@ class ManagedLocalServer:
 
     def stop(self) -> None:
         process = self.process
+        process_group_id = self.process_group_id
         self.process = None
+        self.process_group_id = None
         try:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
+            if process is not None or process_group_id is not None:
+                stop_managed_process(
+                    process,
+                    process_group_id=process_group_id,
+                    shutdown_timeout_seconds=5,
+                    use_stdin_shutdown_watcher=False,
+                )
         finally:
             temp_dir = self.temp_dir
             self.temp_dir = None
@@ -463,6 +577,7 @@ class WorkerPool:
                 server_id=server_id,
                 worker_host=self.settings.worker_host,
                 gpu=gpu,
+                enable_vlm_preload=self.settings.enable_vlm_preload,
                 extra_cli_args=self.settings.worker_extra_args,
             )
             self._servers[server_id] = WorkerState(
@@ -478,20 +593,32 @@ class WorkerPool:
         return list(self._servers.values())
 
     async def start(self) -> None:
-        for server in self.servers:
-            if server.local_server is None:
-                continue
-            try:
-                await server.local_server.start(self.client)
-                server.base_url = normalize_base_url(server.local_server.base_url or "")
-            except Exception as exc:
-                server.healthy = False
-                server.last_error = str(exc)
-                server.last_checked_at = utc_now_iso()
+        local_servers = [
+            server for server in self.servers if server.local_server is not None
+        ]
+        local_ports = reserve_unique_local_ports(len(local_servers))
+        await asyncio.gather(
+            *(
+                self._start_local_server(server, port)
+                for server, port in zip(local_servers, local_ports)
+            )
+        )
 
         await self.refresh_all()
         if self._monitor_task is None or self._monitor_task.done():
             self._monitor_task = asyncio.create_task(self._monitor_loop(), name="mineru-router-worker-monitor")
+
+    async def _start_local_server(self, server: WorkerState, port: int) -> None:
+        """启动单个本地 worker，并把启动失败限制在该 worker 状态内。"""
+        if server.local_server is None:
+            return
+        try:
+            await server.local_server.start(self.client, port=port)
+            server.base_url = normalize_base_url(server.local_server.base_url or "")
+        except Exception as exc:
+            server.healthy = False
+            server.last_error = str(exc)
+            server.last_checked_at = utc_now_iso()
 
     async def shutdown(self) -> None:
         if self._monitor_task is not None:
@@ -576,7 +703,11 @@ class WorkerPool:
             server.last_error = str(exc)
             server.last_checked_at = utc_now_iso()
             server.consecutive_health_failures += 1
-            if server.local_server is not None and server.consecutive_health_failures >= 2:
+            if (
+                server.local_server is not None
+                and server.consecutive_health_failures
+                >= WORKER_HEALTH_FAILURE_RESTART_THRESHOLD
+            ):
                 await self._restart_local_server(server)
             return
 
@@ -585,7 +716,11 @@ class WorkerPool:
             server.healthy = False
             server.last_error = response_detail(response)
             server.consecutive_health_failures += 1
-            if server.local_server is not None and server.consecutive_health_failures >= 2:
+            if (
+                server.local_server is not None
+                and server.consecutive_health_failures
+                >= WORKER_HEALTH_FAILURE_RESTART_THRESHOLD
+            ):
                 await self._restart_local_server(server)
             return
 
@@ -596,7 +731,11 @@ class WorkerPool:
             server.healthy = False
             server.last_error = f"Invalid health payload: {exc}"
             server.consecutive_health_failures += 1
-            if server.local_server is not None and server.consecutive_health_failures >= 2:
+            if (
+                server.local_server is not None
+                and server.consecutive_health_failures
+                >= WORKER_HEALTH_FAILURE_RESTART_THRESHOLD
+            ):
                 await self._restart_local_server(server)
             return
 
@@ -834,6 +973,63 @@ class RouterTaskRegistry:
         return (now - completed_at).total_seconds() >= self.task_retention_seconds
 
 
+def warn_if_router_preload_ignored(settings: RouterSettings) -> None:
+    if settings.enable_vlm_preload and not parse_local_gpus(settings.local_gpus):
+        logger.warning(
+            "Ignoring --enable-vlm-preload because mineru-router is not launching any local mineru-api workers."
+        )
+
+
+async def startup_router_state(app: FastAPI, settings: RouterSettings) -> None:
+    http_client = httpx.AsyncClient(
+        timeout=build_http_timeout(),
+        follow_redirects=True,
+    )
+    worker_pool = WorkerPool(settings, http_client)
+    registry = RouterTaskRegistry(
+        task_retention_seconds=settings.task_retention_seconds,
+        cleanup_interval_seconds=settings.task_cleanup_interval_seconds,
+    )
+
+    try:
+        await registry.start()
+        await worker_pool.start()
+        healthy, payload = worker_pool.health_payload()
+        if not healthy:
+            raise RuntimeError(
+                payload.get(
+                    "error",
+                    "No healthy upstream MinerU API servers are available",
+                )
+            )
+    except Exception:
+        await registry.shutdown()
+        await worker_pool.shutdown()
+        await http_client.aclose()
+        raise
+
+    app.state.http_client = http_client
+    app.state.worker_pool = worker_pool
+    app.state.router_task_registry = registry
+
+
+async def shutdown_router_state(app: FastAPI) -> None:
+    registry = getattr(app.state, "router_task_registry", None)
+    worker_pool = getattr(app.state, "worker_pool", None)
+    http_client = getattr(app.state, "http_client", None)
+
+    if registry is not None:
+        await registry.shutdown()
+    if worker_pool is not None:
+        await worker_pool.shutdown()
+    if http_client is not None:
+        await http_client.aclose()
+
+    app.state.router_task_registry = None
+    app.state.worker_pool = None
+    app.state.http_client = None
+
+
 class UpstreamSubmissionUnavailable(RuntimeError):
     pass
 
@@ -980,6 +1176,16 @@ async def submit_router_task(
     request: Request,
     payload: MultipartPayload,
 ) -> RouterTaskRecord:
+    validate_public_http_client_request(
+        public_bind_exposed=bool(
+            getattr(request.app.state, "public_bind_exposed", False)
+        ),
+        allow_public_http_client=bool(
+            getattr(request.app.state, "allow_public_http_client", False)
+        ),
+        backend=payload.get_field_value("backend") or "",
+        server_url=payload.get_field_value("server_url"),
+    )
     worker_pool: WorkerPool = request.app.state.worker_pool
     registry: RouterTaskRegistry = request.app.state.router_task_registry
     attempted_servers: set[str] = set()
@@ -1033,7 +1239,6 @@ async def fetch_router_task_status(
     registry: RouterTaskRegistry = request.app.state.router_task_registry
     client: httpx.AsyncClient = request.app.state.http_client
     url = f"{task.upstream_base_url}{TASKS_ENDPOINT}/{task.upstream_task_id}"
-    print('====================url===================',url)
     try:
         response = await client.get(url)
     except httpx.HTTPError as exc:
@@ -1093,7 +1298,11 @@ async def proxy_router_task_result(
     result_url = f"{task.upstream_base_url}{TASKS_ENDPOINT}/{task.upstream_task_id}/result"
     try:
         upstream_response = await client.send(
-            client.build_request("GET", result_url),
+            client.build_request(
+                "GET",
+                result_url,
+                timeout=build_result_download_timeout(),
+            ),
             stream=True,
         )
     except httpx.HTTPError as exc:
@@ -1144,7 +1353,11 @@ async def build_sync_router_task_result_response(
     result_url = f"{task.upstream_base_url}{TASKS_ENDPOINT}/{task.upstream_task_id}/result"
     try:
         upstream_response = await client.send(
-            client.build_request("GET", result_url),
+            client.build_request(
+                "GET",
+                result_url,
+                timeout=build_result_download_timeout(),
+            ),
             stream=True,
         )
     except httpx.HTTPError as exc:
@@ -1217,26 +1430,11 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        http_client = httpx.AsyncClient(
-            timeout=build_http_timeout(),
-            follow_redirects=True,
-        )
-        worker_pool = WorkerPool(resolved_settings, http_client)
-        registry = RouterTaskRegistry(
-            task_retention_seconds=resolved_settings.task_retention_seconds,
-            cleanup_interval_seconds=resolved_settings.task_cleanup_interval_seconds,
-        )
-        await registry.start()
-        await worker_pool.start()
-        app.state.http_client = http_client
-        app.state.worker_pool = worker_pool
-        app.state.router_task_registry = registry
+        await startup_router_state(app, resolved_settings)
         try:
             yield
         finally:
-            await registry.shutdown()
-            await worker_pool.shutdown()
-            await http_client.aclose()
+            await shutdown_router_state(app)
 
     app = FastAPI(
         openapi_url="/openapi.json" if enable_docs else None,
@@ -1245,10 +1443,35 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.router_settings = resolved_settings
+    configure_public_http_client_policy(
+        app,
+        public_bind_exposed=env_flag_enabled(
+            MINERU_ROUTER_PUBLIC_BIND_EXPOSED_ENV,
+            default=False,
+        ),
+        allow_public_http_client=env_flag_enabled(
+            MINERU_ROUTER_ALLOW_PUBLIC_HTTP_CLIENT_ENV,
+            default=False,
+        ),
+    )
     app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-    @app.post(path="/tasks", status_code=202)
-    async def submit_parse_task(http_request: Request):
+    @app.post(
+        path="/tasks",
+        status_code=202,
+        summary="Submit an asynchronous parse task through the router",
+        description=(
+            "Submit files and parse options to a healthy upstream MinerU API "
+            "server selected by the router, then return a router task id."
+        ),
+    )
+    async def submit_parse_task(
+        http_request: Request,
+        request_options: Annotated[
+            ParseRequestOptions, Depends(parse_request_form)
+        ],
+    ):
+        del request_options
         payload = await stage_multipart_request(http_request)
         try:
             router_task = await submit_router_task(http_request, payload)
@@ -1293,8 +1516,23 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             )
         return await proxy_router_task_result(request, task)
 
-    @app.post(path="/file_parse", status_code=200)
-    async def file_parse(request: Request):
+    @app.post(
+        path="/file_parse",
+        status_code=200,
+        summary="Synchronously parse uploaded files through the router",
+        description=(
+            "Submit files and parse options to a healthy upstream MinerU API "
+            "server selected by the router, wait for completion, and proxy the "
+            "final result in the same response."
+        ),
+    )
+    async def file_parse(
+        request: Request,
+        request_options: Annotated[
+            ParseRequestOptions, Depends(parse_request_form)
+        ],
+    ):
+        del request_options
         payload = await stage_multipart_request(request)
         try:
             router_task = await submit_router_task(request, payload)
@@ -1335,6 +1573,14 @@ app = create_app()
 @click.option("--port", default=8002, type=int, help="Server port (default: 8002)")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development mode)")
 @click.option(
+    "--allow-public-http-client",
+    is_flag=True,
+    help=(
+        "Allow *-http-client backends and server_url even when binding the router "
+        "to 0.0.0.0 or ::."
+    ),
+)
+@click.option(
     "--upstream-url",
     "upstream_urls",
     multiple=True,
@@ -1350,27 +1596,54 @@ app = create_app()
     default="127.0.0.1",
     help="Host for router-managed mineru-api workers (default: 127.0.0.1).",
 )
+@click.option(
+    "--enable-vlm-preload",
+    "enable_vlm_preload",
+    type=bool,
+    default=False,
+    help="Preload the local VLM model in router-managed mineru-api workers.",
+)
 def main(
     ctx: click.Context,
     host: str,
     port: int,
     reload: bool,
+    allow_public_http_client: bool,
     upstream_urls: tuple[str, ...],
     local_gpus: str,
     worker_host: str,
+    enable_vlm_preload: bool,
 ):
     settings = RouterSettings(
         upstream_urls=tuple(upstream_urls),
         local_gpus=local_gpus,
         worker_host=worker_host,
+        enable_vlm_preload=enable_vlm_preload,
         worker_extra_args=tuple(ctx.args),
         task_retention_seconds=get_task_retention_seconds(),
         task_cleanup_interval_seconds=get_task_cleanup_interval_seconds(),
     )
+    public_bind_exposed = is_public_bind_host(host)
+    warn_if_router_preload_ignored(settings)
+    configure_public_http_client_policy(
+        app,
+        public_bind_exposed=public_bind_exposed,
+        allow_public_http_client=allow_public_http_client,
+    )
     os.environ["MINERU_ROUTER_UPSTREAM_URLS_JSON"] = json.dumps(list(settings.upstream_urls))
     os.environ["MINERU_ROUTER_LOCAL_GPUS"] = settings.local_gpus
     os.environ["MINERU_ROUTER_WORKER_HOST"] = settings.worker_host
+    os.environ["MINERU_ROUTER_ENABLE_VLM_PRELOAD"] = (
+        "1" if settings.enable_vlm_preload else "0"
+    )
     os.environ["MINERU_ROUTER_WORKER_ARGS_JSON"] = json.dumps(list(settings.worker_extra_args))
+    os.environ[MINERU_ROUTER_PUBLIC_BIND_EXPOSED_ENV] = (
+        "1" if public_bind_exposed else "0"
+    )
+    os.environ[MINERU_ROUTER_ALLOW_PUBLIC_HTTP_CLIENT_ENV] = (
+        "1" if allow_public_http_client else "0"
+    )
+    warn_if_public_http_client_policy(host, allow_public_http_client)
 
     access_log = not env_flag_enabled("MINERU_API_DISABLE_ACCESS_LOG")
     print(f"Start MinerU Router Service: http://{host}:{port}")

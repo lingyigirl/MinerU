@@ -1,3 +1,4 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import math
 import os
 import time
@@ -183,7 +184,7 @@ def clean_memory(device='cuda'):
     if str(device).startswith("cuda"):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+            # torch.cuda.ipc_collect()
     elif str(device).startswith("npu"):
         if torch_npu.npu.is_available():
             torch_npu.npu.empty_cache()

@@ -30,6 +30,8 @@ from mineru.utils.pdfium_guard import (
 
 from mineru.version import __version__
 from mineru.cli.common import (
+    HybridDependencyError,
+    ensure_backend_dependencies,
     image_suffixes,
     office_suffixes,
     pdf_suffixes,
@@ -620,6 +622,7 @@ def build_request_form_data(
     server_url: Optional[str],
     start_page_id: int,
     end_page_id: Optional[int],
+    image_analysis: bool = True,
 ) -> dict[str, str | list[str]]:
     return _api_client.build_parse_request_form_data(
         lang_list=[lang],
@@ -627,6 +630,7 @@ def build_request_form_data(
         parse_method=method,
         formula_enable=formula_enable,
         table_enable=table_enable,
+        image_analysis=image_analysis,
         server_url=server_url,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
@@ -841,12 +845,18 @@ async def run_orchestrated_cli(
     end_page_id: Optional[int],
     formula_enable: bool,
     table_enable: bool,
+    image_analysis: bool = True,
     extra_cli_args: tuple[str, ...] = (),
 ) -> None:
     if start_page_id < 0:
         raise click.ClickException("--start must be greater than or equal to 0")
     if end_page_id is not None and end_page_id < 0:
         raise click.ClickException("--end must be greater than or equal to 0")
+    if api_url is None:
+        try:
+            ensure_backend_dependencies(backend)
+        except HybridDependencyError as exc:
+            raise click.ClickException(str(exc)) from exc
 
     output_dir.mkdir(parents=True, exist_ok=True)
     documents = collect_input_documents(
@@ -902,6 +912,7 @@ async def run_orchestrated_cli(
                 method=method,
                 formula_enable=formula_enable,
                 table_enable=table_enable,
+                image_analysis=image_analysis,
                 server_url=server_url,
                 start_page_id=start_page_id,
                 end_page_id=end_page_id,
@@ -953,7 +964,7 @@ async def run_orchestrated_cli(
     "input_path",
     type=click.Path(exists=True, path_type=Path),
     required=True,
-    help="local filepath or directory. support pdf, png, jpg, jpeg files",
+    help="local filepath or directory. support pdf, image, docx, pptx, xlsx files",
 )
 @click.option(
     "-o",
@@ -1081,6 +1092,13 @@ async def run_orchestrated_cli(
     default=True,
     help="Enable table parsing. Default is True. ",
 )
+@click.option(
+    "--image-analysis",
+    "image_analysis",
+    type=bool,
+    default=True,
+    help="Enable image/chart analysis for VLM and hybrid backends. Default is True. ",
+)
 def main(
     ctx: click.Context,
     input_path: Path,
@@ -1094,6 +1112,7 @@ def main(
     end_page_id: Optional[int],
     formula_enable: bool,
     table_enable: bool,
+    image_analysis: bool,
 ) -> None:
     asyncio.run(
         run_orchestrated_cli(
@@ -1108,6 +1127,7 @@ def main(
             end_page_id=end_page_id,
             formula_enable=formula_enable,
             table_enable=table_enable,
+            image_analysis=image_analysis,
             extra_cli_args=tuple(ctx.args),
         )
     )

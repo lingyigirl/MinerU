@@ -1,3 +1,4 @@
+# Copyright (c) Opendatalab. All rights reserved.
 from typing import BinaryIO
 
 from mineru.model.docx.docx_converter import DocxConverter
@@ -34,7 +35,7 @@ if __name__ == "__main__":
 
     script_path = Path(__file__).resolve()
     project_root = find_project_root(script_path.parent)
-    default_docx = project_root / "demo" / "docx" / "demo5.docx"
+    default_docx = project_root / "demo" / "docx" / "demo1.docx"
 
     parser = argparse.ArgumentParser(
         description="Convert a DOCX file to internal JSON representation"
@@ -43,7 +44,7 @@ if __name__ == "__main__":
         "docx",
         nargs="?",
         default=str(default_docx),
-        help="path to the .docx file to convert (defaults to demo/docx/demo5.docx)"
+        help="path to the .docx file to convert (defaults to demo/docx/demo1.docx)"
     )
     args = parser.parse_args()
 

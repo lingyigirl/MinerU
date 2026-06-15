@@ -1,3 +1,4 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import argparse
 import colorsys
 import hashlib
@@ -890,7 +891,7 @@ class PPDocLayoutV2LayoutModel:
         weight: str,
         device: Optional[str] = "cuda",
         imgsz: Tuple[int, int] = DEFAULT_IMAGE_SIZE,
-        conf: float = 0.5,
+        conf: float = 0.45,
         use_paddlex_filter_boxes: bool = True,
     ):
         self.device = device
@@ -949,32 +950,27 @@ class PPDocLayoutV2LayoutModel:
         outputs: PPDocLayoutV2ForObjectDetectionOutput,
         target_sizes: Sequence[Tuple[int, int]],
     ) -> List[Dict[str, torch.Tensor]]:
-        # 1. 从模型输出里拿出 预测框 + 分类得分 + 顺序预测
-        boxes = outputs.pred_boxes # 原始框 (相对坐标)
-        logits = outputs.logits # 分类得分
-        order_logits = outputs.order_logits # 阅读顺序
+        boxes = outputs.pred_boxes
+        logits = outputs.logits
+        order_logits = outputs.order_logits
         order_seqs = self._get_order_seqs(order_logits)
-        # 2. 把模型输出的 (中心x,中心y,宽,高) → 转成 (x1,y1,x2,y2)
+
         box_centers, box_dims = torch.split(boxes, 2, dim=-1)
-        boxes = torch.cat([
-            box_centers - 0.5 * box_dims # 左上角
-            , box_centers + 0.5 * box_dims  # 右下角
-        ], dim=-1)
-        # 3. 把相对坐标 → 还原成图片真实像素坐标
+        boxes = torch.cat([box_centers - 0.5 * box_dims, box_centers + 0.5 * box_dims], dim=-1)
+
         img_height, img_width = torch.as_tensor(target_sizes, device=boxes.device).unbind(1)
         scale_factor = torch.stack([img_width, img_height, img_width, img_height], dim=1).to(boxes.device)
         boxes = boxes * scale_factor[:, None, :]
-        # 4. 计算置信度（sigmoid）
+
         num_top_queries = logits.shape[1]
         num_classes = logits.shape[2]
         scores = torch.sigmoid(logits)
-        # 5. 拿到最高分的类别
         scores, index = torch.topk(scores.flatten(1), num_top_queries, dim=-1)
         labels = index % num_classes
         index = index // num_classes
         boxes = boxes.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, boxes.shape[-1]))
         order_seqs = order_seqs.gather(dim=1, index=index)
-        # 6. 过滤掉低置信度的框
+
         results = []
         for score, label, box, order_seq in zip(scores, labels, boxes, order_seqs):
             keep = score >= self.conf
@@ -1223,11 +1219,123 @@ class PPDocLayoutV2LayoutModel:
         return boxes
 
     @classmethod
-    def _apply_layout_post_process(cls, boxes: List[Dict]) -> List[Dict]:
+    def _relabel_header_footer_boundary_blocks(
+        cls,
+        boxes: List[Dict],
+        image_size: Optional[Tuple[int, int]] = None,
+    ) -> List[Dict]:
+        """按视觉坐标用页眉/页脚锚点修正边界区域的普通块标签。"""
+        if len(boxes) <= 1:
+            return boxes
+
+        header_labels = {"header", "header_image"}
+        footer_labels = {"footer", "footer_image"}
+        exempt_labels = {"aside_text", "footnote", "number"}
+        ordered_boxes = sorted(boxes, key=lambda box: box["index"])
+        boundary_anchor_ids = {
+            id(box)
+            for box in ordered_boxes
+            if box.get("label") in header_labels or box.get("label") in footer_labels
+        }
+
+        header_anchor = max(
+            (box for box in ordered_boxes if box.get("label") in header_labels),
+            key=lambda box: (box["bbox"][3], box["index"]),
+            default=None,
+        )
+        footer_anchor = min(
+            (box for box in ordered_boxes if box.get("label") in footer_labels),
+            key=lambda box: (box["bbox"][1], box["index"]),
+            default=None,
+        )
+
+        # 先按最后一个页眉锚点的下边界修正，后续页脚修正可覆盖重叠区间。
+        if header_anchor is not None:
+            header_boundary = header_anchor["bbox"][3]
+            for box in ordered_boxes:
+                label = box.get("label")
+                if label in exempt_labels or label in header_labels:
+                    continue
+                if box["bbox"][3] <= header_boundary:
+                    box["label"] = "header"
+                    box["cls_id"] = 12
+
+        if footer_anchor is not None:
+            footer_boundary = footer_anchor["bbox"][1]
+            for box in ordered_boxes:
+                label = box.get("label")
+                if label in exempt_labels or label in footer_labels:
+                    continue
+                if box["bbox"][1] >= footer_boundary:
+                    box["label"] = "footer"
+                    box["cls_id"] = 8
+
+        if image_size is None:
+            return ordered_boxes
+
+        page_height = float(image_size[0])
+        if page_height <= 0:
+            return ordered_boxes
+
+        top_boundary = page_height * 0.3
+        bottom_boundary = page_height * 0.7
+        top_numbers = []
+        bottom_numbers = []
+        for box in ordered_boxes:
+            if box.get("label") != "number":
+                continue
+            y_mid = (float(box["bbox"][1]) + float(box["bbox"][3])) / 2
+            if y_mid <= top_boundary:
+                top_numbers.append(box)
+            elif y_mid >= bottom_boundary:
+                bottom_numbers.append(box)
+
+        top_number_anchor = max(
+            top_numbers,
+            key=lambda box: (box["bbox"][3], box["index"]),
+            default=None,
+        )
+        bottom_number_anchor = min(
+            bottom_numbers,
+            key=lambda box: (box["bbox"][1], box["index"]),
+            default=None,
+        )
+
+        # number 自身不改标签，仅用上下 30% 区域中的 number 作为辅助分割线。
+        if top_number_anchor is not None:
+            header_boundary = top_number_anchor["bbox"][1]
+            for box in ordered_boxes:
+                if id(box) in boundary_anchor_ids or box.get("label") in exempt_labels:
+                    continue
+                if box["bbox"][3] <= header_boundary:
+                    box["label"] = "header"
+                    box["cls_id"] = 12
+
+        if bottom_number_anchor is not None:
+            footer_boundary = bottom_number_anchor["bbox"][3]
+            for box in ordered_boxes:
+                if id(box) in boundary_anchor_ids or box.get("label") in exempt_labels:
+                    continue
+                if box["bbox"][1] >= footer_boundary:
+                    box["label"] = "footer"
+                    box["cls_id"] = 8
+
+        return ordered_boxes
+
+    @classmethod
+    def _apply_layout_post_process(
+        cls,
+        boxes: List[Dict],
+        image_size: Optional[Tuple[int, int]] = None,
+    ) -> List[Dict]:
         processed_boxes = [{**box, "bbox": list(box["bbox"])} for box in boxes]
         processed_boxes = cls._deduplicate_boxes_by_iou(processed_boxes, iou_threshold=0.9)
         processed_boxes = cls._merge_nested_formula_boxes(processed_boxes, overlap_threshold=0.7)
         processed_boxes = cls._relabel_formula_boxes(processed_boxes, overlap_threshold=0.7)
+        processed_boxes = cls._relabel_header_footer_boundary_blocks(
+            processed_boxes,
+            image_size=image_size,
+        )
         return cls._renumber_indices(processed_boxes)
 
     @classmethod
@@ -1317,46 +1425,34 @@ class PPDocLayoutV2LayoutModel:
         batch_size: int = 1,
         use_paddlex_filter_boxes: Optional[bool] = None,
     ) -> List[List[Dict]]:
-        # 1. 如果没有图片，直接返回空
         if len(images) == 0:
             return []
-        # 2. 使用配置里的过滤开关（不用管）
+
         use_paddlex_filter_boxes = (
             self.use_paddlex_filter_boxes
             if use_paddlex_filter_boxes is None
             else use_paddlex_filter_boxes
         )
         results: List[List[Dict]] = []
-        # 3. 关闭梯度计算（推理加速）
         with torch.no_grad():
-            # 进度条
             with tqdm(total=len(images), desc="Layout Predict") as pbar:
-                # 4. 按批次循环
                 for start in range(0, len(images), batch_size):
-                    # 取当前批次图片
                     batch_images = images[start : start + batch_size]
                     pixel_values_list = []
                     target_sizes = []
-                    # 5. 对每张图预处理（转模型输入格式）
                     for image in batch_images:
                         pixel_values, target_size = self._preprocess_single_image(image)
                         pixel_values_list.append(pixel_values)
                         target_sizes.append(target_size)
-                    # 6. 堆叠成 batch 张量，送到 GPU/CPU
+
                     batch_tensor = torch.stack(pixel_values_list, dim=0).to(self.device)
-                    # 7. 模型前向推理（核心！）,调用模型获取布局（包含印章）
                     outputs = self.model(pixel_values=batch_tensor)
-                    # 8. 后处理：框坐标还原
                     predictions = self._post_process_object_detection(outputs, target_sizes)
-                    # 9. 解析每个预测结果
                     for prediction, image_size in zip(predictions, target_sizes):
                         layout_res = self._parse_prediction(prediction, image_size)
-                        # 10. 可选过滤框
                         if use_paddlex_filter_boxes:
                             layout_res = self._apply_paddlex_filter_boxes(layout_res, drop_inline_formula=False)
-                        # 11. 布局后处理（合并、过滤、优化）
-                        layout_res = self._apply_layout_post_process(layout_res)
-                        # 12. 加入最终结果
+                        layout_res = self._apply_layout_post_process(layout_res, image_size=image_size)
                         results.append(layout_res)
                     pbar.update(len(batch_images))
         return results
