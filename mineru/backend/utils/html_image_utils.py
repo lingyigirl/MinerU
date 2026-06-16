@@ -1,12 +1,16 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import base64
 import re
+from io import BytesIO
 
+from PIL import Image
 from loguru import logger
 
 from mineru.backend.utils.office_image import is_vector_image_part, serialize_office_image
 from mineru.utils.enum_class import BlockType, ContentType
 from mineru.utils.hash_utils import str_sha256
+from mineru.utils.pdf_image_tools import _rotate_sub_image
+from mineru.utils.pdf_reader import image_to_bytes
 
 
 INLINE_IMAGE_DATA_URI_RE = re.compile(r"data:image/([^;]+);base64,(.+)", re.DOTALL)
@@ -95,6 +99,17 @@ def save_base64_image(b64_data_uri: str, image_writer, page_index: int):
             raw_fmt,
             page_index,
         )
+
+    # Detect and correct image orientation
+    try:
+        pil_img = Image.open(BytesIO(img_bytes))
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        pil_img = _rotate_sub_image(pil_img)
+        save_fmt = "JPEG" if fmt == "jpg" else fmt.upper()
+        img_bytes = image_to_bytes(pil_img, image_format=save_fmt)
+    except Exception as e:
+        logger.debug(f"Skipped sub-image rotation on page {page_index}: {e}")
 
     img_path = f"{str_sha256(b64_data_uri)}.{fmt}"
     _write_image_once(image_writer, img_path, img_bytes)

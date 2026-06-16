@@ -169,3 +169,91 @@ def result_to_middle_json(model_output_blocks_list, image_writer):
 
     _link_index_entries_by_anchor(middle_json)
     return middle_json
+
+
+def _normalize_to_vlm_format(middle_json: dict, page_width_pt: int = 595, page_height_pt: int = 842) -> dict:
+    """Normalize DOCX/PPTX/XLSX middle_json to match VLM backend format.
+
+    - ``_backend``: ``"office"`` -> ``"vlm"``
+    - ``page_size``: added with ``[page_width_pt, page_height_pt]``
+    - ``angle``: ``0`` for all blocks and spans
+    - ``bbox``: placeholder ``[0, 0, 0, 0]`` for all spans
+    - ``chart`` blocks -> ``image``
+    - ``index`` blocks -> flattened ``list``
+    - ``hyperlink`` spans -> ``text`` with URL merged into content
+    - Nested ``list`` structures -> flattened
+    """
+    middle_json["_backend"] = "vlm"
+
+    def _normalize_block(block: dict) -> None:
+        block.setdefault("angle", 0)
+        block.setdefault("lines", [])
+        block_type = block.get("type", "")
+        if block_type == "chart":
+            block["type"] = "image"
+        if block_type == "title" and block.get("section_number"):
+            sn = block.pop("section_number", "")
+            lines = block.get("lines", [])
+            if lines and lines[0].get("spans"):
+                lines[0]["spans"][0]["content"] = f"{sn} {lines[0]['spans'][0].get('content', '')}"
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                _normalize_span(span)
+        for child in block.get("blocks", []):
+            _normalize_block(child)
+
+    def _normalize_span(span: dict) -> None:
+        span.setdefault("angle", 0)
+        span.setdefault("bbox", [0, 0, 0, 0])
+        if span.get("type") == "hyperlink":
+            span["type"] = "text"
+            url = span.pop("url", "")
+            content = span.get("content", "")
+            span["content"] = f"[{content}]({url})" if content and url else (url or content)
+        for child_span in span.get("spans", []):
+            _normalize_span(child_span)
+
+    def _flatten_docx_list(list_block: dict) -> None:
+        flat_items = []
+        for child in list_block.get("blocks", []):
+            if child.get("type") == "list":
+                _flatten_docx_list(child)
+                flat_items.extend(child.get("blocks", []))
+            else:
+                _normalize_block(child)
+                flat_items.append(child)
+        list_block["blocks"] = flat_items
+
+    def _flatten_index_block(index_block: dict) -> list[dict]:
+        items = []
+        for child in index_block.get("blocks", []):
+            if child.get("type") == "index":
+                items.extend(_flatten_index_block(child))
+            elif child.get("type") == "text":
+                _normalize_block(child)
+                items.append(child)
+        return items
+
+    for page_info in middle_json.get("pdf_info", []):
+        page_info["page_size"] = [page_width_pt, page_height_pt]
+        new_blocks = []
+        for block in page_info.get("para_blocks", []):
+            block_type = block.get("type", "")
+            if block_type == "index":
+                list_items = _flatten_index_block(block)
+                if list_items:
+                    new_blocks.append({
+                        "type": "list", "attribute": "unordered", "ilevel": 0,
+                        "blocks": list_items, "angle": 0,
+                        "index": block.get("index", 0),
+                    })
+            elif block_type == "list":
+                _flatten_docx_list(block)
+                _normalize_block(block)
+                new_blocks.append(block)
+            else:
+                _normalize_block(block)
+                new_blocks.append(block)
+        page_info["para_blocks"] = new_blocks
+
+    return middle_json

@@ -3,7 +3,7 @@ import time
 from io import BytesIO
 
 from loguru import logger
-from mineru.backend.office.model_output_to_middle_json import result_to_middle_json
+from mineru.backend.office.model_output_to_middle_json import result_to_middle_json, _normalize_to_vlm_format
 
 from mineru.model.pptx.main import convert_binary
 
@@ -24,6 +24,8 @@ def office_pptx_analyze(file_bytes, image_writer=None):
         results,
         image_writer,
     )
+
+    _normalize_to_vlm_format(middle_json, 960, 540)
 
     return middle_json, results
 

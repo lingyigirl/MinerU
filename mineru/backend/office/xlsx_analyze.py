@@ -3,7 +3,7 @@ import time
 from io import BytesIO
 
 from loguru import logger
-from mineru.backend.office.model_output_to_middle_json import result_to_middle_json
+from mineru.backend.office.model_output_to_middle_json import result_to_middle_json, _normalize_to_vlm_format
 
 from mineru.model.xlsx.main import convert_binary
 
@@ -24,6 +24,8 @@ def office_xlsx_analyze(file_bytes, image_writer=None):
         results,
         image_writer,
     )
+
+    _normalize_to_vlm_format(middle_json, 842, 595)
 
     return middle_json, results
 

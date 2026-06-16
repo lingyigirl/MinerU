@@ -425,6 +425,9 @@ def cut_image(
 
     crop_img = get_crop_img(bbox, page_pil_img, scale=scale)
 
+    # direction detection and rotation correction for sub-images
+    crop_img = _rotate_sub_image(crop_img)
+
     img_bytes = image_to_bytes(crop_img, image_format="JPEG")
 
     image_writer.write(img_hash256_path, img_bytes)
@@ -478,7 +481,158 @@ def images_bytes_to_pdf_bytes(image_bytes):
         subsampling=0,
     )
 
-    # 获取 PDF bytes 并重置指针（可选）
+    # Get PDF bytes and reset position (optional)
     pdf_bytes = pdf_buffer.getvalue()
     pdf_buffer.close()
     return pdf_bytes
+
+
+# ===== Sub-image rotation + PDF accumulation utilities (custom additions) =====
+
+_orientation_cls_model = None
+
+
+def _get_orientation_cls_model():
+    """Lazy-load ONNX orientation classifier for sub-image rotation."""
+    global _orientation_cls_model
+    if _orientation_cls_model is None:
+        from mineru.model.ori_cls.paddle_ori_cls import PaddleOrientationClsModel
+        _orientation_cls_model = PaddleOrientationClsModel(ocr_engine=None)
+    return _orientation_cls_model
+
+
+def _rotate_sub_image(crop_img: Image.Image) -> Image.Image:
+    """Detect and rotate sub-images (seals, embedded images, table crops)."""
+    cls_model = _get_orientation_cls_model()
+    label = cls_model.predict_direct(crop_img)
+    if label != "0":
+        crop_img = cls_model.rotate_pil_image(crop_img, label)
+    return crop_img
+
+
+def getPilImageBytes(images_list):
+    """Convert a list of PIL Images to multi-page PDF bytes."""
+    pdf_bytes_io = io.BytesIO()
+    if not images_list:
+        return b""
+    images_list[0].save(pdf_bytes_io, format="PDF", save_all=True, append_images=images_list[1:])
+    return pdf_bytes_io.getvalue()
+
+
+def pdf_images_to_pdf_bytes(images_list: list[dict]) -> bytes:
+    """Extract rotated PIL images from images_list and return as PDF bytes."""
+    pil_images = [img_dict["img_pil"].convert("RGB") for img_dict in images_list]
+    if not pil_images:
+        return b""
+    return getPilImageBytes(pil_images)
+
+
+def _merge_pdf_bytes(pdf_bytes_a: bytes, pdf_bytes_b: bytes) -> bytes:
+    """Merge two PDF byte sequences using pypdfium2."""
+    doc_a = doc_b = output_doc = None
+    try:
+        with pdfium_guard():
+            doc_a = open_pdfium_document(pdfium.PdfDocument, pdf_bytes_a)
+            doc_b = open_pdfium_document(pdfium.PdfDocument, pdf_bytes_b)
+            output_doc = pdfium.PdfDocument.new()
+            output_doc.import_pages(doc_a, list(range(len(doc_a))))
+            output_doc.import_pages(doc_b, list(range(len(doc_b))))
+            buf = BytesIO()
+            output_doc.save(buf)
+            return buf.getvalue()
+    finally:
+        close_pdfium_document(output_doc)
+        close_pdfium_document(doc_b)
+        close_pdfium_document(doc_a)
+
+
+def append_pdf_bytes(new_images_list: list[dict], accumulated_pdf_bytes: bytes | None = None) -> bytes:
+    """Append rotated pages from a new window to accumulated PDF bytes."""
+    current_pdf_bytes = pdf_images_to_pdf_bytes(new_images_list)
+    if not accumulated_pdf_bytes:
+        return current_pdf_bytes
+    if not current_pdf_bytes:
+        return accumulated_pdf_bytes
+    return _merge_pdf_bytes(accumulated_pdf_bytes, current_pdf_bytes)
+
+
+def _correct_sub_regions_in_page(pil_img: Image.Image, cls_model) -> Image.Image:
+    """Correct locally rotated regions in a mixed-orientation page."""
+    np_img = np.asarray(pil_img)
+    h, w = np_img.shape[:2]
+    mid = h // 2
+    top_np = np_img[:mid, :, :]
+    bottom_np = np_img[mid:, :, :]
+    top_label = cls_model.predict_direct(top_np)
+    bottom_label = cls_model.predict_direct(bottom_np)
+    if top_label == "0" and bottom_label == "0":
+        return pil_img
+
+    result = pil_img.copy()
+
+    def _get_pil_angle(label):
+        if label == "270": return -90
+        elif label == "90": return 90
+        elif label == "180": return 180
+        return 0
+
+    def _correct_region(x1, y1, x2, y2, label):
+        crop = pil_img.crop((x1, y1, x2, y2))
+        angle = _get_pil_angle(label)
+        rotated = crop.rotate(angle, expand=True)
+        target_w, target_h = x2 - x1, y2 - y1
+        rotated = rotated.resize((target_w, target_h), Image.LANCZOS)
+        nonlocal result
+        result.paste(rotated, (x1, y1))
+
+    if top_label != "0":
+        _correct_region(0, 0, w, mid, top_label)
+    if bottom_label != "0":
+        _correct_region(0, mid, w, h, bottom_label)
+    return result
+
+
+def image_rotate(image_dict):
+    """Detect and rotate a page image. Handles mixed-orientation pages."""
+    ng_img = image_dict['img_pil']
+    from mineru.backend.pipeline.model_init import AtomModelSingleton
+    from mineru.backend.pipeline.model_list import AtomicModel
+    atom_model_manager = AtomModelSingleton()
+    img_orientation_cls_model = atom_model_manager.get_atom_model(
+        atom_model_name=AtomicModel.ImgOrientationCls,
+    )
+    image_dict["table_img"] = ng_img
+    image_dict['wired_table_img'] = ng_img
+    rotate_label = img_orientation_cls_model.predict(ng_img)
+
+    np_img = np.asarray(ng_img)
+    h_img, w_img = np_img.shape[:2]
+    top_label = img_orientation_cls_model.predict_direct(np_img[:h_img // 2, :, :])
+    bottom_label = img_orientation_cls_model.predict_direct(np_img[h_img // 2:, :, :])
+
+    if top_label != "0" or bottom_label != "0":
+        if top_label != bottom_label or (top_label != "0" and rotate_label != top_label):
+            corrected_img = _correct_sub_regions_in_page(ng_img, img_orientation_cls_model)
+            image_dict["table_img"] = corrected_img
+            image_dict['wired_table_img'] = corrected_img
+            rotate_label = None
+        else:
+            image_dict["table_img"] = ng_img
+            image_dict['wired_table_img'] = ng_img
+    else:
+        image_dict["table_img"] = ng_img
+        image_dict['wired_table_img'] = ng_img
+        rotate_label = None
+
+    if rotate_label is not None:
+        img_orientation_cls_model.img_rotate(image_dict, rotate_label)
+
+    rotate_img = image_dict["table_img"]
+    if not isinstance(rotate_img, Image.Image):
+        rotate_img = Image.fromarray(rotate_img.astype(np.uint8))
+    image_dict['img_pil'] = rotate_img
+    del image_dict['table_img']
+    del image_dict['wired_table_img']
+    if 'rotate_label' in image_dict:
+        del image_dict['rotate_label']
+    return image_dict
