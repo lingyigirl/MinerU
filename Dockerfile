@@ -36,19 +36,11 @@ RUN python3 -m pip install --no-cache-dir -e ".[core]" --break-system-packages &
 # ---- 拷贝项目源码 ----
 COPY mineru/ ./mineru/
 
-# ---- 拷贝模型文件（打包进镜像） ----
-# 本地缓存路径 → 镜像内路径
-# Pipeline 模型（PDF-Extract-Kit-1.0）：布局、OCR、公式、表格、方向分类等
-COPY models/pipeline/ /opt/models/pipeline/
-
-# VLM 模型（MinerU2.5-Pro）：文档理解大模型
-COPY models/vlm/ /opt/models/vlm/
-
-# ---- 配置文件 ----
+# ---- 配置文件（模型通过运行时挂载） ----
 RUN printf '{\n\
   "models-dir": {\n\
-    "pipeline": "/opt/models/pipeline",\n\
-    "vlm": "/opt/models/vlm"\n\
+    "pipeline": "/models/pipeline",\n\
+    "vlm": "/models/vlm"\n\
   }\n\
 }\n' > /root/mineru.json
 
