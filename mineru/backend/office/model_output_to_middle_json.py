@@ -1,71 +1,11 @@
-
-import base64
+# Copyright (c) Opendatalab. All rights reserved.
 import re
 from collections import defaultdict
 
-from loguru import logger
-
+from mineru.backend.utils.html_image_utils import replace_inline_table_images, save_span_image_if_needed
 from mineru.backend.office.office_magic_model import MagicModel
 from mineru.utils.enum_class import BlockType
-from mineru.utils.hash_utils import str_sha256
 from mineru.version import __version__
-
-
-def _save_base64_image(b64_data_uri: str, image_writer, page_index: int):
-    """将 data-URI 格式的 base64 图片解码并通过 image_writer 保存到本地。
-
-    Args:
-        b64_data_uri: 形如 ``data:image/{fmt};base64,{data}`` 的字符串。
-        image_writer:  DataWriter 实例，用于将字节写入本地存储。
-        page_index:    当前页索引，仅用于日志信息。
-
-    Returns:
-        保存成功时返回相对路径字符串（如 ``"abc123.png"``），否则返回 ``None``。
-    """
-    m = re.match(r'data:image/(\w+);base64,(.+)', b64_data_uri, re.DOTALL)
-    if not m:
-        logger.warning(f"Unrecognized image_base64 format in page {page_index}, skipping.")
-        return None
-    fmt = m.group(1)
-    ext = "jpg" if fmt == "jpeg" else fmt
-    try:
-        img_bytes = base64.b64decode(m.group(2))
-    except Exception as e:
-        logger.warning(f"Failed to decode image_base64 on page {page_index}: {e}")
-        return None
-    img_path = f"{str_sha256(b64_data_uri)}.{ext}"
-    image_writer.write(img_path, img_bytes)
-    return img_path
-
-
-def _save_span_image_if_needed(span: dict, image_writer, page_index: int) -> None:
-    """Persist a span-level base64 image and normalize the image_path field."""
-    img_b64 = span.get("image_base64", "")
-    if img_b64:
-        img_path = _save_base64_image(img_b64, image_writer, page_index)
-        if img_path:
-            span["image_path"] = img_path
-            del span["image_base64"]
-            return
-    span.setdefault("image_path", "")
-
-
-def _replace_inline_base64_img_src(markup: str, image_writer, page_index: int) -> str:
-    """Replace inline base64 image sources in HTML-like markup with saved local paths."""
-    if not markup or "base64," not in markup:
-        return markup
-
-    def _replace_src(m_src, _writer=image_writer, _idx=page_index):
-        img_path = _save_base64_image(m_src.group(1), _writer, _idx)
-        if img_path:
-            return f'src="{img_path}"'
-        return m_src.group(0)
-
-    return re.sub(
-        r'src="(data:image/[^"]+)"',
-        _replace_src,
-        markup,
-    )
 
 
 def blocks_to_page_info(page_blocks, image_writer, page_index) -> dict:
@@ -85,22 +25,9 @@ def blocks_to_page_info(page_blocks, image_writer, page_index) -> dict:
                     continue
                 for line in sub_block.get("lines", []):
                     for span in line.get("spans", []):
-                        _save_span_image_if_needed(span, image_writer, page_index)
+                        save_span_image_if_needed(span, image_writer, page_index)
 
-        # Replace inline base64 images inside table HTML with local paths
-        for tbl_block in table_blocks:
-            for sub_block in tbl_block.get("blocks", []):
-                if sub_block.get("type") != "table_body":
-                    continue
-                for line in sub_block.get("lines", []):
-                    for span in line.get("spans", []):
-                        if span.get("type") != "table":
-                            continue
-                        span["html"] = _replace_inline_base64_img_src(
-                            span.get("html", ""),
-                            image_writer,
-                            page_index,
-                        )
+        replace_inline_table_images(table_blocks, image_writer, page_index)
 
         # Replace inline base64 images inside chart content with local paths
         for chart_block in chart_blocks:
@@ -111,7 +38,7 @@ def blocks_to_page_info(page_blocks, image_writer, page_index) -> dict:
                     for span in line.get("spans", []):
                         if span.get("type") != "chart":
                             continue
-                        _save_span_image_if_needed(span, image_writer, page_index)
+                        save_span_image_if_needed(span, image_writer, page_index)
 
     title_blocks = magic_model.get_title_blocks()
     discarded_blocks = magic_model.get_discarded_blocks()
@@ -218,10 +145,10 @@ def result_to_middle_json(model_output_blocks_list, image_writer):
                 for deeper in list(section_counters.keys()):
                     if deeper > level:
                         section_counters[deeper] = 0
-                # Build section number string, e.g. "1.2.1."
+                # Build section number string, e.g. "1.2.1"
                 section_number = ".".join(
                     str(section_counters[l]) for l in range(1, level + 1)
-                ) + "."
+                )
                 block["section_number"] = section_number
             else:
                 # Some documents embed the section number directly in the content
@@ -241,4 +168,92 @@ def result_to_middle_json(model_output_blocks_list, image_writer):
                             section_counters[deeper] = 0
 
     _link_index_entries_by_anchor(middle_json)
+    return middle_json
+
+
+def _normalize_to_vlm_format(middle_json: dict, page_width_pt: int = 595, page_height_pt: int = 842) -> dict:
+    """Normalize DOCX/PPTX/XLSX middle_json to match VLM backend format.
+
+    - ``_backend``: ``"office"`` -> ``"vlm"``
+    - ``page_size``: added with ``[page_width_pt, page_height_pt]``
+    - ``angle``: ``0`` for all blocks and spans
+    - ``bbox``: placeholder ``[0, 0, 0, 0]`` for all spans
+    - ``chart`` blocks -> ``image``
+    - ``index`` blocks -> flattened ``list``
+    - ``hyperlink`` spans -> ``text`` with URL merged into content
+    - Nested ``list`` structures -> flattened
+    """
+    middle_json["_backend"] = "vlm"
+
+    def _normalize_block(block: dict) -> None:
+        block.setdefault("angle", 0)
+        block.setdefault("lines", [])
+        block_type = block.get("type", "")
+        if block_type == "chart":
+            block["type"] = "image"
+        if block_type == "title" and block.get("section_number"):
+            sn = block.pop("section_number", "")
+            lines = block.get("lines", [])
+            if lines and lines[0].get("spans"):
+                lines[0]["spans"][0]["content"] = f"{sn} {lines[0]['spans'][0].get('content', '')}"
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                _normalize_span(span)
+        for child in block.get("blocks", []):
+            _normalize_block(child)
+
+    def _normalize_span(span: dict) -> None:
+        span.setdefault("angle", 0)
+        span.setdefault("bbox", [0, 0, 0, 0])
+        if span.get("type") == "hyperlink":
+            span["type"] = "text"
+            url = span.pop("url", "")
+            content = span.get("content", "")
+            span["content"] = f"[{content}]({url})" if content and url else (url or content)
+        for child_span in span.get("spans", []):
+            _normalize_span(child_span)
+
+    def _flatten_docx_list(list_block: dict) -> None:
+        flat_items = []
+        for child in list_block.get("blocks", []):
+            if child.get("type") == "list":
+                _flatten_docx_list(child)
+                flat_items.extend(child.get("blocks", []))
+            else:
+                _normalize_block(child)
+                flat_items.append(child)
+        list_block["blocks"] = flat_items
+
+    def _flatten_index_block(index_block: dict) -> list[dict]:
+        items = []
+        for child in index_block.get("blocks", []):
+            if child.get("type") == "index":
+                items.extend(_flatten_index_block(child))
+            elif child.get("type") == "text":
+                _normalize_block(child)
+                items.append(child)
+        return items
+
+    for page_info in middle_json.get("pdf_info", []):
+        page_info["page_size"] = [page_width_pt, page_height_pt]
+        new_blocks = []
+        for block in page_info.get("para_blocks", []):
+            block_type = block.get("type", "")
+            if block_type == "index":
+                list_items = _flatten_index_block(block)
+                if list_items:
+                    new_blocks.append({
+                        "type": "list", "attribute": "unordered", "ilevel": 0,
+                        "blocks": list_items, "angle": 0,
+                        "index": block.get("index", 0),
+                    })
+            elif block_type == "list":
+                _flatten_docx_list(block)
+                _normalize_block(block)
+                new_blocks.append(block)
+            else:
+                _normalize_block(block)
+                new_blocks.append(block)
+        page_info["para_blocks"] = new_blocks
+
     return middle_json

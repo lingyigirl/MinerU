@@ -1,37 +1,39 @@
-#  Copyright (c) Opendatalab. All rights reserved.
+# Copyright (c) Opendatalab. All rights reserved.
 
 import os
 import time
 
-import cv2
 import numpy as np
 from loguru import logger
 from tqdm import tqdm
 
+from mineru.backend.utils.html_image_utils import replace_inline_table_images
+from mineru.backend.utils.ocr_det_utils import (
+    detect_ocr_boxes_from_padded_crop,
+    get_ch_lite_ocr_det_model,
+)
+from mineru.backend.utils.para_block_utils import (
+    build_para_blocks_from_preproc,
+    cleanup_internal_para_block_metadata,
+    iter_block_spans,
+    merge_para_text_blocks,
+)
 from mineru.backend.hybrid.hybrid_magic_model import MagicModel
-from mineru.backend.utils import cross_page_table_merge
+from mineru.backend.utils.runtime_utils import cross_page_table_merge
 from mineru.utils.config_reader import get_table_enable, get_llm_aided_config
 from mineru.utils.cut_image import cut_image_and_table
-from mineru.utils.enum_class import ContentType
+from mineru.utils.enum_class import ContentType, BlockType
 from mineru.utils.hash_utils import bytes_md5
 from mineru.utils.ocr_utils import OcrConfidence, rotate_vertical_crop_if_needed
-from mineru.utils.pdf_image_tools import get_crop_img
 from mineru.utils.pdfium_guard import close_pdfium_document, pdfium_guard
 from mineru.version import __version__
 
-
-heading_level_import_success = False
+from mineru.utils.llm_aided import llm_aided_title
+title_aided_enable = False
 llm_aided_config = get_llm_aided_config()
 if llm_aided_config:
     title_aided_config = llm_aided_config.get('title_aided', {})
-    if title_aided_config.get('enable', False):
-        try:
-            from mineru.utils.llm_aided import llm_aided_title
-            from mineru.backend.pipeline.model_init import AtomModelSingleton
-            heading_level_import_success = True
-        except Exception as e:
-            logger.warning("The heading level feature cannot be used. If you need to use the heading level feature, "
-                            "please execute `pip install mineru[core]` to install the required packages.")
+    title_aided_enable = title_aided_config.get('enable', False)
 
 
 def blocks_to_page_info(
@@ -63,6 +65,7 @@ def blocks_to_page_info(
     )
     image_blocks = magic_model.get_image_blocks()
     table_blocks = magic_model.get_table_blocks()
+    chart_blocks = magic_model.get_chart_blocks()
     title_blocks = magic_model.get_title_blocks()
     discarded_blocks = magic_model.get_discarded_blocks()
     code_blocks = magic_model.get_code_blocks()
@@ -71,24 +74,16 @@ def blocks_to_page_info(
     list_blocks = magic_model.get_list_blocks()
 
     # 如果有标题优化需求，计算标题的平均行高
-    if heading_level_import_success:
+    if title_aided_enable:
         if _vlm_ocr_enable:  # vlm_ocr导致没有line信息，需要重新det获取平均行高
-            atom_model_manager = AtomModelSingleton()
-            ocr_model = atom_model_manager.get_atom_model(
-                atom_model_name='ocr',
-                ocr_show_log=False,
-                det_db_box_thresh=0.3,
-                lang='ch_lite'
-            )
+            ocr_model = get_ch_lite_ocr_det_model()
             for title_block in title_blocks:
-                title_pil_img = get_crop_img(title_block['bbox'], page_pil_img, scale)
-                title_np_img = np.array(title_pil_img)
-                # 给title_pil_img添加上下左右各50像素白边padding
-                title_np_img = cv2.copyMakeBorder(
-                    title_np_img, 50, 50, 50, 50, cv2.BORDER_CONSTANT, value=[255, 255, 255]
+                ocr_det_res, _ = detect_ocr_boxes_from_padded_crop(
+                    title_block.get('bbox'),
+                    page_pil_img,
+                    scale,
+                    ocr_model=ocr_model,
                 )
-                title_img = cv2.cvtColor(title_np_img, cv2.COLOR_RGB2BGR)
-                ocr_det_res = ocr_model.ocr(title_img, rec=False)[0]
                 if len(ocr_det_res) > 0:
                     # 计算所有res的平均高度
                     avg_height = np.mean([box[2][1] - box[0][1] for box in ocr_det_res])
@@ -107,15 +102,18 @@ def blocks_to_page_info(
     interline_equation_blocks = magic_model.get_interline_equation_blocks()
 
     all_spans = magic_model.get_all_spans()
-    # 对image/table/interline_equation的span截图
+    # 对image/table/chart/interline_equation的span截图
     for span in all_spans:
-        if span["type"] in [ContentType.IMAGE, ContentType.TABLE, ContentType.INTERLINE_EQUATION]:
+        if span["type"] in [ContentType.IMAGE, ContentType.TABLE, ContentType.CHART, ContentType.INTERLINE_EQUATION]:
             span = cut_image_and_table(span, page_pil_img, page_img_md5, page_index, image_writer, scale=scale)
+
+    replace_inline_table_images(table_blocks, image_writer, page_index)
 
     page_blocks = []
     page_blocks.extend([
         *image_blocks,
         *table_blocks,
+        *chart_blocks,
         *code_blocks,
         *ref_text_blocks,
         *phonetic_blocks,
@@ -127,27 +125,27 @@ def blocks_to_page_info(
     # 对page_blocks根据index的值进行排序
     page_blocks.sort(key=lambda x: x["index"])
 
-    page_info = {"para_blocks": page_blocks, "discarded_blocks": discarded_blocks, "page_size": [width, height], "page_idx": page_index}
+    page_info = {
+        "preproc_blocks": page_blocks,
+        "discarded_blocks": discarded_blocks,
+        "page_size": [width, height],
+        "page_idx": page_index,
+    }
     return page_info
 
 
 def _apply_post_ocr(pdf_info_list, hybrid_pipeline_model):
     need_ocr_list = []
     img_crop_list = []
-    text_block_list = []
     for page_info in pdf_info_list:
-        for block in page_info['para_blocks']:
-            if block['type'] in ['table', 'image', 'list', 'code']:
-                for sub_block in block['blocks']:
-                    if not sub_block['type'].endswith('body'):
-                        text_block_list.append(sub_block)
-            elif block['type'] in ['text', 'title', 'ref_text']:
-                text_block_list.append(block)
-        for block in page_info['discarded_blocks']:
-            text_block_list.append(block)
-    for block in text_block_list:
-        for line in block['lines']:
-            for span in line['spans']:
+        for block in page_info.get('preproc_blocks', []):
+            for span in iter_block_spans(block):
+                if 'np_img' in span:
+                    need_ocr_list.append(span)
+                    img_crop_list.append(rotate_vertical_crop_if_needed(span['np_img']))
+                    span.pop('np_img')
+        for block in page_info.get('discarded_blocks', []):
+            for span in iter_block_spans(block):
                 if 'np_img' in span:
                     need_ocr_list.append(span)
                     img_crop_list.append(rotate_vertical_crop_if_needed(span['np_img']))
@@ -164,6 +162,22 @@ def _apply_post_ocr(pdf_info_list, hybrid_pipeline_model):
             else:
                 span['content'] = ''
                 span['score'] = 0.0
+
+
+def _normalize_split_title_blocks(pdf_info_list):
+    """将Hybrid内部拆分标题统一为输出层通用title，并补齐默认标题层级。"""
+    title_type_to_level = {
+        BlockType.DOC_TITLE: 1,
+        BlockType.PARAGRAPH_TITLE: 2,
+    }
+    for page_info in pdf_info_list:
+        for block_key in ["preproc_blocks", "para_blocks"]:
+            for block in page_info.get(block_key, []):
+                title_level = title_type_to_level.get(block.get("type"))
+                if title_level is None:
+                    continue
+                block["type"] = BlockType.TITLE
+                block["level"] = title_level
 
 
 def init_middle_json(_ocr_enable, _vlm_ocr_enable):
@@ -235,14 +249,23 @@ def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm
     if not (_vlm_ocr_enable or _ocr_enable):
         _apply_post_ocr(pdf_info_list, hybrid_pipeline_model)
 
+    build_para_blocks_from_preproc(pdf_info_list)
+    merge_para_text_blocks(
+        pdf_info_list,
+        auto_merge_by_det=True,
+    )
+
     table_enable = get_table_enable(os.getenv('MINERU_VLM_TABLE_ENABLE', 'True').lower() == 'true')
     if table_enable:
         cross_page_table_merge(pdf_info_list)
 
-    if heading_level_import_success:
+    if title_aided_enable:
         llm_aided_title_start_time = time.time()
         llm_aided_title(pdf_info_list, title_aided_config)
         logger.info(f'llm aided title time: {round(time.time() - llm_aided_title_start_time, 2)}')
+
+    _normalize_split_title_blocks(pdf_info_list)
+    cleanup_internal_para_block_metadata(pdf_info_list)
 
 
 def result_to_middle_json(

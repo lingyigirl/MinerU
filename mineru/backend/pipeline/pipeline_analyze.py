@@ -1,3 +1,4 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import os
 import time
 from typing import List, Tuple
@@ -13,7 +14,7 @@ from .model_json_to_middle_json import (
     finalize_middle_json,
     init_middle_json,
 )
-from ..utils import exclude_progress_bar_idle_time
+from ..utils.runtime_utils import exclude_progress_bar_idle_time
 from mineru.utils.config_reader import get_device, get_processing_window_size
 from ...utils.enum_class import ImageType
 from ...utils.pdf_classify import classify
@@ -27,7 +28,6 @@ from ...utils.pdfium_guard import (
 
 
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 让mps可以fallback
-os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 禁止albumentations检查更新
 
 class ModelSingleton:
     _instance = None
@@ -120,15 +120,11 @@ def _finalize_processing_window_context(context, on_doc_ready):
     logger.debug(
         f"Pipeline doc ready: doc{context['doc_index']} pages={context['page_count']}"
     )
-    final_bytes = context['final_bytes']
-    if context['final_bytes'] is None:
-        final_bytes = b''
     on_doc_ready(
         context['doc_index'],
         context['model_list'],
         context['middle_json'],
         context['ocr_enable'],
-        final_bytes,
     )
     close_pdfium_document(context['pdf_doc'])
     context['closed'] = True
@@ -211,7 +207,7 @@ def doc_analyze_streaming(
                         continue
                     take_count = min(batch_capacity, context['page_count'] - page_start)
                     page_end = page_start + take_count - 1
-                    images_list,final_bytes = load_images_from_pdf_doc(
+                    images_list = load_images_from_pdf_doc(
                         context['pdf_doc'],
                         start_page_id=page_start,
                         end_page_id=page_end,
@@ -231,7 +227,7 @@ def doc_analyze_streaming(
                             'count': take_count,
                         }
                     )
-                    batch_payloads.append((context, images_list, page_start, take_count,final_bytes))
+                    batch_payloads.append((context, images_list, page_start, take_count))
                     context['next_page_idx'] = page_end + 1
                     batch_capacity -= take_count
 
@@ -256,7 +252,7 @@ def doc_analyze_streaming(
                     )
 
                 result_offset = 0
-                for context, images_list, page_start, take_count,final_bytes in batch_payloads:
+                for context, images_list, page_start, take_count in batch_payloads:
                     result_slice = batch_results[result_offset: result_offset + take_count]
                     append_batch_results_to_middle_json(
                         context['middle_json'],
@@ -269,7 +265,6 @@ def doc_analyze_streaming(
                         model_list=context['model_list'],
                         progress_bar=progress_bar,
                     )
-                    context['final_bytes'] = final_bytes
                     result_offset += take_count
                     _close_images(images_list)
                     images_list.clear()

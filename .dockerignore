@@ -1,0 +1,19 @@
+# Docker build context exclusions
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/
+.idea/
+.vscode/
+.git/
+.gitignore
+tests/
+output/
+demo/
+.DS_Store
+Thumbs.db
+# models/ 由 build-docker.sh 临时生成，构建后删除

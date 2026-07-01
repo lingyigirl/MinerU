@@ -1,0 +1,44 @@
+# ============================================================
+# MinerU Custom — Docker Compose（GPU + FastAPI）
+#
+# 启动: docker compose up -d
+# 停止: docker compose down
+# 模型: runtime volume 挂载，不入镜像
+# ============================================================
+
+services:
+  mineru-api:
+    image: mineru:custom
+    container_name: mineru-api
+    restart: always
+
+    ports:
+      - "8000:8000"
+
+    # ---- GPU 配置 ----
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+    # ---- 模型挂载（修改为你的实际路径） ----
+    volumes:
+      - ${MODEL_PIPELINE:-./models/pipeline}:/models/pipeline:ro
+      - ${MODEL_VLM:-./models/vlm}:/models/vlm:ro
+
+    # ---- 环境变量 ----
+    environment:
+      MINERU_MODEL_SOURCE: local
+      MINERU_DEVICE_MODE: cuda
+      MINERU_VLM_FORMULA_ENABLE: "true"
+      MINERU_VLM_TABLE_ENABLE: "true"
+      MINERU_PROCESSING_WINDOW_SIZE: "64"
+
+    # ---- vllm 基镜像需要 ----
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host

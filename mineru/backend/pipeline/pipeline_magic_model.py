@@ -1,16 +1,20 @@
+# Copyright (c) Opendatalab. All rights reserved.
 from mineru.backend.pipeline.para_split import ListLineTag
 from mineru.backend.pipeline.pipeline_middle_json_mkcontent import _merge_para_text
 from mineru.utils.boxbase import (
-    bbox_center_distance,
-    bbox_distance,
     calculate_overlap_area_2_minbox_area_ratio,
     calculate_overlap_area_in_bbox1_area_ratio,
 )
 from mineru.utils.enum_class import ContentType, BlockType
 from mineru.utils.guess_suffix_or_lang import guess_language_by_text
 from mineru.utils.span_block_fix import merge_spans_to_vertical_line, vertical_line_sort_spans_from_top_to_bottom, \
-    merge_spans_to_line, line_sort_spans_by_left_to_right
-from mineru.utils.span_pre_proc import txt_spans_extract
+    merge_spans_to_line, line_sort_spans_by_left_to_right, is_vertical_text_block_by_spans
+from mineru.utils.span_pre_proc import SpanBlockMatcher, txt_spans_extract
+from mineru.utils.visual_magic_model_utils import (
+    fallback_inline_caption_fragments,
+    fallback_leading_table_continuation_captions,
+    find_best_visual_parent,
+)
 
 
 class MagicModel:
@@ -34,7 +38,7 @@ class MagicModel:
         "number": BlockType.PAGE_NUMBER,
         "paragraph_title": BlockType.PARAGRAPH_TITLE,
         "reference_content": BlockType.REF_TEXT,
-        "seal": BlockType.SEAL,
+        "seal": BlockType.IMAGE,
         "table": BlockType.TABLE,
         "text": BlockType.TEXT,
         "vertical_text": BlockType.VERTICAL_TEXT,
@@ -113,16 +117,27 @@ class MagicModel:
                     index=block_index,
                     score=block_score,
                 )
+                if self.__is_seal_layout_block(layout_det):
+                    block["sub_type"] = "seal"
                 self.page_blocks.append(block)
 
         self.page_blocks.sort(key=lambda x: x["index"])
         self.__build_page_blocks()
+        fallback_inline_caption_fragments(self.page_blocks, self.VISUAL_MAIN_TYPES)
+        fallback_leading_table_continuation_captions(self.page_blocks, self.VISUAL_MAIN_TYPES)
         self.__classify_visual_blocks()
         self.__build_return_blocks()
 
 
     @staticmethod
     def __fix_text_block(block):
+        if (
+            block["type"] == BlockType.TEXT
+            and is_vertical_text_block_by_spans(block["spans"])
+        ):
+            # layout 偶发会把竖排正文识别为横排 text，这里用旧版 span 高宽比规则兜底。
+            block["type"] = BlockType.VERTICAL_TEXT
+
         if block["type"] == BlockType.VERTICAL_TEXT:
             # 如果是纵向文本块，则按纵向lines处理
             block_lines = merge_spans_to_vertical_line(block['spans'])
@@ -170,6 +185,20 @@ class MagicModel:
     def __is_ocr_text_block(layout_det: dict) -> bool:
         return layout_det.get("label") == "ocr_text"
 
+    @staticmethod
+    def __is_seal_layout_block(layout_det: dict) -> bool:
+        """判断原始 layout 是否为印章，输出层会将其规范为 image 子类型。"""
+        return layout_det.get("label") == "seal"
+
+    @staticmethod
+    def __normalize_seal_text(content):
+        """将 seal OCR 的列表或字符串结果规范为 VLM 一致的多行字符串。"""
+        if isinstance(content, list):
+            return "\n".join(str(item) for item in content if str(item).strip())
+        if isinstance(content, str):
+            return content.strip()
+        return ""
+
     def __build_return_blocks(self):
         self.preproc_blocks = []
         self.discarded_blocks = []
@@ -195,6 +224,7 @@ class MagicModel:
 
     def __build_page_blocks(self):
         span_type = "unknown"
+        span_matcher = SpanBlockMatcher(self.page_text_inline_formula_spans)
         for block in self.page_blocks:
             if block["type"] in [
                 BlockType.ABSTRACT,
@@ -223,29 +253,28 @@ class MagicModel:
                 span_type = ContentType.CHART
             elif block["type"] in [BlockType.INTERLINE_EQUATION]:
                 span_type = ContentType.INTERLINE_EQUATION
-            elif block["type"] in [BlockType.SEAL]:
-                span_type = ContentType.SEAL
 
             if span_type in [
                 ContentType.IMAGE,
                 ContentType.TABLE,
                 ContentType.CHART,
                 ContentType.INTERLINE_EQUATION,
-                ContentType.SEAL
             ]:
                 span = {
                     "bbox": block["bbox"],
                     "type": span_type,
                 }
+                if span_type == ContentType.IMAGE and block.get("sub_type") == "seal":
+                    seal_text = self.__normalize_seal_text(block.get("text"))
+                    if seal_text:
+                        span["content"] = seal_text
+                    block.pop("text", None)
                 if span_type == ContentType.TABLE:
                     span["html"] = block.get("html", "")
                     block.pop("html", None)
                 if span_type == ContentType.INTERLINE_EQUATION:
                     span["content"] = block.get("latex", "")
                     block.pop("latex", None)
-                if span_type == ContentType.SEAL:
-                    span["content"] = block.get("text")
-                    block.pop("text", None)
 
                 self.all_image_spans.append(span)
                 # 构造line对象
@@ -254,28 +283,25 @@ class MagicModel:
                 block["lines"] = [line]
             else:
                 # span填充
-                block_spans = []
-                for span in self.page_text_inline_formula_spans:
-                    overlap_ratio = calculate_overlap_area_in_bbox1_area_ratio(
-                        span['bbox'], block["bbox"]
+                if block["type"] == BlockType.FORMULA_NUMBER:
+                    block_spans = span_matcher.collect_for_block(
+                        block["bbox"],
+                        overlap_ratio_getter=self.__formula_number_overlap_ratio,
                     )
-                    if block["type"] == BlockType.FORMULA_NUMBER:
-                        # OCR 检测框通常会比公式编号框更大，使用最小框重叠比避免编号文字无法回填。
-                        overlap_ratio = max(
-                            overlap_ratio,
-                            calculate_overlap_area_2_minbox_area_ratio(
-                                span['bbox'], block["bbox"]
-                            ),
-                        )
-                    if overlap_ratio > 0.5:
-                        block_spans.append(span)
-                # 从spans删除已经放入block_spans中的span
-                if len(block_spans) > 0:
-                    for span in block_spans:
-                        self.page_text_inline_formula_spans.remove(span)
+                else:
+                    block_spans = span_matcher.collect_for_block(block["bbox"])
 
                 block["spans"] = block_spans
                 block = self.__fix_text_block(block)
+        self.page_text_inline_formula_spans = span_matcher.remaining_spans()
+
+    @staticmethod
+    def __formula_number_overlap_ratio(span, block_bbox):
+        """公式编号框较窄时，沿用最小框重叠比例提高回填召回。"""
+        return max(
+            calculate_overlap_area_in_bbox1_area_ratio(span['bbox'], block_bbox),
+            calculate_overlap_area_2_minbox_area_ratio(span['bbox'], block_bbox),
+        )
 
     def __fix_axis(self):
         need_remove_list = []
@@ -397,6 +423,8 @@ class MagicModel:
 
             mapping = self.VISUAL_TYPE_MAPPING[original_block_type]
             body_block = self.__make_child_block(block, mapping["body"])
+            if original_block_type in [BlockType.IMAGE, BlockType.CHART]:
+                body_block.pop("sub_type", None)
             captions = sorted(
                 [
                     self.__make_child_block(caption, mapping["caption"])
@@ -433,6 +461,8 @@ class MagicModel:
                 "index": block["index"],
                 "score": block.get("score"),
             }
+            if original_block_type in [BlockType.IMAGE, BlockType.CHART] and block.get("sub_type"):
+                two_layer_block["sub_type"] = block["sub_type"]
             # 对blocks按index排序
             two_layer_block["blocks"].sort(key=lambda x: x["index"])
             rebuilt_page_blocks.append(two_layer_block)
@@ -451,54 +481,16 @@ class MagicModel:
         if child_type not in self.VISUAL_CHILD_TYPES:
             return None
 
-        best_parent = None
-        best_key = None
-        for main_block in main_blocks:
-            if not self.__is_visual_neighbor(
-                child_block,
-                main_block,
-                ordered_blocks,
-                original_type_by_index,
-                position_by_index,
-            ):
-                continue
-
-            candidate_key = (
-                abs(child_block["index"] - main_block["index"]),
-                bbox_distance(child_block["bbox"], main_block["bbox"]),
-                bbox_center_distance(child_block["bbox"], main_block["bbox"]),
-                main_block["index"],
-            )
-
-            if best_key is None or candidate_key < best_key:
-                best_key = candidate_key
-                best_parent = main_block
-
-        return best_parent
-
-    def __is_visual_neighbor(
-        self,
-        child_block,
-        main_block,
-        ordered_blocks,
-        original_type_by_index,
-        position_by_index,
-    ):
-        child_type = original_type_by_index[child_block["index"]]
-        if child_type == BlockType.FOOTNOTE and child_block["index"] < main_block["index"]:
-            return False
-
-        child_pos = position_by_index[child_block["index"]]
-        main_pos = position_by_index[main_block["index"]]
-        start_pos = min(child_pos, main_pos) + 1
-        end_pos = max(child_pos, main_pos)
-
-        for pos in range(start_pos, end_pos):
-            between_block = ordered_blocks[pos]
-            if original_type_by_index[between_block["index"]] != child_type:
-                return False
-
-        return True
+        return find_best_visual_parent(
+            child_block,
+            main_blocks,
+            ordered_blocks,
+            position_by_index,
+            main_type_to_visual_type={
+                block_type: block_type for block_type in self.VISUAL_MAIN_TYPES
+            },
+            type_by_index=original_type_by_index,
+        )
 
     @staticmethod
     def __child_kind(block_type):

@@ -1,3 +1,4 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import os
 from huggingface_hub import snapshot_download as hf_snapshot_download
 from modelscope import snapshot_download as ms_snapshot_download
@@ -14,7 +15,7 @@ def auto_download_and_get_model_root_path(relative_path: str, repo_mode='pipelin
     :param relative_path: 文件或目录相对路径
     :return: 本地文件绝对路径或相对路径
     """
-    model_source = os.getenv('MINERU_MODEL_SOURCE', "modelscope")
+    model_source = os.getenv('MINERU_MODEL_SOURCE', "huggingface")
 
     if model_source == 'local':
         local_models_config = get_local_models_dir()

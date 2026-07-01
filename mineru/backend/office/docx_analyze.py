@@ -3,7 +3,7 @@ import time
 from io import BytesIO
 
 from loguru import logger
-from mineru.backend.office.model_output_to_middle_json import result_to_middle_json
+from mineru.backend.office.model_output_to_middle_json import result_to_middle_json, _normalize_to_vlm_format
 
 from mineru.model.docx.main import convert_binary
 
@@ -26,6 +26,21 @@ def office_docx_analyze(
         image_writer,
     )
 
+    # normalize to VLM-compatible format
+    page_width_pt = 595
+    page_height_pt = 842
+    try:
+        from docx import Document as DocxDoc
+        doc = DocxDoc(BytesIO(file_bytes))
+        if doc.sections:
+            pw, ph = doc.sections[0].page_width, doc.sections[0].page_height
+            if pw and ph:
+                page_width_pt, page_height_pt = int(pw / 12700), int(ph / 12700)
+    except Exception:
+        pass
+
+    _normalize_to_vlm_format(middle_json, page_width_pt, page_height_pt)
+
     return middle_json, results
 
 if __name__ == '__main__':
@@ -37,7 +52,7 @@ if __name__ == '__main__':
     import argparse
 
     script_root = Path(__file__).resolve().parent.parent.parent.parent
-    default_docx = script_root / "demo" / "docx" / "demo5.docx"
+    default_docx = script_root / "demo" / "office_docs" / "docx_01.docx"
 
     parser = argparse.ArgumentParser(
         description="Quick demo runner for office_docx_analyze"
@@ -46,7 +61,7 @@ if __name__ == '__main__':
         "docx",
         nargs="?",
         default=str(default_docx),
-        help="path to docx file (defaults to demo/docx/demo5.docx relative to project root)"
+        help="path to docx file (defaults to demo/office_docs/docx_01.docx relative to project root)"
     )
     parser.add_argument(
         "--output-images",

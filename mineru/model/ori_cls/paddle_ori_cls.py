@@ -14,7 +14,7 @@ from mineru.utils.models_download_utils import auto_download_and_get_model_root_
 
 
 class PaddleOrientationClsModel:
-    def __init__(self, ocr_engine):
+    def __init__(self, ocr_engine=None):
         self.sess = onnxruntime.InferenceSession(
             os.path.join(auto_download_and_get_model_root_path(ModelPath.paddle_orientation_classification), ModelPath.paddle_orientation_classification)
         )
@@ -112,6 +112,24 @@ class PaddleOrientationClsModel:
                     rotate_label = self.labels[np.argmax(result)]
                     # logger.debug(f"Orientation classification result: {label}")
 
+        return rotate_label
+
+    def predict_direct(self, input_img):
+        """直接使用 ONNX 模型预测图片方向，绕过 OCR 预筛选。"""
+        if isinstance(input_img, Image.Image):
+            np_img = np.asarray(input_img)
+        elif isinstance(input_img, np.ndarray):
+            np_img = input_img
+        else:
+            raise ValueError("Input must be a pillow object or a numpy array.")
+        # 确保 RGB 3 通道
+        if len(np_img.shape) == 3 and np_img.shape[2] == 4:
+            np_img = cv2.cvtColor(np_img, cv2.COLOR_RGBA2RGB)
+        elif len(np_img.shape) == 2:
+            np_img = cv2.cvtColor(np_img, cv2.COLOR_GRAY2RGB)
+        x = self.preprocess(np_img)
+        (result,) = self.sess.run(None, {"x": x})
+        rotate_label = self.labels[np.argmax(result)]
         return rotate_label
 
     def list_2_batch(self, img_list, batch_size=16):
@@ -284,3 +302,14 @@ class PaddleOrientationClsModel:
         else:
             # 0度不做处理
             pass
+
+    @staticmethod
+    def rotate_pil_image(pil_img: Image.Image, label: str) -> Image.Image:
+        if label == "270":
+            return pil_img.rotate(-90, expand=True)
+        elif label == "90":
+            return pil_img.rotate(90, expand=True)
+        elif label == "180":
+            return pil_img.rotate(180, expand=True)
+        else:
+            return pil_img

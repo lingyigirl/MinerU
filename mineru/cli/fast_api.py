@@ -1,5 +1,7 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import asyncio
 import mimetypes
+import multiprocessing
 import os
 import shutil
 import sys
@@ -11,7 +13,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 import click
 import uvicorn
@@ -19,8 +21,6 @@ from fastapi import (
     BackgroundTasks,
     Depends,
     FastAPI,
-    File,
-    Form,
     HTTPException,
     Request,
     UploadFile,
@@ -42,19 +42,31 @@ from mineru.cli.common import (
     read_fn,
     uniquify_task_stems,
 )
+from mineru.cli.api_request import ParseRequestOptions, parse_request_form
+from mineru.cli.public_http_client_policy import (
+    configure_public_http_client_policy,
+    is_public_bind_host,
+    warn_if_public_http_client_policy as _warn_if_public_http_client_policy,
+)
 from mineru.cli.output_paths import resolve_parse_dir
 from mineru.cli.api_protocol import (
     API_PROTOCOL_VERSION,
     DEFAULT_MAX_CONCURRENT_REQUESTS,
     DEFAULT_PROCESSING_WINDOW_SIZE,
 )
+from mineru.cli.vlm_preload import (
+    maybe_preload_vlm_model,
+    split_service_and_model_config,
+)
+from mineru.backend.vlm.vlm_analyze import shutdown_cached_models
 from mineru.utils.cli_parser import arg_parse
+from mineru.utils.check_sys_env import is_mac_environment
 from mineru.utils.config_reader import (
-    get_device,
     get_max_concurrent_requests as read_max_concurrent_requests,
     get_processing_window_size,
 )
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
+from mineru.utils.pdf_image_tools import shutdown_pdf_render_executor
 from mineru.version import __version__
 
 os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
@@ -68,19 +80,20 @@ TASK_COMPLETED = "completed"
 TASK_FAILED = "failed"
 TASK_TERMINAL_STATES = {TASK_COMPLETED, TASK_FAILED}
 SUPPORTED_UPLOAD_SUFFIXES = pdf_suffixes + image_suffixes + office_suffixes
+RESULT_IMAGE_SUFFIXES = set(image_suffixes) | {"svg"}
 DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
 DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60
 DEFAULT_OUTPUT_ROOT = "./output"
-ALLOWED_PARSE_METHODS = {"auto", "txt", "ocr"}
 FILE_PARSE_TASK_ID_HEADER = "X-MinerU-Task-Id"
 FILE_PARSE_TASK_STATUS_HEADER = "X-MinerU-Task-Status"
 FILE_PARSE_TASK_STATUS_URL_HEADER = "X-MinerU-Task-Status-Url"
 FILE_PARSE_TASK_RESULT_URL_HEADER = "X-MinerU-Task-Result-Url"
+MINERU_API_PUBLIC_BIND_EXPOSED_ENV = "MINERU_API_PUBLIC_BIND_EXPOSED"
+MINERU_API_ALLOW_PUBLIC_HTTP_CLIENT_ENV = "MINERU_API_ALLOW_PUBLIC_HTTP_CLIENT"
 
 # 并发控制器
 _request_semaphore: Optional[asyncio.Semaphore] = None
-_configured_max_concurrent_requests = 0
-_mps_parse_lock = threading.Lock()
+_configured_max_concurrent_requests = 1
 
 
 def env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -90,24 +103,31 @@ def env_flag_enabled(name: str, default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
-@dataclass
-class ParseRequestOptions:
-    files: list[UploadFile]
-    lang_list: list[str]
-    backend: str
-    parse_method: str
-    formula_enable: bool
-    table_enable: bool
-    server_url: Optional[str]
-    return_md: bool
-    return_middle_json: bool
-    return_model_output: bool
-    return_content_list: bool
-    return_images: bool
-    response_format_zip: bool
-    return_original_file: bool
-    start_page_id: int
-    end_page_id: int
+def is_main_multiprocessing_process() -> bool:
+    try:
+        return multiprocessing.current_process().name == "MainProcess"
+    except Exception:
+        return True
+
+
+def install_stdin_shutdown_watcher(server: uvicorn.Server) -> None:
+    if not env_flag_enabled("MINERU_API_SHUTDOWN_ON_STDIN_EOF"):
+        return
+
+    def _watch_stdin_for_eof() -> None:
+        stdin_stream = getattr(sys.stdin, "buffer", sys.stdin)
+        try:
+            stdin_stream.read()
+        except Exception:
+            return
+        server.should_exit = True
+
+    watcher = threading.Thread(
+        target=_watch_stdin_for_eof,
+        name="mineru-api-stdin-shutdown",
+        daemon=True,
+    )
+    watcher.start()
 
 
 @dataclass
@@ -129,6 +149,7 @@ class AsyncParseTask:
     lang_list: list[str]
     formula_enable: bool
     table_enable: bool
+    image_analysis: bool
     server_url: Optional[str]
     return_md: bool
     return_middle_json: bool
@@ -178,16 +199,11 @@ class TaskWaitAbortedError(RuntimeError):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task_manager = AsyncTaskManager(app)
-    await task_manager.start()
-    app.state.task_manager = task_manager
+    await startup_app_state(app)
     try:
         yield
     finally:
-        current_task_manager = getattr(app.state, "task_manager", None)
-        if current_task_manager is not None:
-            await current_task_manager.shutdown()
-        app.state.task_manager = None
+        await shutdown_app_state(app)
 
 
 def create_app():
@@ -202,20 +218,83 @@ def create_app():
     )
 
     global _request_semaphore, _configured_max_concurrent_requests
-    max_concurrent_requests = read_max_concurrent_requests(
-        default=DEFAULT_MAX_CONCURRENT_REQUESTS
-    )
+
+    if is_mac_environment():
+        max_concurrent_requests = 1
+    else:
+        max_concurrent_requests = read_max_concurrent_requests(
+            default=DEFAULT_MAX_CONCURRENT_REQUESTS
+        )
 
     _configured_max_concurrent_requests = max_concurrent_requests
     app.state.max_concurrent_requests = max_concurrent_requests
     _request_semaphore = asyncio.Semaphore(max_concurrent_requests)
-    logger.info(f"Request concurrency limited to {max_concurrent_requests}")
+    if is_main_multiprocessing_process():
+        logger.info(f"Request concurrency limited to {max_concurrent_requests}")
 
     app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.state.public_bind_exposed = env_flag_enabled(
+        MINERU_API_PUBLIC_BIND_EXPOSED_ENV,
+        default=False,
+    )
+    app.state.allow_public_http_client = env_flag_enabled(
+        MINERU_API_ALLOW_PUBLIC_HTTP_CLIENT_ENV,
+        default=False,
+    )
+    default_service_config, default_model_config = split_service_and_model_config(
+        {
+            "enable_vlm_preload": env_flag_enabled(
+                "MINERU_API_ENABLE_VLM_PRELOAD",
+                default=False,
+            )
+        }
+    )
+    app.state.service_config = default_service_config
+    app.state.config = default_model_config
+    app.state.task_manager = None
     return app
 
 
 app = create_app()
+
+
+async def startup_app_state(app: FastAPI) -> "AsyncTaskManager":
+    task_manager = AsyncTaskManager(app)
+    await task_manager.start()
+    try:
+        service_config = getattr(app.state, "service_config", {})
+        model_config = getattr(app.state, "config", {})
+        maybe_preload_vlm_model(
+            bool(service_config.get("enable_vlm_preload", False)),
+            model_kwargs=model_config,
+        )
+    except Exception:
+        await task_manager.shutdown()
+        app.state.task_manager = None
+        raise
+
+    app.state.task_manager = task_manager
+    return task_manager
+
+
+async def shutdown_app_state(app: FastAPI) -> None:
+    current_task_manager = getattr(app.state, "task_manager", None)
+    if current_task_manager is not None:
+        await current_task_manager.shutdown()
+    app.state.task_manager = None
+    shutdown_runtime_resources()
+
+
+def shutdown_runtime_resources() -> None:
+    try:
+        shutdown_cached_models()
+    except Exception as exc:
+        logger.warning(f"Failed to shutdown cached VLM models: {exc}")
+
+    try:
+        shutdown_pdf_render_executor()
+    except Exception as exc:
+        logger.warning(f"Failed to shutdown PDF render executor: {exc}")
 
 
 def utc_now_iso() -> str:
@@ -258,16 +337,12 @@ def get_output_root() -> Path:
     return root.resolve()
 
 
-def validate_parse_method(parse_method: str) -> str:
-    if parse_method not in ALLOWED_PARSE_METHODS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid parse_method. Allowed values: "
-                + ", ".join(sorted(ALLOWED_PARSE_METHODS))
-            ),
-        )
-    return parse_method
+def warn_if_public_http_client_policy(host: str, allow_public_http_client: bool) -> None:
+    _warn_if_public_http_client_policy(
+        service_name="API",
+        host=host,
+        allow_public_http_client=allow_public_http_client,
+    )
 
 
 def cleanup_file(file_path: str) -> None:
@@ -311,7 +386,7 @@ def get_images_dir_image_paths(images_dir: str) -> list[str]:
     return sorted(
         str(path)
         for path in Path(images_dir).iterdir()
-        if path.is_file() and path.suffix.lstrip(".").lower() in image_suffixes
+        if path.is_file() and path.suffix.lstrip(".").lower() in RESULT_IMAGE_SUFFIXES
     )
 
 
@@ -527,7 +602,17 @@ def create_result_zip(
     return zip_path
 
 
-def build_result_response(
+def _cleanup_generated_zip_task(task: asyncio.Task[str]) -> None:
+    try:
+        generated_zip_path = task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+    cleanup_file(generated_zip_path)
+
+
+async def build_result_response(
     background_tasks: BackgroundTasks,
     status_code: int,
     output_dir: str,
@@ -541,29 +626,39 @@ def build_result_response(
     return_images: bool,
     response_format_zip: bool,
     return_original_file: bool,
+    zip_filename: str = "results.zip",
 ) -> Response:
     if response_format_zip:
-        zip_path = create_result_zip(
-            output_dir=output_dir,
-            pdf_file_names=pdf_file_names,
-            backend=backend,
-            parse_method=parse_method,
-            return_md=return_md,
-            return_middle_json=return_middle_json,
-            return_model_output=return_model_output,
-            return_content_list=return_content_list,
-            return_images=return_images,
-            return_original_file=return_original_file,
+        zip_task = asyncio.create_task(
+            asyncio.to_thread(
+                create_result_zip,
+                output_dir=output_dir,
+                pdf_file_names=pdf_file_names,
+                backend=backend,
+                parse_method=parse_method,
+                return_md=return_md,
+                return_middle_json=return_middle_json,
+                return_model_output=return_model_output,
+                return_content_list=return_content_list,
+                return_images=return_images,
+                return_original_file=return_original_file,
+            )
         )
+        try:
+            zip_path = await asyncio.shield(zip_task)
+        except asyncio.CancelledError:
+            zip_task.add_done_callback(_cleanup_generated_zip_task)
+            raise
         background_tasks.add_task(cleanup_file, zip_path)
         return FileResponse(
             path=zip_path,
             media_type="application/zip",
-            filename="results.zip",
+            filename=zip_filename,
             status_code=status_code,
         )
 
-    result_dict = build_result_dict(
+    result_dict = await asyncio.to_thread(
+        build_result_dict,
         output_dir=output_dir,
         pdf_file_names=pdf_file_names,
         backend=backend,
@@ -594,14 +689,14 @@ def build_task_submission_response(
     return JSONResponse(status_code=202, content=payload)
 
 
-def build_sync_file_parse_response(
+async def build_sync_file_parse_response(
     background_tasks: BackgroundTasks,
     task: AsyncParseTask,
     request: Request,
 ) -> Response:
     task_payload = task.to_status_payload(request)
     if task.response_format_zip:
-        response = build_result_response(
+        response = await build_result_response(
             background_tasks=background_tasks,
             status_code=200,
             output_dir=task.output_dir,
@@ -615,6 +710,7 @@ def build_sync_file_parse_response(
             return_images=task.return_images,
             response_format_zip=task.response_format_zip,
             return_original_file=task.return_original_file,
+            zip_filename=f"{task.task_id}.zip",
         )
         response.headers[FILE_PARSE_TASK_ID_HEADER] = task.task_id
         response.headers[FILE_PARSE_TASK_STATUS_HEADER] = task.status
@@ -622,7 +718,8 @@ def build_sync_file_parse_response(
         response.headers[FILE_PARSE_TASK_RESULT_URL_HEADER] = task_payload["result_url"]
         return response
 
-    result_dict = build_result_dict(
+    result_dict = await asyncio.to_thread(
+        build_result_dict,
         output_dir=task.output_dir,
         pdf_file_names=task.file_names,
         backend=task.backend,
@@ -641,106 +738,6 @@ def build_sync_file_parse_response(
             "version": __version__,
             "results": result_dict,
         },
-    )
-
-
-async def parse_request_form(
-    files: list[UploadFile] = File(
-        ..., description="Upload pdf or image files for parsing"
-    ),
-    lang_list: list[str] = Form(
-        ["ch"],
-        description="""(Adapted only for pipeline and hybrid backend)Input the languages in the pdf to improve OCR accuracy.Options:
-- ch: Chinese, English, Chinese Traditional.
-- ch_lite: Chinese, English, Chinese Traditional, Japanese.
-- ch_server: Chinese, English, Chinese Traditional, Japanese.
-- en: English.
-- korean: Korean, English.
-- japan: Chinese, English, Chinese Traditional, Japanese.
-- chinese_cht: Chinese, English, Chinese Traditional, Japanese.
-- ta: Tamil, English.
-- te: Telugu, English.
-- ka: Kannada.
-- th: Thai, English.
-- el: Greek, English.
-- latin: French, German, Afrikaans, Italian, Spanish, Bosnian, Portuguese, Czech, Welsh, Danish, Estonian, Irish, Croatian, Uzbek, Hungarian, Serbian (Latin), Indonesian, Occitan, Icelandic, Lithuanian, Maori, Malay, Dutch, Norwegian, Polish, Slovak, Slovenian, Albanian, Swedish, Swahili, Tagalog, Turkish, Latin, Azerbaijani, Kurdish, Latvian, Maltese, Pali, Romanian, Vietnamese, Finnish, Basque, Galician, Luxembourgish, Romansh, Catalan, Quechua.
-- arabic: Arabic, Persian, Uyghur, Urdu, Pashto, Kurdish, Sindhi, Balochi, English.
-- east_slavic: Russian, Belarusian, Ukrainian, English.
-- cyrillic: Russian, Belarusian, Ukrainian, Serbian (Cyrillic), Bulgarian, Mongolian, Abkhazian, Adyghe, Kabardian, Avar, Dargin, Ingush, Chechen, Lak, Lezgin, Tabasaran, Kazakh, Kyrgyz, Tajik, Macedonian, Tatar, Chuvash, Bashkir, Malian, Moldovan, Udmurt, Komi, Ossetian, Buryat, Kalmyk, Tuvan, Sakha, Karakalpak, English.
-- devanagari: Hindi, Marathi, Nepali, Bihari, Maithili, Angika, Bhojpuri, Magahi, Santali, Newari, Konkani, Sanskrit, Haryanvi, English.
-""",
-    ),
-    backend: str = Form(
-        "hybrid-auto-engine",
-        description="""The backend for parsing:
-- pipeline: More general, supports multiple languages, hallucination-free.
-- vlm-auto-engine: High accuracy via local computing power, supports Chinese and English documents only.
-- vlm-http-client: High accuracy via remote computing power(client suitable for openai-compatible servers), supports Chinese and English documents only.
-- hybrid-auto-engine: Next-generation high accuracy solution via local computing power, supports multiple languages.
-- hybrid-http-client: High accuracy via remote computing power but requires a little local computing power(client suitable for openai-compatible servers), supports multiple languages.""",
-    ),
-    parse_method: str = Form(
-        "auto",
-        description="""(Adapted only for pipeline and hybrid backend)The method for parsing PDF:
-- auto: Automatically determine the method based on the file type
-- txt: Use text extraction method
-- ocr: Use OCR method for image-based PDFs
-""",
-    ),
-    formula_enable: bool = Form(True, description="Enable formula parsing."),
-    table_enable: bool = Form(True, description="Enable table parsing."),
-    server_url: Optional[str] = Form(
-        None,
-        description="(Adapted only for <vlm/hybrid>-http-client backend)openai compatible server url, e.g., http://127.0.0.1:30000",
-    ),
-    return_md: bool = Form(True, description="Return markdown content in response"),
-    return_middle_json: bool = Form(
-        False, description="Return middle JSON in response"
-    ),
-    return_model_output: bool = Form(
-        False, description="Return model output JSON in response"
-    ),
-    return_content_list: bool = Form(
-        False, description="Return content list JSON in response"
-    ),
-    return_images: bool = Form(
-        False, description="Return extracted images in response"
-    ),
-    response_format_zip: bool = Form(
-        False, description="Return results as a ZIP file instead of JSON"
-    ),
-    return_original_file: bool = Form(
-        False,
-        description=(
-            "Include the processed original input file in the ZIP result; "
-            "ignored unless response_format_zip=true"
-        ),
-    ),
-    start_page_id: int = Form(
-        0, description="The starting page for PDF parsing, beginning from 0"
-    ),
-    end_page_id: int = Form(
-        99999, description="The ending page for PDF parsing, beginning from 0"
-    ),
-) -> ParseRequestOptions:
-    effective_return_original_file = return_original_file and response_format_zip
-    return ParseRequestOptions(
-        files=files,
-        lang_list=lang_list,
-        backend=backend,
-        parse_method=validate_parse_method(parse_method),
-        formula_enable=formula_enable,
-        table_enable=table_enable,
-        server_url=server_url,
-        return_md=return_md,
-        return_middle_json=return_middle_json,
-        return_model_output=return_model_output,
-        return_content_list=return_content_list,
-        return_images=return_images,
-        response_format_zip=response_format_zip,
-        return_original_file=effective_return_original_file,
-        start_page_id=start_page_id,
-        end_page_id=end_page_id,
     )
 
 
@@ -838,6 +835,7 @@ async def run_parse_job(
         parse_method=request_options.parse_method,
         formula_enable=request_options.formula_enable,
         table_enable=request_options.table_enable,
+        image_analysis=request_options.image_analysis,
         server_url=request_options.server_url,
         f_draw_layout_bbox=False,
         f_draw_span_bbox=False,
@@ -854,30 +852,10 @@ async def run_parse_job(
     )
 
     if request_options.backend == "pipeline":
-        async with serialize_parse_job_if_needed(request_options.backend):
-            await asyncio.to_thread(do_parse, **parse_kwargs)
+        await asyncio.to_thread(do_parse, **parse_kwargs)
     else:
-        async with serialize_parse_job_if_needed(request_options.backend):
-            await aio_do_parse(**parse_kwargs)
+        await aio_do_parse(**parse_kwargs)
     return response_file_names
-
-
-def should_serialize_parse_job(backend: str) -> bool:
-    if get_device() != "mps":
-        return False
-    return backend == "pipeline" or backend.startswith(("vlm-", "hybrid-"))
-
-
-@asynccontextmanager
-async def serialize_parse_job_if_needed(backend: str):
-    if not should_serialize_parse_job(backend):
-        yield
-        return
-    await asyncio.to_thread(_mps_parse_lock.acquire)
-    try:
-        yield
-    finally:
-        _mps_parse_lock.release()
 
 
 def create_task_output_dir(task_id: str) -> str:
@@ -910,6 +888,7 @@ async def create_async_parse_task(
             lang_list=request_options.lang_list,
             formula_enable=request_options.formula_enable,
             table_enable=request_options.table_enable,
+            image_analysis=request_options.image_analysis,
             server_url=request_options.server_url,
             return_md=request_options.return_md,
             return_middle_json=request_options.return_middle_json,
@@ -1247,7 +1226,9 @@ def get_task_manager() -> AsyncTaskManager:
 async def parse_pdf(
     http_request: Request,
     background_tasks: BackgroundTasks,
-    request_options: ParseRequestOptions = Depends(parse_request_form),
+    request_options: Annotated[
+        ParseRequestOptions, Depends(parse_request_form)
+    ],
 ):
     task = await create_async_parse_task(request_options)
     request_options = None
@@ -1274,7 +1255,7 @@ async def parse_pdf(
             },
         )
 
-    return build_sync_file_parse_response(
+    return await build_sync_file_parse_response(
         background_tasks=background_tasks,
         task=task,
         request=http_request,
@@ -1292,7 +1273,9 @@ async def parse_pdf(
 )
 async def submit_parse_task(
     http_request: Request,
-    request_options: ParseRequestOptions = Depends(parse_request_form),
+    request_options: Annotated[
+        ParseRequestOptions, Depends(parse_request_form)
+    ],
 ):
     task_manager = get_task_manager()
     task = await create_async_parse_task(request_options)
@@ -1337,7 +1320,7 @@ async def get_async_task_result(
             },
         )
 
-    return build_result_response(
+    return await build_result_response(
         background_tasks=background_tasks,
         status_code=200,
         output_dir=task.output_dir,
@@ -1351,6 +1334,7 @@ async def get_async_task_result(
         return_images=task.return_images,
         response_format_zip=task.response_format_zip,
         return_original_file=task.return_original_file,
+        zip_filename=f"{task.task_id}.zip",
     )
 
 
@@ -1404,10 +1388,51 @@ async def health_check():
 @click.option("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
 @click.option("--port", default=8000, type=int, help="Server port (default: 8000)")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development mode)")
-def main(ctx, host, port, reload, **kwargs):
-    kwargs.update(arg_parse(ctx))
+@click.option(
+    "--allow-public-http-client",
+    is_flag=True,
+    help=(
+        "Allow *-http-client backends and server_url even when binding the API to "
+        "0.0.0.0 or ::."
+    ),
+)
+@click.option(
+    "--enable-vlm-preload",
+    "enable_vlm_preload",
+    type=bool,
+    default=False,
+    help="Preload the local VLM model during mineru-api startup.",
+)
+def main(
+    ctx,
+    host,
+    port,
+    reload,
+    allow_public_http_client,
+    enable_vlm_preload,
+    **kwargs,
+):
+    del kwargs
+    raw_config = arg_parse(ctx)
+    raw_config["enable_vlm_preload"] = enable_vlm_preload
+    service_config, model_config = split_service_and_model_config(raw_config)
+    public_bind_exposed = is_public_bind_host(host)
 
-    app.state.config = kwargs
+    app.state.service_config = service_config
+    app.state.config = model_config
+    configure_public_http_client_policy(
+        app,
+        public_bind_exposed=public_bind_exposed,
+        allow_public_http_client=allow_public_http_client,
+    )
+    os.environ["MINERU_API_ENABLE_VLM_PRELOAD"] = (
+        "1" if service_config["enable_vlm_preload"] else "0"
+    )
+    os.environ[MINERU_API_PUBLIC_BIND_EXPOSED_ENV] = "1" if public_bind_exposed else "0"
+    os.environ[MINERU_API_ALLOW_PUBLIC_HTTP_CLIENT_ENV] = (
+        "1" if allow_public_http_client else "0"
+    )
+    warn_if_public_http_client_policy(host, allow_public_http_client)
     access_log = not env_flag_enabled("MINERU_API_DISABLE_ACCESS_LOG")
 
     print(f"Start MinerU FastAPI Service: http://{host}:{port}")
@@ -1422,7 +1447,16 @@ def main(ctx, host, port, reload, **kwargs):
             access_log=access_log,
         )
     else:
-        uvicorn.run(app, host=host, port=port, reload=False, access_log=access_log)
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            reload=False,
+            access_log=access_log,
+        )
+        server = uvicorn.Server(config)
+        install_stdin_shutdown_watcher(server)
+        server.run()
 
 
 if __name__ == "__main__":

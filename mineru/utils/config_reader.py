@@ -194,13 +194,3 @@ def get_local_models_dir():
     if models_dir is None:
         logger.warning(f"'models-dir' not found in {CONFIG_FILE_NAME}, use None as default")
     return models_dir
-
-def get_ocr_config():
-    config = read_config()
-    if config is None:
-        return None
-    seal_config = config.get('seal-ocr-config')
-    if seal_config is None:
-        logger.warning(f"'models-dir' not found in {CONFIG_FILE_NAME}, use None as default")
-    return seal_config
-
