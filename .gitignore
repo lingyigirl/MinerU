@@ -57,5 +57,5 @@ _build/
 
 
 output/
-.opencode-rules.md
 CLAUDE.md
+agents_logs/

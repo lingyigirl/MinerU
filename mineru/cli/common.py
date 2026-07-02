@@ -255,6 +255,20 @@ def _process_output(
                 f"{pdf_file_name}_origin.pdf",
                 pdf_bytes,
             )
+            # [自定义] 生成旋转修正后的 PDF（页面朝向检测+旋转为正）
+            # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+            try:
+                from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf
+                rotated_pdf_bytes = generate_rotation_corrected_pdf(pdf_bytes)
+                if rotated_pdf_bytes:
+                    md_writer.write(
+                        f"{pdf_file_name}_rotated.pdf",
+                        rotated_pdf_bytes,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"Skipping rotation-corrected PDF for {pdf_file_name}: {exc}"
+                )
         elif process_mode in office_suffixes:
             md_writer.write(
                 f"{pdf_file_name}_origin.{process_mode}",
