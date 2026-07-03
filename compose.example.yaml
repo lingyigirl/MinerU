@@ -1,0 +1,78 @@
+# ============================================================
+# MinerU Custom — Docker Compose 示例（GPU + FastAPI）
+#
+# 这是通用示例文件，复制为 compose.yaml 后按需修改。
+# 启动: docker compose up -d
+# 停止: docker compose down
+# 查看运行状态: docker compose ps
+# 查看日志: docker compose logs -f
+# ============================================================
+
+services:
+  mineru-api:
+    # ---- 镜像（通过 build-docker.sh 构建） ----
+    image: mineru:custom
+    container_name: mineru-api
+    restart: always
+
+    # ---- 服务端口 ----
+    ports:
+      - "8000:8000"
+
+    # ---- 入口点 & 启动参数 ----
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      # --backend hybrid-engine  # 指定后端: pipeline | vlm-engine | hybrid-engine（默认）
+      # --data-parallel-size 2  # 多 GPU 并行，提升 vllm 吞吐（单 GPU 请注释掉）
+      # --gpu-memory-utilization 0.5  # vllm KV 缓存占比，显存不足时降低此值（如 0.4 或更低）
+
+    # ---- GPU 配置 ----
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]  # 可修改为多 GPU: ["0", "1"]
+              capabilities: [gpu]
+
+    # ---- 模型挂载（修改为你的实际路径） ----
+    volumes:
+      - ${MODEL_PIPELINE:-./models/pipeline}:/models/pipeline:ro  # pipeline 模型目录（PDF-Extract-Kit-1.0）
+      - ${MODEL_VLM:-./models/vlm}:/models/vlm:ro                # vlm 模型目录（MinerU2.5-Pro-2605-1.2B）
+
+    # ---- 环境变量 ----
+    environment:
+      # 模型来源: local=本地挂载 | modelscope=自动下载 | huggingface=自动下载
+      MINERU_MODEL_SOURCE: local
+      # 计算设备: cuda | cpu | npu | mps
+      MINERU_DEVICE_MODE: cuda
+      # 解析后端: pipeline | vlm-engine | hybrid-engine（默认，需要 vlm + pipeline 模型）
+      MINERU_BACKEND: hybrid-engine
+      # 启用公式识别（vlm/pipeline 后端）
+      MINERU_VLM_FORMULA_ENABLE: "true"
+      # 启用表格识别（vlm/pipeline 后端）
+      MINERU_VLM_TABLE_ENABLE: "true"
+      # 滑窗处理页面数，长文档自动分批，降低峰值显存
+      MINERU_PROCESSING_WINDOW_SIZE: "64"
+      # API 输出目录（可选，默认为临时目录）
+      # MINERU_API_OUTPUT_ROOT: /opt/mineru/output
+      # 日志级别（可选，默认 INFO）
+      # MINERU_LOG_LEVEL: INFO
+      # 限制可见 GPU（可选，等价于 nvidia 运行时环境变量）
+      # CUDA_VISIBLE_DEVICES: "0"
+
+    # ---- vllm 基镜像需要（大页内存锁 + 无限制栈 + 宿主机 IPC） ----
+    ulimits:
+      memlock: -1   # 无限制锁定内存（vllm 需要）
+      stack: 67108864  # 栈大小 64MB
+    ipc: host  # 共享宿主机 IPC 命名空间（vllm 多进程通信需要）
+
+    # ---- 健康检查 ----
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s     # 每 30 秒检查一次
+      timeout: 10s      # 单次检查超时
+      start-period: 120s  # 启动宽限期（模型加载需要时间）
+      retries: 3        # 失败重试次数

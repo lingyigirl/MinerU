@@ -59,3 +59,6 @@ _build/
 output/
 CLAUDE.md
 agents_logs/
+# 本地运行配置，不提交
+compose.yaml
+mineru.json
