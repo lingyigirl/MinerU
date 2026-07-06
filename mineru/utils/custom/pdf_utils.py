@@ -34,24 +34,30 @@ def generate_rotation_corrected_pdf(pdf_bytes: bytes, dpi: int = DEFAULT_PDF_IMA
             image_type=ImageType.PIL,
         )
     except Exception as exc:
-        logger.warning(f"Failed to render pages for rotation-corrected PDF: {exc}")
+        logger.warning(
+            f"旋转修正PDF——页面渲染失败（pdf_bytes长度={len(pdf_bytes)}字节，dpi={dpi}）: {exc}"
+        )
         return b""
 
     if not images_list:
+        logger.warning(
+            f"旋转修正PDF——渲染结果为空（pdf_bytes长度={len(pdf_bytes)}字节，dpi={dpi}），"
+            f"可能原因：PDF页数为0、渲染DPI下无有效页面、或PDF格式不被pypdfium2支持"
+        )
         return b""
 
-    for img_dict in images_list:
+    for idx, img_dict in enumerate(images_list):
         try:
             image_rotate(img_dict)
         except Exception as exc:
             logger.warning(
-                f"Failed to rotate page for rotation-corrected PDF: {exc}"
+                f"旋转修正PDF——第{idx}页旋转失败: {exc}"
             )
 
     try:
         return pdf_images_to_pdf_bytes(images_list)
     except Exception as exc:
         logger.warning(
-            f"Failed to generate rotation-corrected PDF bytes: {exc}"
+            f"旋转修正PDF——图片合成PDF失败（{len(images_list)}张修正后图片）: {exc}"
         )
         return b""

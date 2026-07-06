@@ -586,10 +586,12 @@ def create_result_zip(
 
             if return_original_file:
                 origin_pattern = f"{pdf_name}_origin."
+                rotated_name = f"{pdf_name}_rotated.pdf"
                 for path in sorted(Path(parse_dir).iterdir()):
                     if not path.is_file():
                         continue
-                    if not path.name.startswith(origin_pattern):
+                    # [自定义] 同时收集 _origin.* 和 _rotated.pdf（旋转修正后的原始文件）
+                    if not path.name.startswith(origin_pattern) and path.name != rotated_name:
                         continue
                     zf.write(
                         str(path),

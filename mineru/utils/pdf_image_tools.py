@@ -512,7 +512,7 @@ def _rotate_sub_image(crop_img: Image.Image) -> Image.Image:
 
 def getPilImageBytes(images_list):
     """Convert a list of PIL Images to multi-page PDF bytes."""
-    pdf_bytes_io = io.BytesIO()
+    pdf_bytes_io = BytesIO()
     if not images_list:
         return b""
     images_list[0].save(pdf_bytes_io, format="PDF", save_all=True, append_images=images_list[1:])
@@ -563,8 +563,9 @@ def _correct_sub_regions_in_page(pil_img: Image.Image, cls_model) -> Image.Image
     mid = h // 2
     top_np = np_img[:mid, :, :]
     bottom_np = np_img[mid:, :, :]
-    top_label = cls_model.predict_direct(top_np)
-    bottom_label = cls_model.predict_direct(bottom_np)
+    # [自定义] MineruTableOrientationClsModel 无 predict_direct，用 predict 替代
+    top_label = cls_model.predict(top_np)
+    bottom_label = cls_model.predict(bottom_np)
     if top_label == "0" and bottom_label == "0":
         return pil_img
 
@@ -592,14 +593,45 @@ def _correct_sub_regions_in_page(pil_img: Image.Image, cls_model) -> Image.Image
     return result
 
 
+def _rotate_image_dict_by_label(image_dict: dict, label: str) -> None:
+    """按标签原地旋转 image_dict 中的 table_img 和 wired_table_img。
+
+    [自定义] 从 PaddleOrientationClsModel.img_rotate 提取，
+    因 MinerUTableOrientationClsModel 无此方法。
+    """
+    if label == "270":
+        image_dict["table_img"] = cv2.rotate(
+            np.asarray(image_dict["table_img"]), cv2.ROTATE_90_CLOCKWISE
+        )
+        image_dict["wired_table_img"] = cv2.rotate(
+            np.asarray(image_dict["wired_table_img"]), cv2.ROTATE_90_CLOCKWISE
+        )
+    elif label == "90":
+        image_dict["table_img"] = cv2.rotate(
+            np.asarray(image_dict["table_img"]), cv2.ROTATE_90_COUNTERCLOCKWISE
+        )
+        image_dict["wired_table_img"] = cv2.rotate(
+            np.asarray(image_dict["wired_table_img"]), cv2.ROTATE_90_COUNTERCLOCKWISE
+        )
+    elif label == "180":
+        image_dict["table_img"] = cv2.rotate(
+            np.asarray(image_dict["table_img"]), cv2.ROTATE_180
+        )
+        image_dict["wired_table_img"] = cv2.rotate(
+            np.asarray(image_dict["wired_table_img"]), cv2.ROTATE_180
+        )
+    # 0 度不做处理
+
+
 def image_rotate(image_dict):
     """Detect and rotate a page image. Handles mixed-orientation pages."""
     ng_img = image_dict['img_pil']
     from mineru.backend.pipeline.model_init import AtomModelSingleton
     from mineru.backend.pipeline.model_list import AtomicModel
     atom_model_manager = AtomModelSingleton()
+    # [自定义] 上游 AtomicModel.ImgOrientationCls 已更名为 TableOrientationCls
     img_orientation_cls_model = atom_model_manager.get_atom_model(
-        atom_model_name=AtomicModel.ImgOrientationCls,
+        atom_model_name=AtomicModel.TableOrientationCls,
     )
     image_dict["table_img"] = ng_img
     image_dict['wired_table_img'] = ng_img
@@ -607,8 +639,9 @@ def image_rotate(image_dict):
 
     np_img = np.asarray(ng_img)
     h_img, w_img = np_img.shape[:2]
-    top_label = img_orientation_cls_model.predict_direct(np_img[:h_img // 2, :, :])
-    bottom_label = img_orientation_cls_model.predict_direct(np_img[h_img // 2:, :, :])
+    # [自定义] MineruTableOrientationClsModel 无 predict_direct，用 predict 替代
+    top_label = img_orientation_cls_model.predict(np_img[:h_img // 2, :, :])
+    bottom_label = img_orientation_cls_model.predict(np_img[h_img // 2:, :, :])
 
     if top_label != "0" or bottom_label != "0":
         if top_label != bottom_label or (top_label != "0" and rotate_label != top_label):
@@ -625,7 +658,8 @@ def image_rotate(image_dict):
         rotate_label = None
 
     if rotate_label is not None:
-        img_orientation_cls_model.img_rotate(image_dict, rotate_label)
+        # [自定义] MineruTableOrientationClsModel 无 img_rotate 方法，内联实现
+        _rotate_image_dict_by_label(image_dict, rotate_label)
 
     rotate_img = image_dict["table_img"]
     if not isinstance(rotate_img, Image.Image):
