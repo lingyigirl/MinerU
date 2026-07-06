@@ -1,5 +1,5 @@
 # ============================================================
-# MinerU 3.2.0 Custom — GPU 服务器 FastAPI 部署
+# MinerU 4.2.0 Custom — GPU 服务器 FastAPI 部署
 # 模型打包进镜像，开箱即用
 #
 # 构建: docker build -t mineru:custom .
@@ -25,16 +25,15 @@ RUN apt-get update && \
 # ---- 设置工作目录 ----
 WORKDIR /opt/mineru
 
-# ---- 先拷贝依赖文件（利用 Docker 缓存层） ----
+# ---- 先拷贝依赖文件和源码（version.py 供 pyproject.toml 动态读取版本号） ----
 COPY pyproject.toml README.md ./
+COPY mineru/ ./mineru/
 
 # ---- 安装核心依赖 ----
 RUN python3 -m pip install --no-cache-dir -e ".[core]" --break-system-packages && \
     python3 -m pip install --no-cache-dir "mineru-vl-utils>=1.0.0" --break-system-packages && \
+    python3 -m pip install --no-cache-dir "pdftext<0.7.0" --break-system-packages && \
     python3 -m pip cache purge
-
-# ---- 拷贝项目源码 ----
-COPY mineru/ ./mineru/
 
 # ---- 配置文件（模型通过运行时挂载） ----
 RUN printf '{\n\
@@ -59,4 +58,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # ---- 启动 FastAPI 服务 ----
-ENTRYPOINT ["mineru-api", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["mineru-api"]
