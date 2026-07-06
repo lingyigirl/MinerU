@@ -916,7 +916,7 @@ def union_make(pdf_info_dict: list,
                     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
                     try:
                         from mineru.utils.custom.content_list_utils import enrich_list_items_with_bbox
-                        enrich_list_items_with_bbox(para_content, para_block)
+                        enrich_list_items_with_bbox(para_content, para_block, page_size)
                     except Exception as exc:
                         logger.warning(
                             f"enrich_list_items_with_bbox 执行失败，将使用原始 list 输出: {exc}"

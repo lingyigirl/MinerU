@@ -9,7 +9,11 @@
 from typing import Any
 
 
-def enrich_list_items_with_bbox(para_content: dict[str, Any], para_block: dict[str, Any]) -> None:
+def enrich_list_items_with_bbox(
+    para_content: dict[str, Any],
+    para_block: dict[str, Any],
+    page_size: tuple[int, int],
+) -> None:
     """为 content_list_v2 中 LIST 类型的每个 list_item 补充独立 bbox。
 
     上游 make_blocks_to_content_list_v2() 生成的 LIST 段落中，
@@ -20,7 +24,8 @@ def enrich_list_items_with_bbox(para_content: dict[str, Any], para_block: dict[s
     Args:
         para_content: make_blocks_to_content_list_v2() 生成的段落内容，
                       会被原地修改（in-place）。
-        para_block:   原始段落数据，包含 blocks 列表及 page_size。
+        para_block:   原始段落数据，包含 blocks 列表。
+        page_size:    页面尺寸 (width, height)，用于 bbox 归一化。
     """
     if para_content.get("type") != "list":
         return
@@ -28,10 +33,6 @@ def enrich_list_items_with_bbox(para_content: dict[str, Any], para_block: dict[s
     list_items = para_content.get("content", {}).get("list_items")
     raw_blocks = para_block.get("blocks")
     if not list_items or not raw_blocks:
-        return
-
-    page_size = para_block.get("page_size")
-    if not page_size:
         return
 
     page_width, page_height = page_size
