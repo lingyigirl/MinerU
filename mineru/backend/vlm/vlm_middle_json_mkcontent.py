@@ -720,13 +720,25 @@ def make_blocks_to_content_list_v2(para_block, img_buket_path, page_size):
         else:
             list_type = ContentTypeV2.LIST_TEXT
         list_items = []
+        page_width, page_height = page_size
         for block in para_block['blocks']:
             item_content = merge_para_with_text_v2(block)
             if item_content:
-                list_items.append({
+                item_data = {
                     'item_type': 'text',
                     'item_content': item_content,
-                })
+                }
+                # 提取每个 list_item 的独立 bbox，与父级 bbox 使用相同归一化逻辑
+                item_bbox = block.get('bbox')
+                if item_bbox:
+                    ix0, iy0, ix1, iy1 = item_bbox
+                    item_data['bbox'] = [
+                        int(ix0 * 1000 / page_width),
+                        int(iy0 * 1000 / page_height),
+                        int(ix1 * 1000 / page_width),
+                        int(iy1 * 1000 / page_height),
+                    ]
+                list_items.append(item_data)
         para_content = {
             'type': ContentTypeV2.LIST,
             'content': {
