@@ -7,3 +7,7 @@
 # 1. 新增功能/函数放在此目录下的对应模块中
 # 2. 对上游文件的修改仅限于最小化的 hook 点（try/except import + 调用）
 # 3. 所有自定义代码需添加清晰的注释说明用途
+#
+# 当前模块：
+# - pdf_utils.py: PDF 旋转修正功能（generate_rotation_corrected_pdf）
+# - content_list_utils.py: content_list_v2 后处理（list_item 独立 bbox）
