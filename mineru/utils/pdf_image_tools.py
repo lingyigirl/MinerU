@@ -563,9 +563,8 @@ def _correct_sub_regions_in_page(pil_img: Image.Image, cls_model) -> Image.Image
     mid = h // 2
     top_np = np_img[:mid, :, :]
     bottom_np = np_img[mid:, :, :]
-    # [自定义] MineruTableOrientationClsModel 无 predict_direct，用 predict 替代
-    top_label = cls_model.predict(top_np)
-    bottom_label = cls_model.predict(bottom_np)
+    top_label = cls_model.predict_direct(top_np)
+    bottom_label = cls_model.predict_direct(bottom_np)
     if top_label == "0" and bottom_label == "0":
         return pil_img
 
@@ -593,80 +592,36 @@ def _correct_sub_regions_in_page(pil_img: Image.Image, cls_model) -> Image.Image
     return result
 
 
-def _rotate_image_dict_by_label(image_dict: dict, label: str) -> None:
-    """按标签原地旋转 image_dict 中的 table_img 和 wired_table_img。
-
-    [自定义] 从 PaddleOrientationClsModel.img_rotate 提取，
-    因 MinerUTableOrientationClsModel 无此方法。
-    """
-    if label == "270":
-        image_dict["table_img"] = cv2.rotate(
-            np.asarray(image_dict["table_img"]), cv2.ROTATE_90_CLOCKWISE
-        )
-        image_dict["wired_table_img"] = cv2.rotate(
-            np.asarray(image_dict["wired_table_img"]), cv2.ROTATE_90_CLOCKWISE
-        )
-    elif label == "90":
-        image_dict["table_img"] = cv2.rotate(
-            np.asarray(image_dict["table_img"]), cv2.ROTATE_90_COUNTERCLOCKWISE
-        )
-        image_dict["wired_table_img"] = cv2.rotate(
-            np.asarray(image_dict["wired_table_img"]), cv2.ROTATE_90_COUNTERCLOCKWISE
-        )
-    elif label == "180":
-        image_dict["table_img"] = cv2.rotate(
-            np.asarray(image_dict["table_img"]), cv2.ROTATE_180
-        )
-        image_dict["wired_table_img"] = cv2.rotate(
-            np.asarray(image_dict["wired_table_img"]), cv2.ROTATE_180
-        )
-    # 0 度不做处理
-
-
 def image_rotate(image_dict):
-    """Detect and rotate a page image. Handles mixed-orientation pages."""
+    """Detect and rotate a page image using ONNX orientation classifier.
+
+    使用 PaddleOrientationClsModel（基于 ONNX 的图像特征分类器）对整页做朝向检测。
+    能处理混合朝向页面（上半部分和下半部分方向不同）。
+
+    [自定义] 上游从 PaddleOrientationClsModel 切换到 MineruTableOrientationClsModel
+    后，image_rotate 未同步更新。MineruTableOrientationClsModel 是表格朝向模型，
+    基于 OCR 竖排文字检测，对整页图片始终返回 "0"。此处使用 PaddleOrientationClsModel
+    的 predict_direct() 直接做 ONNX 图像分类，正确处理整页朝向。
+    """
     ng_img = image_dict['img_pil']
-    from mineru.backend.pipeline.model_init import AtomModelSingleton
-    from mineru.backend.pipeline.model_list import AtomicModel
-    atom_model_manager = AtomModelSingleton()
-    # [自定义] 上游 AtomicModel.ImgOrientationCls 已更名为 TableOrientationCls
-    img_orientation_cls_model = atom_model_manager.get_atom_model(
-        atom_model_name=AtomicModel.TableOrientationCls,
-    )
-    image_dict["table_img"] = ng_img
-    image_dict['wired_table_img'] = ng_img
-    rotate_label = img_orientation_cls_model.predict(ng_img)
+    cls_model = _get_orientation_cls_model()
+
+    rotate_label = cls_model.predict_direct(ng_img)
 
     np_img = np.asarray(ng_img)
     h_img, w_img = np_img.shape[:2]
-    # [自定义] MineruTableOrientationClsModel 无 predict_direct，用 predict 替代
-    top_label = img_orientation_cls_model.predict(np_img[:h_img // 2, :, :])
-    bottom_label = img_orientation_cls_model.predict(np_img[h_img // 2:, :, :])
+    top_label = cls_model.predict_direct(np_img[:h_img // 2, :, :])
+    bottom_label = cls_model.predict_direct(np_img[h_img // 2:, :, :])
 
     if top_label != "0" or bottom_label != "0":
         if top_label != bottom_label or (top_label != "0" and rotate_label != top_label):
-            corrected_img = _correct_sub_regions_in_page(ng_img, img_orientation_cls_model)
-            image_dict["table_img"] = corrected_img
-            image_dict['wired_table_img'] = corrected_img
+            ng_img = _correct_sub_regions_in_page(ng_img, cls_model)
             rotate_label = None
-        else:
-            image_dict["table_img"] = ng_img
-            image_dict['wired_table_img'] = ng_img
     else:
-        image_dict["table_img"] = ng_img
-        image_dict['wired_table_img'] = ng_img
         rotate_label = None
 
     if rotate_label is not None:
-        # [自定义] MineruTableOrientationClsModel 无 img_rotate 方法，内联实现
-        _rotate_image_dict_by_label(image_dict, rotate_label)
+        ng_img = cls_model.rotate_pil_image(ng_img, rotate_label)
 
-    rotate_img = image_dict["table_img"]
-    if not isinstance(rotate_img, Image.Image):
-        rotate_img = Image.fromarray(rotate_img.astype(np.uint8))
-    image_dict['img_pil'] = rotate_img
-    del image_dict['table_img']
-    del image_dict['wired_table_img']
-    if 'rotate_label' in image_dict:
-        del image_dict['rotate_label']
+    image_dict['img_pil'] = ng_img
     return image_dict
