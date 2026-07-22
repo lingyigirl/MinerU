@@ -1962,3 +1962,119 @@ def _classify_ocr_item_type(text: str) -> str:
     if _is_data_value(text):
         return "number"
     return "text"
+
+
+# ============================================================
+# Hybrid 模式表格 OCR 调度（从 hybrid_model_output_to_middle_json.py 的 hook 调用）
+# ============================================================
+
+def supplement_vlm_table_cells_with_ocr(
+    pdf_info_list: list,
+    hybrid_pipeline_model,
+) -> None:
+    """使用 Pipeline OCR 识别结果补充 VLM 表格 HTML 中的空单元格。
+
+    遍历所有表格 span，对有空单元格的表格：
+    1. 加载表格截图
+    2. 运行 PaddleOCR 获取文字识别结果
+    3. 按行列聚类 OCR 文字为网格
+    4. 将 OCR 网格文字填充到 VLM HTML 对应空单元格
+
+    [自定义] 此函数由 hybrid_model_output_to_middle_json.py 中的 hook 调用。
+    上游合并时此模块仅需保留，无需修改。
+
+    Args:
+        pdf_info_list: 中间 JSON 的页面列表。
+        hybrid_pipeline_model: Hybrid pipeline 模型实例（含 ocr_model）。
+    """
+    import cv2
+    from bs4 import BeautifulSoup
+    from mineru.backend.utils.para_block_utils import iter_block_spans
+    from mineru.utils.enum_class import ContentType
+
+    ocr_model = hybrid_pipeline_model.ocr_model
+    filled_count = 0
+    skipped_count = 0
+
+    for page_info in pdf_info_list:
+        for block in page_info.get("preproc_blocks", []):
+            for span in iter_block_spans(block):
+                if span.get("type") != ContentType.TABLE:
+                    continue
+
+                html = span.get("html", "")
+                if not html:
+                    continue
+
+                # 检查是否有空单元格需要填充
+                try:
+                    soup = BeautifulSoup(html, "html.parser")
+                    table = soup.find("table")
+                    if not table:
+                        continue
+                    # 快速检查：是否存在空文本的 <td>
+                    has_empty = any(
+                        not cell.get_text().strip()
+                        for cell in table.find_all("td")
+                    )
+                    if not has_empty:
+                        continue
+                except Exception:
+                    continue
+
+                # 获取表格图片路径并加载
+                image_path = span.get("image_path", "")
+                if not image_path:
+                    skipped_count += 1
+                    continue
+
+                try:
+                    table_img = cv2.imread(image_path)
+                    if table_img is None:
+                        skipped_count += 1
+                        continue
+                except Exception:
+                    skipped_count += 1
+                    continue
+
+                h, w = table_img.shape[:2]
+                if h < 10 or w < 10:
+                    skipped_count += 1
+                    continue
+
+                # 运行 PaddleOCR 获取文字
+                try:
+                    ocr_output = ocr_model.ocr(table_img, det=True, rec=True)
+                except Exception:
+                    logger.exception("表格图片 PaddleOCR 执行失败")
+                    skipped_count += 1
+                    continue
+
+                if not ocr_output or not ocr_output[0]:
+                    skipped_count += 1
+                    continue
+
+                ocr_results = ocr_output[0]
+
+                # 调用表格补充函数
+                try:
+                    new_html = supplement_empty_table_cells(
+                        html, ocr_results, w
+                    )
+                    if new_html != html:
+                        span["html"] = new_html
+                        filled_count += 1
+                        logger.debug(
+                            f"OCR 补充表格单元格成功："
+                            f"图片={image_path.split('/')[-1]}"
+                        )
+                except Exception:
+                    logger.exception("supplement_empty_table_cells 执行失败")
+                    skipped_count += 1
+                    continue
+
+    if filled_count > 0:
+        logger.info(
+            f"Pipeline OCR 表格补充完成：填入了 {filled_count} 个表格的空单元格，"
+            f"跳过 {skipped_count} 个表格"
+        )
