@@ -434,6 +434,16 @@ def doc_analyze(
         predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
 
+    # [自定义] 在解析入口处对 PDF 做整体旋转修正
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf
+        rotated_pdf = generate_rotation_corrected_pdf(pdf_bytes)
+        if rotated_pdf:
+            pdf_bytes = rotated_pdf
+    except Exception as exc:
+        logger.warning(f"PDF 旋转修正失败，使用原始 PDF 继续解析: {exc}")
+
     pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
     middle_json = init_middle_json()
     results = []
@@ -529,6 +539,16 @@ async def aio_doc_analyze(
     if predictor is None:
         predictor = await _get_model_async(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
+
+    # [自定义] 在解析入口处对 PDF 做整体旋转修正
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf
+        rotated_pdf = generate_rotation_corrected_pdf(pdf_bytes)
+        if rotated_pdf:
+            pdf_bytes = rotated_pdf
+    except Exception as exc:
+        logger.warning(f"PDF 旋转修正失败，使用原始 PDF 继续解析: {exc}")
 
     pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
     middle_json = init_middle_json()
