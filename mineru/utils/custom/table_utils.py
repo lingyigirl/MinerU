@@ -1629,3 +1629,336 @@ def _has_colspan_mismatch(html: str) -> bool:
             return True
 
     return False
+
+
+# ============================================================
+# Hybrid 模式表格 OCR 补全（方案 B：Pipeline OCR 补充 VLM 表格）
+# ============================================================
+
+def supplement_empty_table_cells(
+    vlm_html: str,
+    ocr_results: list,
+    table_img_width: int = 0,
+) -> str:
+    """使用 PaddleOCR 文字网格补充 VLM 表格中的空单元格。
+
+    VLM 能正确识别表格结构但可能遗漏个别单元格文字（如税率值），
+    而 PaddleOCR 对文字识别精度很高。此函数将两者合并：
+    - VLM HTML 提供表格结构（行列布局、colspan/rowspan）
+    - PaddleOCR 提供精准的文字内容
+    - 将 OCR 文字按坐标聚类成行列网格，填充到 VLM HTML 的空单元格中
+
+    算法：
+    1. 解析 VLM HTML → 提取每个单元格的文本和行列位置
+    2. 将 OCR 结果按 y 坐标聚类分行，再按 x 坐标排序得列 → 形成 OCR 网格
+    3. OCR 网格与 VLM 网格执行对齐匹配
+    4. 若 VLM 单元格为空且 OCR 网格对应位置有文字 → 填充
+
+    Args:
+        vlm_html: VLM 模型生成的表格 HTML 字符串。
+        ocr_results: PaddleOCR (det+rec) 的输出结果，
+            格式为 [[box_points, ['text', score]], ...]。
+        table_img_width: 表格图片的像素宽度，用于 x 坐标列的聚类半径计算。
+
+    Returns:
+        补充后的 HTML 字符串；若无需补充则返回原字符串。
+    """
+    if not vlm_html or not ocr_results:
+        return vlm_html
+
+    try:
+        soup = BeautifulSoup(vlm_html, "html.parser")
+    except Exception:
+        logger.warning("BeautifulSoup 解析表格 HTML 失败，跳过 OCR 补充")
+        return vlm_html
+
+    # 构建 OCR 网格
+    ocr_grid = _build_ocr_text_grid(ocr_results, table_img_width)
+    if not ocr_grid:
+        return vlm_html
+
+    # 找到所有表格
+    modified = False
+    for table in soup.find_all("table"):
+        try:
+            modified = _fill_empty_cells_from_ocr_grid(
+                soup, table, ocr_grid
+            ) or modified
+        except Exception:
+            logger.exception("OCR 网格填充单表时出错，跳过此表格")
+            continue
+
+    if modified:
+        return str(soup)
+    return vlm_html
+
+
+def _build_ocr_text_grid(
+    ocr_results: list,
+    table_img_width: int = 0,
+) -> list[list[str]]:
+    """将 PaddleOCR 结果按行列聚类为二维文字网格。
+
+    步骤：
+    1. 提取每个 OCR 项的文本和 bbox 中心点
+    2. 按 y 坐标聚类分行（使用相邻文字行的 y 间距中位数作为聚类阈值）
+    3. 每行内按 x 坐标排序
+
+    Args:
+        ocr_results: PaddleOCR 的 det+rec 输出。
+        table_img_width: 表格图片宽度（像素），用于估算列聚类半径。
+
+    Returns:
+        二维文字网格 list[list[str]]，grid[row][col] = 文字。
+    """
+    if not ocr_results:
+        return []
+
+    # 提取 (x_center, y_center, text) 三元组
+    items = []
+    for res in ocr_results:
+        try:
+            bbox = res[0]
+            text_info = res[1]
+            if isinstance(text_info, (list, tuple)):
+                text = str(text_info[0]) if text_info[0] else ""
+            else:
+                text = str(text_info) if text_info else ""
+
+            if not text.strip():
+                continue
+
+            # 计算 bbox 中心点
+            if isinstance(bbox[0], (list, tuple)):
+                # 四点格式 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+                xs = [p[0] for p in bbox]
+                ys = [p[1] for p in bbox]
+            else:
+                # 扁平格式 [x1,y1,x2,y2,...]
+                xs = [bbox[i] for i in range(0, len(bbox), 2)]
+                ys = [bbox[i] for i in range(1, len(bbox), 2)]
+
+            cx = sum(xs) / len(xs)
+            cy = sum(ys) / len(ys)
+            items.append((cx, cy, text.strip()))
+        except (IndexError, TypeError, ValueError):
+            continue
+
+    if not items:
+        return []
+
+    # 按 y 坐标排序
+    items.sort(key=lambda it: it[1])
+
+    # 按 y 坐标相似度聚类分行
+    # 同一行的文字具有接近的 y 坐标（差异 < 10 像素）
+    # 不同行的文字有显著不同的 y 坐标
+    Y_TOLERANCE = 10.0
+    rows = []
+    current_row = [items[0]]
+    for item in items[1:]:
+        current_avg_y = sum(it[1] for it in current_row) / len(current_row)
+        if abs(item[1] - current_avg_y) <= Y_TOLERANCE:
+            current_row.append(item)
+        else:
+            rows.append(current_row)
+            current_row = [item]
+    rows.append(current_row)
+
+    # 每行内按 x 排序
+    grid = []
+    for row in rows:
+        row.sort(key=lambda it: it[0])
+        grid.append([it[2] for it in row])
+
+    return grid
+
+
+def _fill_empty_cells_from_ocr_grid(
+    soup: BeautifulSoup,
+    table: Tag,
+    ocr_grid: list[list[str]],
+) -> bool:
+    """将 OCR 网格中的文字填充到表格中的空单元格。
+
+    匹配策略：
+    1. 遍历 VLM 表格所有行，收集每个 <td> 的文本
+    2. 识别哪一行/列对应 OCR 网格的哪一行/列
+    3. 对于每个空单元格，尝试从 OCR 网格对应位置取文字填充
+
+    Args:
+        soup: BeautifulSoup 对象。
+        table: <table> Tag。
+        ocr_grid: OCR 识别文字网格。
+
+    Returns:
+        是否对表格做了任何修改。
+    """
+    rows = table.find_all("tr")
+    if not rows:
+        return False
+
+    # 解析 VLM 表格：收集每行的单元格文本和行列信息
+    vlm_data = []  # list[list[str]]  每行每列的文本
+    vlm_cells = []  # list[list[Tag]]  对应的 BeautifulSoup Tag
+
+    for row in rows:
+        row_cells = row.find_all(["td", "th"])
+        if not row_cells:
+            continue
+
+        row_texts = []
+        row_tags = []
+        for cell in row_cells:
+            colspan = int(cell.get("colspan", 1))
+            text = cell.get_text().strip()
+            # colspan > 1 的单元格展开（重复填入多次以对齐网格）
+            for _ in range(colspan):
+                row_texts.append(text)
+                row_tags.append(cell)
+        vlm_data.append(row_texts)
+        vlm_cells.append(row_tags)
+
+    if not vlm_data:
+        return False
+
+    # 确定 VLM 表格的列数（取最大行宽）
+
+    # 计算 OCR 网格的维度（取最大列数）
+    ocr_nrows = len(ocr_grid)
+    if ocr_nrows == 0:
+        return False
+
+    # 跳过表头行（第一行 + 任何包含 <th> 的行）
+    data_row_start = 0
+    for i, row in enumerate(rows):
+        if row.find("th"):
+            data_row_start = i + 1
+        else:
+            # 检查第一个非表头的全文本行（类表头）
+            cells = row.find_all("td")
+            texts = [c.get_text().strip() for c in cells]
+            if texts and all(
+                len(t) < 15 and not _is_data_value(t)
+                for t in texts if t
+            ):
+                data_row_start = i + 1
+
+    # 匹配：从表头推断列类型，按类型匹配 OCR 文字到空列
+    modified = False
+
+    # 第一步：从表头行推断每列的预期数据类型
+    # ['项目名称'(text), '规格型号'(text), '单位'(text), '数量'(num), '单价'(num), '金额'(num), '税率/征收率'(rate), '税额'(num)]
+    header_types = _infer_column_types_from_header(vlm_data, vlm_cells)
+
+    for vlm_row_idx in range(data_row_start, len(vlm_data)):
+        vlm_row = vlm_data[vlm_row_idx]
+        vlm_tag_row = vlm_cells[vlm_row_idx]
+
+        # 映射到 OCR 网格行
+        ocr_row_idx = vlm_row_idx - data_row_start
+        if ocr_row_idx >= ocr_nrows:
+            break
+        ocr_row = ocr_grid[ocr_row_idx]
+
+        # 找出 VLM 行中的空列及其预期类型
+        empty_columns = []  # [(col_idx, header_type)]
+        for vc in range(len(vlm_row)):
+            if not vlm_row[vc].strip():
+                col_type = header_types.get(vc, "text")
+                empty_columns.append((vc, col_type))
+
+        if not empty_columns:
+            continue
+
+        # 将 OCR 项分类（跳过 VLM 已存在的值）
+        ocr_new_items = []  # [(text, item_type)]
+        for ocr_text in ocr_row:
+            if not ocr_text:
+                continue
+            # 跳过已在 VLM 行中存在的值
+            if any(ocr_text == vlm_row[vc] for vc in range(len(vlm_row))):
+                continue
+            item_type = _classify_ocr_item_type(ocr_text)
+            ocr_new_items.append((ocr_text, item_type))
+
+        if not ocr_new_items:
+            continue
+
+        # 按类型匹配：OCR 项 → 同类型空列
+        for ocr_text, item_type in ocr_new_items:
+            # 找到第一个匹配类型的空列
+            for ec_idx, (vc, col_type) in enumerate(empty_columns):
+                if item_type == col_type:
+                    cell_tag = vlm_tag_row[vc]
+                    if cell_tag.name == "th":
+                        continue
+                    cell_tag.string = ocr_text
+                    modified = True
+                    logger.debug(
+                        f"OCR 填充({item_type}): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
+                    )
+                    empty_columns.pop(ec_idx)
+                    break
+
+    return modified
+
+
+def _infer_column_types_from_header(
+    vlm_data: list[list[str]],
+    vlm_cells: list[list[Tag]],
+) -> dict[int, str]:
+    """从表头行推断每列的预期数据类型。
+
+    通过表头中关键词匹配来确定：
+    - 'number': 金额、税额、数量、单价 等数值列
+    - 'rate': 税率、征收率 等百分比列
+    - 'text': 项目名称、规格型号、单位 等文本列
+
+    Args:
+        vlm_data: VLM 表格的文本网格。
+        vlm_cells: VLM 表格的 Tag 网格。
+
+    Returns:
+        {列索引: 'text'|'number'|'rate'} 映射。
+    """
+    NUMBER_KEYWORDS = {"金额", "税额", "数量", "单价", "价税合计"}
+    RATE_KEYWORDS = {"税率", "征收率", "税率/征收率"}
+
+    result = {}
+
+    # 遍历前若干行找表头（含 <th> 的行）
+    for row_idx in range(min(3, len(vlm_data))):
+        vlm_row = vlm_data[row_idx]
+        if not vlm_row:
+            continue
+        for col_idx, text in enumerate(vlm_row):
+            if not text:
+                continue
+            if text in RATE_KEYWORDS:
+                result[col_idx] = "rate"
+            elif text in NUMBER_KEYWORDS:
+                result[col_idx] = "number"
+            elif col_idx not in result:
+                result[col_idx] = "text"
+
+    return result
+
+
+def _classify_ocr_item_type(text: str) -> str:
+    """判断 OCR 识别文字的语义类型。
+
+    Args:
+        text: OCR 识别的文字。
+
+    Returns:
+        'text' | 'number' | 'rate'。
+    """
+    text = text.strip()
+    # 百分比
+    if re.match(r'^[\d.]+\s*%$', text):
+        return "rate"
+    # 纯数字或货币
+    if _is_data_value(text):
+        return "number"
+    return "text"
