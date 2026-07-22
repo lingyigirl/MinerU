@@ -11,3 +11,5 @@
 # 当前模块：
 # - pdf_utils.py: PDF 旋转修正功能（generate_rotation_corrected_pdf）
 # - content_list_utils.py: content_list_v2 后处理（list_item 独立 bbox）
+# - table_utils.py: VLM 表格 HTML 后处理（split_merged_table_cells, split_summary_from_data_cell,
+#   normalize_table_colspan, normalize_invoice_table）

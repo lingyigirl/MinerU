@@ -58,7 +58,38 @@ def _replace_eq_tags_in_table_html(html):
 
 def _format_embedded_html(html, img_buket_path):
     """Normalize embedded table HTML for markdown/content outputs."""
-    return _replace_eq_tags_in_table_html(_prefix_table_img_src(html, img_buket_path))
+    formatted = _replace_eq_tags_in_table_html(_prefix_table_img_src(html, img_buket_path))
+
+    # [自定义] VLM 表格 HTML 后处理：拆分被错误合并的 colspan 单元格
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.table_utils import split_merged_table_cells
+        formatted = split_merged_table_cells(formatted)
+    except Exception as exc:
+        logger.warning(
+            f"split_merged_table_cells 执行失败，将使用原始表格 HTML: {exc}"
+        )
+
+    # [自定义] VLM 表格 HTML 后处理：拆分混入数据单元格中的合计/小计标签
+    try:
+        from mineru.utils.custom.table_utils import split_summary_from_data_cell
+        formatted = split_summary_from_data_cell(formatted)
+    except Exception as exc:
+        logger.warning(
+            f"split_summary_from_data_cell 执行失败，将使用先前结果: {exc}"
+        )
+
+    # [自定义] VLM 表格 HTML 后处理：发票表格 colspan 规范化、缺失值推断
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.table_utils import normalize_invoice_table
+        formatted = normalize_invoice_table(formatted)
+    except Exception as exc:
+        logger.warning(
+            f"normalize_invoice_table 执行失败，将使用先前结果: {exc}"
+        )
+
+    return formatted
 
 
 def _normalize_text_content(content):
