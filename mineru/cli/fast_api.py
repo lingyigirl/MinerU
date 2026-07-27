@@ -159,6 +159,10 @@ class AsyncParseTask:
     return_original_file: bool
     start_page_id: int
     end_page_id: int
+    # [自定义] 多引擎路由参数
+    doc_type: str = "auto"
+    kvp_engine: str = "qwen-vl-plus"
+    kvp_server_url: Optional[str] = None
     upload_names: list[str]
     uploads: list[str]
     submit_order: int = 0
@@ -849,6 +853,10 @@ async def run_parse_job(
         f_dump_content_list=request_options.return_content_list,
         start_page_id=request_options.start_page_id,
         end_page_id=request_options.end_page_id,
+        # [自定义] 多引擎路由参数
+        doc_type=getattr(request_options, "doc_type", "auto"),
+        kvp_engine=getattr(request_options, "kvp_engine", "qwen-vl-plus"),
+        kvp_server_url=getattr(request_options, "kvp_server_url", None),
         **config,
     )
 
@@ -900,6 +908,10 @@ async def create_async_parse_task(
             return_original_file=request_options.return_original_file,
             start_page_id=request_options.start_page_id,
             end_page_id=request_options.end_page_id,
+            # [自定义] 多引擎路由参数
+            doc_type=request_options.doc_type,
+            kvp_engine=request_options.kvp_engine,
+            kvp_server_url=request_options.kvp_server_url,
             upload_names=[upload.original_name for upload in uploads],
             uploads=[upload.path for upload in uploads],
         )

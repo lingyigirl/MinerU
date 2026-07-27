@@ -636,6 +636,199 @@ def _process_office_doc(
     return need_remove_index
 
 
+# [自定义] S0 → S1 智能路由系统
+# 合并上游时注意：此函数组只依赖 mineru/utils/custom/ 下的自定义模块
+
+
+def _process_form_kvp(
+    output_dir: str,
+    pdf_file_name: str,
+    pdf_bytes: bytes,
+    kvp_engine: str,
+    kvp_server_url: str | None,
+    f_dump_md: bool,
+    f_dump_middle_json: bool,
+    f_dump_model_output: bool,
+    f_dump_content_list: bool,
+    f_make_md_mode,
+) -> None:
+    """使用 KIE Pipeline 处理票据/卡证文档并生成输出。
+
+    Args:
+        output_dir: 输出根目录。
+        pdf_file_name: PDF 文件名（不含后缀）。
+        pdf_bytes: PDF 字节流。
+        kvp_engine: KVP 引擎标识符。
+        kvp_server_url: 自定义 API 地址。
+        f_dump_md: 是否输出 Markdown。
+        f_dump_middle_json: 是否输出 middle_json。
+        f_dump_model_output: 是否输出 model_output。
+        f_dump_content_list: 是否输出 content_list。
+        f_make_md_mode: Markdown 生成模式。
+    """
+    try:
+        from mineru.utils.custom.kvp_extractor import extract_kvp_from_form
+    except (ImportError, ModuleNotFoundError) as exc:
+        logger.warning(f"KVP 提取模块不可用，跳过: {exc}")
+        return
+
+    parse_method = "kie"
+    local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
+    _image_writer = FileBasedDataWriter(local_image_dir)
+    md_writer = FileBasedDataWriter(local_md_dir)
+
+    try:
+        middle_json = extract_kvp_from_form(
+            pdf_bytes,
+            engine=kvp_engine,
+            server_url=kvp_server_url,
+        )
+    except Exception:
+        logger.exception(f"KVP 提取失败: {pdf_file_name}")
+        # 回退到通用解析
+        return
+
+    pdf_info = middle_json.get("pdf_info", [])
+    f_draw_layout_bbox = False
+    f_draw_span_bbox = False
+    f_dump_orig_pdf = False
+
+    _process_output(
+        pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
+        md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
+        f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
+        f_make_md_mode, middle_json, None, process_mode="vlm",
+    )
+
+    logger.info(f"KVP 处理完成: {pdf_file_name}")
+
+
+def _try_smart_routing(
+    pdf_file_names: list[str],
+    pdf_bytes_list: list[bytes],
+    p_lang_list: list[str],
+    output_dir: str,
+    backend: str,
+    parse_method: str,
+    doc_type: str,
+    kvp_engine: str,
+    kvp_server_url: str | None,
+    f_draw_layout_bbox: bool,
+    f_draw_span_bbox: bool,
+    f_dump_md: bool,
+    f_dump_middle_json: bool,
+    f_dump_model_output: bool,
+    f_dump_orig_pdf: bool,
+    f_dump_content_list: bool,
+    f_make_md_mode,
+    formula_enable: bool,
+    table_enable: bool,
+    image_analysis: bool,
+    server_url: str | None,
+    start_page_id: int,
+    end_page_id: int | None,
+    **kwargs,
+) -> bool:
+    """S0 → S1 → KIE 智能路由入口。
+
+    返回 True 表示请求已被处理（路由到 KIE Pipeline），调用者应 return。
+    返回 False 表示请求未被处理，调用者继续原有逻辑。
+
+    Args:
+        pdf_file_names: PDF 文件名列表。
+        pdf_bytes_list: PDF 字节流列表。
+        ... (其他参数透传自 do_parse / aio_do_parse)
+
+    Returns:
+        bool: True = 已处理（调用者应 return），False = 未处理（继续原有逻辑）。
+    """
+    # 仅处理第一个 PDF（多文件场景暂不支持混合路由）
+    if len(pdf_bytes_list) != 1:
+        if doc_type == "form_kvp":
+            logger.warning("KVP 模式仅支持单文件，将使用通用解析")
+        return False
+
+    pdf_bytes = pdf_bytes_list[0]
+    pdf_file_name = pdf_file_names[0]
+
+    # 用户显式指定了非 auto 后端 → 跳过智能路由，直接处理
+    if backend != "hybrid-auto-engine" and doc_type == "auto":
+        return False
+
+    # 用户强制 KVP 模式
+    if doc_type == "form_kvp":
+        logger.info(f"[自定义] 用户指定 KVP 模式: engine={kvp_engine}")
+        _process_form_kvp(
+            output_dir=output_dir,
+            pdf_file_name=pdf_file_name,
+            pdf_bytes=pdf_bytes,
+            kvp_engine=kvp_engine,
+            kvp_server_url=kvp_server_url,
+            f_dump_md=f_dump_md,
+            f_dump_middle_json=f_dump_middle_json,
+            f_dump_model_output=f_dump_model_output,
+            f_dump_content_list=f_dump_content_list,
+            f_make_md_mode=f_make_md_mode,
+        )
+        return True
+
+    # doc_type == "auto" → 运行 S0 + S1 自动分类
+    if doc_type == "auto":
+        try:
+            from mineru.utils.custom.doc_quality import analyze_document_quality
+            from mineru.utils.custom.doc_classifier import classify_document, DocType
+            from mineru.utils.custom.engine_factory import select_engine_route, make_routing_summary
+
+            # S0: 质量分析
+            quality = analyze_document_quality(pdf_bytes)
+
+            # S1: 文档分类
+            doc_type_result = classify_document(pdf_bytes, quality=quality)
+
+            # 选择引擎路由
+            route = select_engine_route(
+                doc_type=doc_type_result,
+                quality=quality,
+                user_kvp_engine=kvp_engine,
+                user_kvp_server_url=kvp_server_url,
+            )
+
+            # 生成路由摘要（日志用）
+            make_routing_summary(doc_type_result, route, quality)
+
+            # 如果是 KIE 路由 → 处理
+            if route.engine_backend == "kie":
+                logger.info(
+                    f"[自定义] 智能路由: {doc_type_result.value} → KIE Pipeline"
+                )
+                _process_form_kvp(
+                    output_dir=output_dir,
+                    pdf_file_name=pdf_file_name,
+                    pdf_bytes=pdf_bytes,
+                    kvp_engine=route.extra_kwargs.get("kvp_engine", kvp_engine),
+                    kvp_server_url=route.extra_kwargs.get("kvp_server_url", kvp_server_url),
+                    f_dump_md=f_dump_md,
+                    f_dump_middle_json=f_dump_middle_json,
+                    f_dump_model_output=f_dump_model_output,
+                    f_dump_content_list=f_dump_content_list,
+                    f_make_md_mode=f_make_md_mode,
+                )
+                return True
+
+            # 非 KIE 路由 → 透传，继续原有逻辑
+            logger.info(
+                f"[自定义] 智能路由: {doc_type_result.value} → {route.engine_backend}"
+            )
+            return False
+
+        except Exception:
+            logger.exception("[自定义] 智能路由失败，回退到原有解析流程")
+            return False
+
+    # doc_type == "general" → 透传
+    return False
+
+
 def do_parse(
         output_dir,
         pdf_file_names: list[str],
@@ -657,6 +850,10 @@ def do_parse(
         start_page_id=0,
         end_page_id=None,
         image_analysis=True,
+        # [自定义] 多引擎路由参数
+        doc_type: str = "auto",
+        kvp_engine: str = "qwen-vl-plus",
+        kvp_server_url: str | None = None,
         **kwargs,
 ):
     need_remove_index = _process_office_doc(
@@ -680,6 +877,37 @@ def do_parse(
 
     # 预处理PDF字节数据
     pdf_bytes_list = _prepare_pdf_bytes(pdf_bytes_list, start_page_id, end_page_id)
+
+    # [自定义] S0 → S1 智能路由 hook
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    _routed = _try_smart_routing(
+        pdf_file_names=pdf_file_names,
+        pdf_bytes_list=pdf_bytes_list,
+        p_lang_list=p_lang_list,
+        output_dir=output_dir,
+        backend=backend,
+        parse_method=parse_method,
+        doc_type=doc_type,
+        kvp_engine=kvp_engine,
+        kvp_server_url=kvp_server_url,
+        f_draw_layout_bbox=f_draw_layout_bbox,
+        f_draw_span_bbox=f_draw_span_bbox,
+        f_dump_md=f_dump_md,
+        f_dump_middle_json=f_dump_middle_json,
+        f_dump_model_output=f_dump_model_output,
+        f_dump_orig_pdf=f_dump_orig_pdf,
+        f_dump_content_list=f_dump_content_list,
+        f_make_md_mode=f_make_md_mode,
+        formula_enable=formula_enable,
+        table_enable=table_enable,
+        image_analysis=image_analysis,
+        server_url=server_url,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        **kwargs,
+    )
+    if _routed:
+        return
 
     if backend == "pipeline":
         _process_pipeline(
@@ -750,6 +978,10 @@ async def aio_do_parse(
         start_page_id=0,
         end_page_id=None,
         image_analysis=True,
+        # [自定义] 多引擎路由参数
+        doc_type: str = "auto",
+        kvp_engine: str = "qwen-vl-plus",
+        kvp_server_url: str | None = None,
         **kwargs,
 ):
     # Office 解析是同步且可能耗时的操作，异步入口需要放到线程中避免阻塞事件循环。
@@ -775,6 +1007,36 @@ async def aio_do_parse(
 
     # 预处理PDF字节数据
     pdf_bytes_list = _prepare_pdf_bytes(pdf_bytes_list, start_page_id, end_page_id)
+
+    # [自定义] S0 → S1 智能路由 hook（异步路径）
+    _routed = _try_smart_routing(
+        pdf_file_names=pdf_file_names,
+        pdf_bytes_list=pdf_bytes_list,
+        p_lang_list=p_lang_list,
+        output_dir=output_dir,
+        backend=backend,
+        parse_method=parse_method,
+        doc_type=doc_type,
+        kvp_engine=kvp_engine,
+        kvp_server_url=kvp_server_url,
+        f_draw_layout_bbox=f_draw_layout_bbox,
+        f_draw_span_bbox=f_draw_span_bbox,
+        f_dump_md=f_dump_md,
+        f_dump_middle_json=f_dump_middle_json,
+        f_dump_model_output=f_dump_model_output,
+        f_dump_orig_pdf=f_dump_orig_pdf,
+        f_dump_content_list=f_dump_content_list,
+        f_make_md_mode=f_make_md_mode,
+        formula_enable=formula_enable,
+        table_enable=table_enable,
+        image_analysis=image_analysis,
+        server_url=server_url,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        **kwargs,
+    )
+    if _routed:
+        return
 
     if backend == "pipeline":
         # pipeline模式暂不支持异步，使用同步处理方式
