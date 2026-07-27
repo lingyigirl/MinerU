@@ -66,13 +66,12 @@ from mineru.utils.config_reader import (
     get_processing_window_size,
 )
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
+from mineru.utils.log_utils import init_root_logger
 from mineru.utils.pdf_image_tools import shutdown_pdf_render_executor
 from mineru.version import __version__
 
 os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
-log_level = os.getenv("MINERU_LOG_LEVEL", "INFO").upper()
-logger.remove()
-logger.add(sys.stderr, level=log_level)
+init_root_logger("mineru_api")
 
 TASK_PENDING = "pending"
 TASK_PROCESSING = "processing"
