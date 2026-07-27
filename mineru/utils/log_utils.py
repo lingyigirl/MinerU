@@ -198,6 +198,39 @@ def init_root_logger(
         stdlib_level = getattr(logging, pkg_level.upper(), logging.INFO)
         pkg_logger = logging.getLogger(pkg_name)
         pkg_logger.setLevel(stdlib_level)
+        pkg_logger.handlers.clear()
+        pkg_logger.propagate = True
+
+    # ---------- 拦截 uvicorn / vLLM 等框架日志 ----------
+    # 这些框架在各自启动阶段会往自己的 logger 上安装 handler，
+    # 导致日志绕过 InterceptHandler 直接输出到 stderr 且格式不统一。
+    # 此处清除所有已存在 logger 的 handler 并强制传播到 root，
+    # 后续新增的 logger（如 uvicorn）通过 monkey-patch LOGGING_CONFIG 拦截。
+    _FRAMEWORK_LOGGERS = [
+        "uvicorn",
+        "uvicorn.access",
+        "uvicorn.error",
+        "vllm",
+    ]
+    for pkg_name in _FRAMEWORK_LOGGERS:
+        pkg_logger = logging.getLogger(pkg_name)
+        pkg_logger.handlers.clear()
+        pkg_logger.propagate = True
+        if pkg_name not in pkg_levels:
+            pkg_logger.setLevel(getattr(logging, root_level, logging.INFO))
+
+    # 预配置 uvicorn 的 LOGGING_CONFIG，防止其后续添加自己的 handler
+    try:
+        import uvicorn.config
+        for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            uvicorn.config.LOGGING_CONFIG.setdefault("loggers", {})
+            uvicorn.config.LOGGING_CONFIG["loggers"][_name] = {
+                "handlers": [],
+                "propagate": True,
+                "level": root_level,
+            }
+    except ImportError:
+        pass
 
     # ---------- 捕获 Python warnings ----------
     logging.captureWarnings(True)
