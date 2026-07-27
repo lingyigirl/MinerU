@@ -171,18 +171,23 @@ def init_root_logger(
     )
 
     # ---------- 文件输出：每日轮转，保留 7 天，zip 压缩 ----------
-    _loguru_logger.add(
-        str(log_path),
-        level=root_level,
-        format=fmt,
-        rotation="00:00",
-        retention="7 days",
-        compression="zip",
-        encoding="utf-8",
-        enqueue=True,
-        backtrace=True,
-        diagnose=True,
+    # MINERU_LOG_FILE_ENABLE=false 可关闭文件日志，仅保留控制台输出
+    _file_enabled = os.environ.get("MINERU_LOG_FILE_ENABLE", "true").lower() not in (
+        "0", "false", "no"
     )
+    if _file_enabled:
+        _loguru_logger.add(
+            str(log_path),
+            level=root_level,
+            format=fmt,
+            rotation="00:00",
+            retention="7 days",
+            compression="zip",
+            encoding="utf-8",
+            enqueue=True,
+            backtrace=True,
+            diagnose=True,
+        )
 
     # ---------- 标准库 logging → Loguru 桥接 ----------
     logging.basicConfig(
@@ -236,11 +241,15 @@ def init_root_logger(
     logging.captureWarnings(True)
 
     # ---------- 启动日志 ----------
-    msg = (
-        f"{logfile_basename} log path: {log_path}, "
-        f"root level: {root_level}, pkg levels: {pkg_levels}"
-    )
-    _loguru_logger.info(msg)
+    msg_parts = [
+        f"root level: {root_level}",
+        f"pkg levels: {pkg_levels}",
+    ]
+    if _file_enabled:
+        msg_parts.insert(0, f"log path: {log_path}")
+    else:
+        msg_parts.insert(0, "file logging: disabled")
+    _loguru_logger.info(f"{logfile_basename} " + ", ".join(msg_parts))
 
 
 def log_exception(e: Exception, *args) -> None:
