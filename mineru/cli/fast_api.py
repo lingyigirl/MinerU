@@ -159,12 +159,12 @@ class AsyncParseTask:
     return_original_file: bool
     start_page_id: int
     end_page_id: int
+    upload_names: list[str]
+    uploads: list[str]
     # [自定义] 多引擎路由参数
     doc_type: str = "auto"
     kvp_engine: str = "qwen-vl-plus"
     kvp_server_url: Optional[str] = None
-    upload_names: list[str]
-    uploads: list[str]
     submit_order: int = 0
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
