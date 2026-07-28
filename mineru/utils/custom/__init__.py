@@ -16,5 +16,5 @@
 #   supplement_vlm_table_cells_with_ocr）
 # - doc_quality.py: S0 文档质量分析器（DPI/模糊/印章/旋转检测）
 # - doc_classifier.py: S1 文档分类器（"信号灯"三路路由：通用/表格/表单）
-# - kvp_extractor.py: KIE Pipeline（基于 MLLM 的票据/卡证 KVP 信息提取）
+# - kvp_extractor.py: KVP Pipeline（基于 MLLM 的票据/卡证 KVP 信息提取）
 # - engine_factory.py: 引擎工厂 + 策略选择器（自动选择最优解析引擎）

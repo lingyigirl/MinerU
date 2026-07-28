@@ -2,9 +2,11 @@
 import asyncio
 import importlib
 import importlib.util
+import io
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 from typing import Sequence
 
@@ -652,7 +654,13 @@ def _process_form_kvp(
     f_dump_content_list: bool,
     f_make_md_mode,
 ) -> None:
-    """使用 KIE Pipeline 处理票据/卡证文档并生成输出。
+    """使用 KVP Pipeline 处理票据/卡证文档并生成输出。
+
+    生成与 MinerU 兼容的输出格式：
+    - {name}.md：KVP 字段表格（Markdown）
+    - {name}_middle.json：包含 KVP 数据和页面信息
+    - {name}_content_list.json / _v2.json：内容列表
+    - images/：页面截图（用于可视化验证）
 
     Args:
         output_dir: 输出根目录。
@@ -672,7 +680,7 @@ def _process_form_kvp(
         logger.warning(f"KVP 提取模块不可用，跳过: {exc}")
         return
 
-    parse_method = "kie"
+    parse_method = "kvp"
     local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
     _image_writer = FileBasedDataWriter(local_image_dir)
     md_writer = FileBasedDataWriter(local_md_dir)
@@ -685,22 +693,165 @@ def _process_form_kvp(
         )
     except Exception:
         logger.exception(f"KVP 提取失败: {pdf_file_name}")
-        # 回退到通用解析
         return
 
     pdf_info = middle_json.get("pdf_info", [])
-    f_draw_layout_bbox = False
-    f_draw_span_bbox = False
-    f_dump_orig_pdf = False
 
-    _process_output(
-        pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
-        md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
-        f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-        f_make_md_mode, middle_json, None, process_mode="vlm",
-    )
+    # ---- 渲染页面截图到 images/（对齐 MinerU 行为） ----
+    try:
+        from mineru.utils.pdf_image_tools import load_images_from_pdf_core
+
+        page_images = load_images_from_pdf_core(pdf_bytes)
+        for page_idx, img_dict in enumerate(page_images):
+            if page_idx >= len(pdf_info):
+                break
+            pil_img = img_dict["img_pil"]
+            # 使用 MinerU 兼容的文件名格式
+            img_filename = f"{pdf_file_name}_{page_idx:04d}.jpg"
+            img_bytes_io = BytesIO()
+            if pil_img.mode in ("RGBA", "P"):
+                pil_img = pil_img.convert("RGB")
+            pil_img.save(img_bytes_io, format="JPEG", quality=92)
+            _image_writer.write(img_filename, img_bytes_io.getvalue())
+    except Exception:
+        logger.warning(f"页面截图保存失败: {pdf_file_name}")
+
+    # ---- 生成 Markdown（对齐 MinerU 的 MM_MD 格式） ----
+    if f_dump_md:
+        md_content = _make_kvp_markdown(pdf_info, pdf_file_name, f_make_md_mode)
+        md_writer.write_string(f"{pdf_file_name}.md", md_content)
+
+    # ---- 生成 content_list（对齐 MinerU 格式） ----
+    if f_dump_content_list:
+        content_list = _make_kvp_content_list(pdf_info, pdf_file_name)
+        md_writer.write_string(
+            f"{pdf_file_name}_content_list.json",
+            json.dumps(content_list, ensure_ascii=False, indent=4),
+        )
+        # content_list_v2 复用同一结构（KVP 输出无 block 层级差异）
+        md_writer.write_string(
+            f"{pdf_file_name}_content_list_v2.json",
+            json.dumps(content_list, ensure_ascii=False, indent=4),
+        )
+
+    # ---- 输出 middle_json ----
+    if f_dump_middle_json:
+        md_writer.write_string(
+            f"{pdf_file_name}_middle.json",
+            json.dumps(middle_json, ensure_ascii=False, indent=4),
+        )
+
+    # ---- 输出 model_output（KVP 原始响应） ----
+    if f_dump_model_output:
+        md_writer.write_string(
+            f"{pdf_file_name}_model.json",
+            json.dumps(middle_json, ensure_ascii=False, indent=4),
+        )
 
     logger.info(f"KVP 处理完成: {pdf_file_name}")
+
+
+# ---------------------------------------------------------------------------
+# KVP → MinerU 输出格式转换
+# ---------------------------------------------------------------------------
+
+def _make_kvp_markdown(
+    pdf_info: list[dict],
+    pdf_file_name: str,
+    f_make_md_mode,
+) -> str:
+    """从 KVP middle_json 生成 Markdown（对齐 MinerU 的 MM_MD / NLP_MD 格式）。
+
+    输出格式：
+    - MM_MD：每个字段一行 `**键**: 值`
+    - NLP_MD：纯文本段落
+
+    Args:
+        pdf_info: KVP middle_json 中的 pdf_info 列表。
+        pdf_file_name: PDF 文件名。
+        f_make_md_mode: Markdown 生成模式。
+
+    Returns:
+        Markdown 字符串。
+    """
+    lines = [f"# {pdf_file_name}\n"]
+
+    # f_make_md_mode 可能是 MakeMode 枚举，也可能已被转换为字符串
+    mode_str = f_make_md_mode.value if hasattr(f_make_md_mode, "value") else str(f_make_md_mode)
+
+    for page in pdf_info:
+        page_idx = page.get("page_idx", 0)
+        kvp_raw = page.get("_kvp_raw", {})
+
+        if not kvp_raw:
+            spans = page.get("spans", [])
+            for span in spans:
+                if span.get("type") == "text":
+                    text = span.get("text", "")
+                    if text:
+                        for line in text.split("\n"):
+                            if ":" in line:
+                                lines.append(line)
+                            else:
+                                lines.append(line)
+            continue
+
+        if mode_str == "nlp_markdown":
+            # 自然语言格式：每行一个 KVP
+            for key, value in kvp_raw.items():
+                if key.startswith("_"):
+                    continue
+                lines.append(f"{key}: {value}")
+        else:
+            # MM_MD 格式：表格
+            if page_idx == 0:
+                lines.append("| 字段 | 值 |")
+                lines.append("|------|-----|")
+            for key, value in kvp_raw.items():
+                if key.startswith("_"):
+                    continue
+                # 转义 Markdown 表格中的特殊字符
+                safe_value = str(value).replace("|", "\\|").replace("\n", " ")
+                lines.append(f"| {key} | {safe_value} |")
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _make_kvp_content_list(
+    pdf_info: list[dict],
+    pdf_file_name: str,
+) -> list[dict]:
+    """从 KVP middle_json 生成 content_list（对齐 MinerU 格式）。
+
+    每页生成一个 "kvp_form" 类型的 block，包含所有提取的 KVP 字段。
+
+    Args:
+        pdf_info: KVP middle_json 中的 pdf_info 列表。
+        pdf_file_name: PDF 文件名。
+
+    Returns:
+        content_list 格式的列表。
+    """
+    content_list = []
+    for page in pdf_info:
+        page_idx = page.get("page_idx", 0)
+        kvp_raw = page.get("_kvp_raw", {})
+
+        # 过滤元数据字段
+        fields = {k: v for k, v in kvp_raw.items() if not k.startswith("_")}
+
+        block = {
+            "type": "kvp_form",
+            "page_idx": page_idx,
+            "fields": fields,
+            "field_count": len(fields),
+            "source": page.get("spans", [{}])[0].get("source", "kvp") if page.get("spans") else "kvp",
+        }
+        content_list.append(block)
+
+    return content_list
 
 
 def _try_smart_routing(
@@ -729,9 +880,9 @@ def _try_smart_routing(
     end_page_id: int | None,
     **kwargs,
 ) -> bool:
-    """S0 → S1 → KIE 智能路由入口。
+    """S0 → S1 → KVP 智能路由入口。
 
-    返回 True 表示请求已被处理（路由到 KIE Pipeline），调用者应 return。
+    返回 True 表示请求已被处理（路由到 KVP Pipeline），调用者应 return。
     返回 False 表示请求未被处理，调用者继续原有逻辑。
 
     Args:
@@ -751,10 +902,6 @@ def _try_smart_routing(
     pdf_bytes = pdf_bytes_list[0]
     pdf_file_name = pdf_file_names[0]
 
-    # 用户显式指定了非 auto 后端 → 跳过智能路由，直接处理
-    if backend != "hybrid-auto-engine" and doc_type == "auto":
-        return False
-
     # 用户强制 KVP 模式
     if doc_type == "form_kvp":
         logger.info(f"[自定义] 用户指定 KVP 模式: engine={kvp_engine}")
@@ -772,7 +919,7 @@ def _try_smart_routing(
         )
         return True
 
-    # doc_type == "auto" → 运行 S0 + S1 自动分类
+    # doc_type == "auto" → 运行 S0 + S1 自动分类（用户显式选择，需付出分析开销）
     if doc_type == "auto":
         try:
             from mineru.utils.custom.doc_quality import analyze_document_quality
@@ -796,10 +943,10 @@ def _try_smart_routing(
             # 生成路由摘要（日志用）
             make_routing_summary(doc_type_result, route, quality)
 
-            # 如果是 KIE 路由 → 处理
-            if route.engine_backend == "kie":
+            # 如果是 KVP 路由 → 处理
+            if route.engine_backend == "kvp":
                 logger.info(
-                    f"[自定义] 智能路由: {doc_type_result.value} → KIE Pipeline"
+                    f"[自定义] 智能路由: {doc_type_result.value} → KVP Pipeline"
                 )
                 _process_form_kvp(
                     output_dir=output_dir,
@@ -815,7 +962,7 @@ def _try_smart_routing(
                 )
                 return True
 
-            # 非 KIE 路由 → 透传，继续原有逻辑
+            # 非 KVP 路由 → 透传，继续原有逻辑
             logger.info(
                 f"[自定义] 智能路由: {doc_type_result.value} → {route.engine_backend}"
             )
@@ -852,7 +999,7 @@ def do_parse(
         image_analysis=True,
         # [自定义] 多引擎路由参数
         doc_type: str = "auto",
-        kvp_engine: str = "qwen-vl-plus",
+        kvp_engine: str = "qwen-vl-max",
         kvp_server_url: str | None = None,
         **kwargs,
 ):
@@ -980,7 +1127,7 @@ async def aio_do_parse(
         image_analysis=True,
         # [自定义] 多引擎路由参数
         doc_type: str = "auto",
-        kvp_engine: str = "qwen-vl-plus",
+        kvp_engine: str = "qwen-vl-max",
         kvp_server_url: str | None = None,
         **kwargs,
 ):

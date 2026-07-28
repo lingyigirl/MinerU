@@ -1,7 +1,7 @@
 """S0 文档质量分析器。
 
 在分类和解析之前对 PDF 进行质量评估，结果可用于：
-- 影响路由决策（低质量扫描件更适合走 OCR-KIE 管线）
+- 影响路由决策（低质量扫描件更适合走 OCR-KVP 管线）
 - 触发预处理（旋转修正、去模糊）
 - 作为下游解析引擎的提示信息
 
@@ -171,18 +171,20 @@ def _select_sample_pages(page_count: int, max_sample_pages: int = 3) -> list[int
 
 def analyze_document_quality(
     pdf_bytes: bytes,
-    dpi: int = DEFAULT_PDF_IMAGE_DPI,
-    max_sample_pages: int = 3,
+    dpi: int = 100,  # 质量分析用 100 DPI 足够，速度优先
+    max_pages: int = 2,  # 只渲染前 N 页做质量分析，无需全量渲染
+    max_sample_pages: int = 2,
     blur_threshold: float = 100.0,
     stamp_threshold: float = 0.02,
 ) -> DocumentQuality:
-    """对 PDF 文档进行质量分析（S0 阶段）。
+    """对 PDF 文档进行快速质量分析（S0 阶段）。
 
-    采样首页、尾页和中间页，评估清晰度、印章、旋转等质量指标。
+    只渲染前 max_pages 页，检测清晰度、印章等关键质量指标。
 
     Args:
         pdf_bytes: PDF 文件字节流。
-        dpi: 渲染 DPI，用于质量评估时的图片分辨率。
+        dpi: 渲染 DPI，默认 100（质量分析对分辨率不敏感，速度优先）。
+        max_pages: 最多渲染页数，0 表示全部页。默认 2 页。
         max_sample_pages: 最大采样页数。
         blur_threshold: 模糊判定阈值（拉普拉斯方差），低于此值判定为模糊。
         stamp_threshold: 印章判定阈值，红色像素占比超过此值判定为有印章。
@@ -193,9 +195,21 @@ def analyze_document_quality(
     quality = DocumentQuality(dpi=dpi)
 
     try:
-        # 渲染采样页
-        all_images = load_images_from_pdf_core(pdf_bytes, dpi=dpi)
+        # 只渲染前 max_pages 页（质量分析不需要全量渲染）
+        end_page = max_pages - 1 if max_pages > 0 else None
+        all_images = load_images_from_pdf_core(
+            pdf_bytes, dpi=dpi, start_page_id=0, end_page_id=end_page,
+        )
         quality.page_count = len(all_images)
+
+        # 用 pymupdf 获取真实总页数（不额外渲染）
+        try:
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            quality.page_count = doc.page_count
+            doc.close()
+        except Exception:
+            pass  # 回退到已渲染的页数
 
         sample_indices = _select_sample_pages(len(all_images), max_sample_pages)
         quality.sample_pages_analyzed = len(sample_indices)

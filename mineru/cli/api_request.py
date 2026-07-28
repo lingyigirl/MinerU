@@ -172,21 +172,21 @@ async def parse_request_form(
         str,
         Form(
             description="""Document classification mode:
-- auto: Automatically classify and route to the best engine (recommended)
-- general: Force MinerU general-purpose parsing
-- form_kvp: Force KIE pipeline for receipt/certificate KVP extraction""",
+- auto: Automatically classify and route to the best engine (default, fast)
+- general: Force MinerU general-purpose parsing (fastest, no routing)
+- form_kvp: Force KVP pipeline for receipt/certificate KVP extraction""",
         ),
     ] = "auto",
     kvp_engine: Annotated[
         str,
         Form(
             description="""KVP extraction engine (only used when doc_type=form_kvp):
-- qwen-vl-plus: Alibaba DashScope API (default, cloud)
-- qwen-vl-max: Alibaba DashScope API (higher accuracy, cloud)
+- qwen-vl-max: Alibaba DashScope API (default, highest accuracy, cloud)
+- qwen-vl-plus: Alibaba DashScope API (faster, cloud)
 - qwen-vl-local: Local vLLM Qwen2.5-VL-7B
 - internvl-local: Local LMDeploy InternVL2.5-8B""",
         ),
-    ] = "qwen-vl-plus",
+    ] = "qwen-vl-max",
     kvp_server_url: Annotated[
         Optional[str],
         Form(

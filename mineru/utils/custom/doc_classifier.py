@@ -3,7 +3,7 @@
 根据文档视觉特征和文本特征，将文档分为三类：
 - DOCUMENT_PARSE：通用文档（学术/书籍/报告）→ MinerU 三后端
 - STRUCTURED_TABLE：密集表格（报表/统计表）→ MinerU Hybrid + OCR 补充
-- FORM_KIE：票据/卡证/高密度 KVP 表单 → KIE Pipeline（MLLM）
+- FORM_KVP：票据/卡证/高密度 KVP 表单 → KVP Pipeline（MLLM）
 
 分类采用视觉特征 + 文本特征的混合策略，不依赖单一模型。
 """
@@ -23,18 +23,76 @@ from mineru.utils.pdf_image_tools import (
 )
 
 
+# ---------------------------------------------------------------------------
+# PaddleOCR 懒加载单例（避免每次请求重建模型）
+# ---------------------------------------------------------------------------
+
+_ocr_instance = None
+
+
+def _get_ocr():
+    """获取 PaddleOCR 单例（线程安全由 GIL 保证）。
+
+    首次调用加载模型（~2s），后续调用直接复用（~50ms）。
+    """
+    global _ocr_instance
+    if _ocr_instance is None:
+        import numpy as np
+        from mineru.model.ocr.pytorch_paddle import PytorchPaddleOCR
+
+        _ocr_instance = PytorchPaddleOCR(lang="ch")
+        logger.info("PaddleOCR 单例已初始化")
+    return _ocr_instance
+
+
+# ---------------------------------------------------------------------------
+# PyMuPDF 快速文本提取（优先于 OCR）
+# ---------------------------------------------------------------------------
+
+def _extract_text_fast(pdf_bytes: bytes, max_pages: int = 2) -> str:
+    """使用 PyMuPDF 快速提取嵌入文本（无需 OCR）。
+
+    对于有嵌入文本层的 PDF（大多数学术/办公文档），可在 ~10ms 内
+    获取足量文本用于关键词分类，完全跳过 OCR。
+
+    Args:
+        pdf_bytes: PDF 字节流。
+        max_pages: 最多提取页数。
+
+    Returns:
+        提取的文本字符串，如果无嵌入文本则返回空字符串。
+    """
+    try:
+        import fitz
+
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        texts = []
+        for i in range(min(max_pages, doc.page_count)):
+            page_text = doc[i].get_text()
+            if page_text:
+                texts.append(page_text)
+        doc.close()
+        text = " ".join(texts).strip()
+        if len(text) >= 50:  # 有足够的嵌入文本，直接使用
+            logger.debug(f"PyMuPDF 快速提取文本: {len(text)} 字符 ({max_pages} 页)")
+            return text
+    except Exception:
+        logger.debug("PyMuPDF 文本提取失败，回退到 OCR")
+    return ""
+
+
 class DocType(str, Enum):
     """文档类型枚举。
 
     对应"信号灯"三路路由：
     - DOCUMENT_PARSE（🟢）：通用文档，走现有 MinerU 管线。
     - STRUCTURED_TABLE（🟡）：密集表格，走 Hybrid + OCR 补充。
-    - FORM_KIE（🔴）：票据/卡证/KVP 表单，走 KIE Pipeline。
+    - FORM_KVP（🔴）：票据/卡证/KVP 表单，走 KVP Pipeline。
     """
 
     DOCUMENT_PARSE = "document_parse"
     STRUCTURED_TABLE = "structured_table"
-    FORM_KIE = "form_kvp"
+    FORM_KVP = "form_kvp"
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +132,8 @@ _TABLE_KW_PATTERN = re.compile("|".join(re.escape(kw) for kw in TABLE_INDICATOR_
 def _extract_text_from_page(pil_img) -> str:
     """对单页运行 PaddleOCR 提取文本（用于关键词匹配）。
 
+    复用模块级 OCR 单例，避免每次请求重建模型。
+
     Args:
         pil_img: PIL Image 对象。
 
@@ -81,9 +141,9 @@ def _extract_text_from_page(pil_img) -> str:
         提取的文本字符串。
     """
     try:
-        from mineru.model.ocr.pytorch_paddle_ocr import PytorchPaddleOCR
+        import numpy as np
 
-        ocr = PytorchPaddleOCR(lang="ch")
+        ocr = _get_ocr()  # 复用单例
         results = ocr.ocr(np.asarray(pil_img))
         if results is None or (isinstance(results, list) and len(results) == 0):
             return ""
@@ -97,27 +157,38 @@ def _extract_text_from_page(pil_img) -> str:
         return ""
 
 
-def _extract_text_sample(pdf_bytes: bytes, sample_pages: list[int], dpi: int) -> str:
-    """对采样页运行轻量 OCR 提取文本。
+def _extract_text_sample(
+    pdf_bytes: bytes,
+    preview_images: list[dict],
+    max_ocr_pages: int = 2,
+) -> str:
+    """从 PDF 提取文本样本用于分类（PyMuPDF 优先，OCR 兜底）。
 
     Args:
         pdf_bytes: PDF 字节流。
-        sample_pages: 采样页索引列表。
-        dpi: 渲染 DPI。
+        preview_images: 已渲染的前 N 页图片列表（供 OCR 兜底使用）。
+        max_ocr_pages: OCR 兜底时最多处理的页数。
 
     Returns:
-        所有采样页文本拼接后的字符串。
+        所有提取文本拼接后的字符串。
     """
+    # 第 1 步：尝试 PyMuPDF 快速提取（~10ms，适用于有嵌入文本的 PDF）
     try:
-        images = load_images_from_pdf_core(pdf_bytes, dpi=dpi)
+        fast_text = _extract_text_fast(pdf_bytes, max_pages=max_ocr_pages)
+        if fast_text and len(fast_text) >= 50:
+            return fast_text
+    except Exception:
+        logger.debug("PyMuPDF 快速提取跳过")
+
+    # 第 2 步：OCR 兜底（仅对扫描件，使用已渲染的预览图片）
+    try:
         all_text = []
-        for idx in sample_pages:
-            if idx < len(images):
-                text = _extract_text_from_page(images[idx]["img_pil"])
-                all_text.append(text)
+        for idx in range(min(max_ocr_pages, len(preview_images))):
+            text = _extract_text_from_page(preview_images[idx]["img_pil"])
+            all_text.append(text)
         return " ".join(all_text)
     except Exception:
-        logger.exception("文本采样失败")
+        logger.exception("OCR 文本采样失败")
         return ""
 
 
@@ -170,13 +241,15 @@ def _select_sample_pages(page_count: int, max_sample_pages: int = 3) -> list[int
     return sorted(indices)
 
 
-def _compute_image_coverage_ratio(pdf_bytes: bytes, sample_indices: list[int], dpi: int) -> float:
+def _compute_image_coverage_ratio(
+    preview_images: list[dict],
+    sample_indices: list[int],
+) -> float:
     """计算非白色像素占比，用于判断是否以图片/扫描件为主。
 
     Args:
-        pdf_bytes: PDF 字节流。
+        preview_images: 已渲染的预览图片列表。
         sample_indices: 采样页索引。
-        dpi: 渲染 DPI。
 
     Returns:
         非白色像素的平均占比（0.0 ~ 1.0）。
@@ -184,11 +257,10 @@ def _compute_image_coverage_ratio(pdf_bytes: bytes, sample_indices: list[int], d
     try:
         import numpy as np
 
-        images = load_images_from_pdf_core(pdf_bytes, dpi=dpi)
         ratios = []
         for idx in sample_indices:
-            if idx < len(images):
-                np_img = np.asarray(images[idx]["img_pil"].convert("L"))
+            if idx < len(preview_images):
+                np_img = np.asarray(preview_images[idx]["img_pil"].convert("L"))
                 non_white = float(np.count_nonzero(np_img < 250) / np_img.size)
                 ratios.append(non_white)
         return float(np.mean(ratios)) if ratios else 0.0
@@ -200,42 +272,72 @@ def _compute_image_coverage_ratio(pdf_bytes: bytes, sample_indices: list[int], d
 def classify_document(
     pdf_bytes: bytes,
     quality: Optional[DocumentQuality] = None,
-    dpi: int = DEFAULT_PDF_IMAGE_DPI,
-    max_sample_pages: int = 3,
+    dpi: int = 100,  # 分类用 100 DPI 足够，速度优先
+    max_preview_pages: int = 2,  # 只渲染前 N 页用于分类
 ) -> DocType:
-    """对文档进行分类，返回推荐的解析路径（S1 阶段）。
+    """对文档进行快速分类，返回推荐的解析路径（S1 阶段）。
+
+    分类流程（性能优先）：
+    1. PyMuPDF 获取总页数（不渲染）
+    2. 只渲染前 max_preview_pages 页用于视觉分析
+    3. PyMuPDF 快速提取嵌入文本 → 关键词匹配
+    4. 无嵌入文本时回退到 PaddleOCR（复用单例）
 
     分类策略（按优先级）：
-    1. FORM_KIE：KVP 关键词 ≥ 3 个 且（有印章 或 OCR 难度高）
+    1. FORM_KVP：KVP 关键词 ≥ 3 个 且（有印章 或 OCR 难度高）
     2. STRUCTURED_TABLE：表格关键词 ≥ 5 个 且 KVP 关键词 < 3 个
     3. DOCUMENT_PARSE：其他所有文档
 
     Args:
         pdf_bytes: PDF 文件字节流。
         quality: 预先计算的质量分析结果（可选，传入则复用 S0 结果）。
-        dpi: 渲染 DPI。
-        max_sample_pages: 最大采样页数。
+        dpi: 渲染 DPI，默认 100（分类对分辨率不敏感，速度优先）。
+        max_preview_pages: 最多渲染页数。
 
     Returns:
         文档分类结果（DocType 枚举）。
     """
     try:
-        images = load_images_from_pdf_core(pdf_bytes, dpi=dpi)
-        page_count = len(images)
-        sample_indices = _select_sample_pages(page_count, max_sample_pages)
+        # 获取总页数（不渲染，从 PDF 元数据获取）
+        page_count = 0
+        try:
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page_count = doc.page_count
+            doc.close()
+        except Exception:
+            pass
 
-        # 特征 1: 文本关键词（需要 OCR）
-        text_sample = _extract_text_sample(pdf_bytes, sample_indices, dpi)
+        # 只渲染前 N 页用于视觉分析和 OCR 兜底
+        end_page = max_preview_pages - 1 if max_preview_pages > 0 else None
+        preview_images = load_images_from_pdf_core(
+            pdf_bytes, dpi=dpi, start_page_id=0, end_page_id=end_page,
+        )
+        if not preview_images:
+            logger.warning("PDF 渲染后无有效页面，回退到通用解析")
+            return DocType.DOCUMENT_PARSE
+
+        if page_count == 0:
+            page_count = len(preview_images)
+
+        sample_indices = _select_sample_pages(len(preview_images), max_preview_pages)
+
+        # 特征 1: 文本关键词（PyMuPDF 优先，OCR 兜底）
+        text_sample = _extract_text_sample(pdf_bytes, preview_images, max_ocr_pages=max_preview_pages)
         kvp_count = _count_kvp_keywords(text_sample)
         table_kw_count = _count_table_keywords(text_sample)
 
         # 特征 2: 是否有印章（复用 S0 结果或独立计算）
+        # 单页/少页文档降低印章阈值：单页票据 1.5% 红章已是明显信号
         has_stamp = False
         if quality is not None:
-            has_stamp = quality.has_stamp
+            if page_count <= 2:
+                has_stamp = quality.stamp_ratio > 0.005  # 0.5%，适配单页票据
+            else:
+                has_stamp = quality.has_stamp  # 多页文档保持原阈值
 
-        # 特征 3: 图片覆盖率
-        image_coverage = _compute_image_coverage_ratio(pdf_bytes, sample_indices, dpi)
+        # 特征 3: 图片覆盖率（复用已渲染的预览图片）
+        image_coverage = _compute_image_coverage_ratio(preview_images, sample_indices)
 
         # 特征 4: OCR 难度（复用 S0 结果）
         ocr_difficulty = quality.ocr_difficulty if quality else "low"
@@ -246,16 +348,27 @@ def classify_document(
             f"ocr_diff={ocr_difficulty}, pages={page_count}"
         )
 
-        # 分类规则
-        if kvp_count >= 3 and (has_stamp or ocr_difficulty in ("medium", "high")):
-            doc_type = DocType.FORM_KIE
-        elif kvp_count >= 5 and not has_stamp:
-            # 大量 KVP 关键词但无印章 → 可能是纯文本表单
-            doc_type = DocType.FORM_KIE
-        elif table_kw_count >= 5 and kvp_count < 3:
-            doc_type = DocType.STRUCTURED_TABLE
+        # OCR 不可用时的纯视觉 fallback 分类
+        if not text_sample or len(text_sample) < 10:
+            logger.info("OCR 文本不可用，启用纯视觉特征 fallback 分类")
+            if page_count <= 2 and (has_stamp or image_coverage > 0.30):
+                doc_type = DocType.FORM_KVP  # 短文档 + 印章/高覆盖率 → 票据
+            elif page_count == 1 and image_coverage > 0.15:
+                doc_type = DocType.FORM_KVP  # 单页 + 中等覆盖率 → 可能表单
+            elif table_kw_count >= 5:
+                doc_type = DocType.STRUCTURED_TABLE
+            else:
+                doc_type = DocType.DOCUMENT_PARSE
         else:
-            doc_type = DocType.DOCUMENT_PARSE
+            # OCR 可用时的标准分类规则
+            if kvp_count >= 3 and (has_stamp or ocr_difficulty in ("medium", "high")):
+                doc_type = DocType.FORM_KVP
+            elif kvp_count >= 5 and not has_stamp:
+                doc_type = DocType.FORM_KVP
+            elif table_kw_count >= 5 and kvp_count < 3:
+                doc_type = DocType.STRUCTURED_TABLE
+            else:
+                doc_type = DocType.DOCUMENT_PARSE
 
         logger.info(
             f"文档分类结果: {doc_type.value} "

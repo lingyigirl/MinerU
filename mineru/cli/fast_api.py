@@ -456,8 +456,13 @@ def build_result_dict(
             logger.warning(f"Unknown backend type: {backend}, skipping {pdf_name}")
             continue
 
+        # [自定义] KVP Pipeline 回退：当标准目录不存在时，检查 kvp/ 目录
         if not os.path.exists(parse_dir):
-            continue
+            kvp_fallback = os.path.join(output_dir, pdf_name, "kvp")
+            if os.path.exists(kvp_fallback):
+                parse_dir = kvp_fallback
+            else:
+                continue
 
         if return_md:
             data["md_content"] = get_infer_result(".md", pdf_name, parse_dir)
@@ -513,7 +518,12 @@ def create_result_zip(
                 continue
 
             if not os.path.exists(parse_dir):
-                continue
+                # [自定义] KVP Pipeline 回退
+                kvp_fallback = os.path.join(output_dir, pdf_name, "kvp")
+                if os.path.exists(kvp_fallback):
+                    parse_dir = kvp_fallback
+                else:
+                    continue
 
             if return_md:
                 path = os.path.join(parse_dir, f"{pdf_name}.md")

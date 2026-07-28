@@ -47,7 +47,7 @@ class EngineRoute:
 # 针对不同文档类型的策略优先级：
 # DOCUMENT_PARSE → 根据质量选择最合适的 MinerU 后端
 # STRUCTURED_TABLE → Hybrid + OCR 补充（当前已实现）
-# FORM_KIE → KIE Pipeline（外部 MLLM）
+# FORM_KVP → KVP Pipeline（外部 MLLM）
 
 def select_engine_route(
     doc_type: DocType,
@@ -77,20 +77,20 @@ def select_engine_route(
             quality=quality,
         )
 
-    if doc_type == DocType.FORM_KIE:
-        # 🔴 票据/卡证 → KIE Pipeline
-        kvp_engine = user_kvp_engine or "qwen-vl-plus"
+    if doc_type == DocType.FORM_KVP:
+        # 🔴 票据/卡证 → KVP Pipeline
+        kvp_engine = user_kvp_engine or "qwen-vl-max"
         kvp_url = user_kvp_server_url or None
         return EngineRoute(
             doc_type=doc_type,
-            engine_backend="kie",
-            strategy=f"form_kie:{kvp_engine}",
+            engine_backend="kvp",
+            strategy=f"form_kvp:{kvp_engine}",
             extra_kwargs={
                 "kvp_engine": kvp_engine,
                 "kvp_server_url": kvp_url,
             },
             quality=quality,
-            fallback_engine="hybrid-auto-engine",  # KIE 失败时回退
+            fallback_engine="hybrid-auto-engine",  # KVP 失败时回退
         )
 
     elif doc_type == DocType.STRUCTURED_TABLE:

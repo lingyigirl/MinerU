@@ -1,4 +1,4 @@
-"""KIE Pipeline：基于 MLLM 的票据/卡证 Key-Value 信息提取器。
+"""KVP Pipeline：基于 MLLM 的票据/卡证 Key-Value 信息提取器。
 
 支持的引擎：
 - qwen-vl-plus / qwen-vl-max：阿里云 DashScope API（OpenAI 兼容）
@@ -50,8 +50,8 @@ class KvpEngineConfig:
     model_name: str
     base_url: Optional[str] = None
     api_key: Optional[str] = None
-    temperature: float = 0.1
-    max_tokens: int = 4096
+    temperature: float = 0.0  # 确定性输出，避免票据数字幻觉
+    max_tokens: int = 2048  # 单页表单 2048 token 足够，过大容易诱发幻觉数字
     timeout: int = 60
 
     def is_remote(self) -> bool:
@@ -91,22 +91,15 @@ ENGINE_REGISTRY: dict[str, KvpEngineConfig] = {
 # 默认 KVP 提取 Prompt 模板
 # ---------------------------------------------------------------------------
 
-DEFAULT_KVP_PROMPT_TEMPLATE = """请提取这张文档图片中所有的"标签-值"（Key-Value）信息。
+DEFAULT_KVP_PROMPT_TEMPLATE = """请严格按照图片中的文字内容，提取所有字段信息。
 
-要求：
-1. 仔细识别图片中每一个字段的标签（如：户名、账号、日期、金额等）及其对应的值
-2. 输出纯 JSON 格式，Key 为标签（中文），Value 为对应的取值
-3. 不要遗漏任何信息，包括印章中的文字、手写内容、印刷文字
-4. 如果某个值看不清或不完整，请标注为 "[无法识别]" 而不是编造内容
-5. 数字和日期请保持原始格式，不要做任何改动
-6. 大写金额和小写金额都要提取
+规则：
+1. 只输出图片中实际出现的文字，绝不编造
+2. 看不清的内容标注为 [无法识别]
+3. 每个字段的值最多30个字符，超出的截断
+4. 直接输出 JSON 对象，以 { 开头 } 结尾，不要用代码块包裹
 
-输出格式：
-{
-  "字段1": "值1",
-  "字段2": "值2",
-  ...
-}"""
+示例输出格式：{"户名": "张三", "账号": "622700123456", "金额": "50000"}"""
 
 
 # ---------------------------------------------------------------------------
@@ -184,28 +177,43 @@ def _call_vlm_api(
     client = _create_openai_client(config)
     img_url = _pil_to_base64_url(pil_img)
 
-    try:
-        response = client.chat.completions.create(
-            model=config.model_name,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": img_url}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-            temperature=config.temperature,
-            max_tokens=config.max_tokens,
-        )
-    except Exception:
-        logger.exception(f"VLM API 调用失败 (engine={config.engine})")
-        raise RuntimeError(f"VLM API 调用失败: {config.engine}")
+    last_error = None
+    for attempt in range(2):
+        try:
+            # 第二次尝试降低温度 + 缩短 prompt 防幻觉
+            if attempt == 0:
+                temp = config.temperature
+                current_prompt = prompt
+            else:
+                temp = 0.0
+                current_prompt = "按图片提取所有字段的标签和值，输出JSON。每个值最多20字符。不确定的标[?]。"
 
-    content = response.choices[0].message.content
-    logger.debug(f"VLM 响应 (tokens={response.usage}): {content[:200]}...")
+            response = client.chat.completions.create(
+                model=config.model_name,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": img_url}},
+                        {"type": "text", "text": current_prompt},
+                    ],
+                }],
+                temperature=temp,
+                max_tokens=config.max_tokens,
+            )
+        except Exception:
+            logger.exception(f"VLM API 调用失败 (engine={config.engine}, attempt={attempt})")
+            raise RuntimeError(f"VLM API 调用失败: {config.engine}")
 
-    # 尝试从响应中提取 JSON
-    return _parse_json_response(content)
+        content = response.choices[0].message.content
+        logger.debug(f"VLM 响应 (attempt={attempt}, tokens={response.usage}): {content[:200]}...")
+
+        try:
+            return _parse_json_response(content)
+        except ValueError as e:
+            last_error = e
+            logger.warning(f"VLM JSON 解析失败 (attempt={attempt}): {str(e)[:100]}")
+
+    raise last_error  # type: ignore[misc]
 
 
 def _parse_json_response(content: str) -> dict[str, Any]:
@@ -215,6 +223,7 @@ def _parse_json_response(content: str) -> dict[str, Any]:
     1. 纯 JSON（以 `{` 开头）
     2. Markdown 代码块包裹（```json ... ```）
     3. 夹带解释文字的 JSON
+    4. 被截断的不完整 JSON（尝试修复）
 
     Args:
         content: LLM 原始响应文本。
@@ -226,7 +235,7 @@ def _parse_json_response(content: str) -> dict[str, Any]:
         ValueError: 无法提取有效 JSON。
     """
     # 尝试 1: Markdown 代码块
-    md_match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n```", content)
+    md_match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)```", content)
     if md_match:
         content = md_match.group(1).strip()
 
@@ -242,16 +251,30 @@ def _parse_json_response(content: str) -> dict[str, Any]:
             return result
         raise ValueError(f"JSON 不是 dict 类型: {type(result)}")
     except json.JSONDecodeError:
-        # 尝试修复常见的 JSON 格式问题
-        cleaned = _attempt_json_repair(content)
+        pass
+
+    # 尝试 3: 修复常见格式问题
+    cleaned = _attempt_json_repair(content)
+    try:
+        result = json.loads(cleaned)
+        if isinstance(result, dict):
+            logger.warning("JSON 经格式修复后成功解析")
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # 尝试 4: 截断恢复 — 补全缺失的引号、括号
+    recovered = _attempt_truncation_recovery(cleaned)
+    if recovered:
         try:
-            result = json.loads(cleaned)
+            result = json.loads(recovered)
             if isinstance(result, dict):
-                logger.warning("JSON 经修复后成功解析")
+                logger.warning("JSON 经截断恢复后成功解析（最后一行数据可能不完整）")
                 return result
         except json.JSONDecodeError:
             pass
-        raise ValueError(f"无法解析 VLM 响应为 JSON: {content[:500]}")
+
+    raise ValueError(f"无法解析 VLM 响应为 JSON: {content[:500]}")
 
 
 def _attempt_json_repair(content: str) -> str:
@@ -263,11 +286,62 @@ def _attempt_json_repair(content: str) -> str:
     Returns:
         修复后的字符串。
     """
-    # 移除尾部逗号（最常见的问题）
+    # 移除尾部逗号
     content = re.sub(r",\s*([}\]])", r"\1", content)
-    # 移除尾部多余的逗号（最后一个值后）
     content = re.sub(r",\s*$", "", content)
     return content
+
+
+def _attempt_truncation_recovery(content: str) -> str | None:
+    """尝试恢复被截断的不完整 JSON。
+
+    当 VLM 输出被 max_tokens 截断时，JSON 可能缺少闭合的引号和括号。
+    尝试从最后一个完整的键值对处截断并补全 JSON。
+
+    Args:
+        content: 可能不完整的 JSON 字符串。
+
+    Returns:
+        修复后的完整 JSON 字符串，如果无法修复则返回 None。
+    """
+    if not content.strip():
+        return None
+
+    # 如果已经以 } 结尾，不需要修复
+    content = content.rstrip()
+    if content.endswith("}"):
+        return None
+
+    # 找到最后一个完整的键值对（以 ", 结尾的行）
+    # 回退到最后一个逗号或换行处
+    last_comma = content.rfind(',\n')
+    if last_comma == -1:
+        last_comma = content.rfind(',\n  ')
+    if last_comma == -1:
+        return None
+
+    # 截断到最后一个完整的键值对
+    truncated = content[:last_comma].rstrip().rstrip(',')
+
+    # 补全 JSON：移除尾部逗号，加上闭合括号
+    truncated = re.sub(r",\s*$", "", truncated)
+
+    # 计算未闭合的括号
+    open_braces = truncated.count('{') - truncated.count('}')
+    open_brackets = truncated.count('[') - truncated.count(']')
+
+    # 检查最后一个值是否有未闭合的字符串
+    # 如果最后一个 " 后面没有对应的 "，补一个 "
+    last_line = truncated.split('\n')[-1].strip()
+    quote_count = last_line.count('"')
+    if quote_count % 2 != 0:
+        truncated += '"'
+
+    # 补全括号
+    truncated += ']' * max(0, open_brackets)
+    truncated += '}' * max(0, open_braces)
+
+    return truncated
 
 
 # ---------------------------------------------------------------------------
@@ -276,14 +350,14 @@ def _attempt_json_repair(content: str) -> str:
 
 def extract_kvp_from_form(
     pdf_bytes: bytes,
-    engine: str = "qwen-vl-plus",
+    engine: str = "qwen-vl-max",
     server_url: Optional[str] = None,
     kvp_prompt: Optional[str] = None,
     dpi: int = DEFAULT_PDF_IMAGE_DPI,
     start_page_id: int = 0,
     end_page_id: Optional[int] = None,
 ) -> dict[str, Any]:
-    """使用专用 MLLM 提取票据/卡证的 KVP 信息（KIE Pipeline 主入口）。
+    """使用专用 MLLM 提取票据/卡证的 KVP 信息（KVP Pipeline 主入口）。
 
     流程：
     1. 渲染 PDF 页面为图片
@@ -320,7 +394,7 @@ def extract_kvp_from_form(
         config = KvpEngineConfig(
             engine=config.engine,
             model_name=config.model_name,
-            base_url=server_url,
+            base_url=effective_url,
             api_key=config.api_key,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
@@ -402,7 +476,7 @@ def _convert_kvp_to_middle_json(
                 "text": "\n".join(lines),
                 "bbox": [0, 0, w, h],
                 "page_idx": page_idx,
-                "source": f"kie_{engine}",
+                "source": f"kvp_{engine}",
             }
         ]
 
@@ -411,11 +485,11 @@ def _convert_kvp_to_middle_json(
             "width": w,
             "height": h,
             "spans": spans,
-            "_kie_raw": kvp_dict,  # 保留原始 KVP 结果
+            "_kvp_raw": kvp_dict,  # 保留原始 KVP 结果
         })
 
     return {
         "pdf_info": pdf_info,
-        "_backend": "kie",
-        "_kie_engine": engine,
+        "_backend": "kvp",
+        "_kvp_engine": engine,
     }
