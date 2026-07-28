@@ -112,6 +112,9 @@ KVP_KEYWORDS: list[str] = [
     "纳税人识别号", "开户行", "账号", "收款人", "付款人", "摘要",
     # 合同/授权书
     "甲方", "乙方", "授权期限", "授权范围", "被授权人", "授权人",
+    # 银行回单
+    "回单", "交易时间", "交易金额", "收费金额", "附言", "记账日期",
+    "业务流水号", "业务类型",
 ]
 
 # 编译正则表达式以加速匹配（匹配中文字符序列）
@@ -124,6 +127,7 @@ _KVP_PATTERN = re.compile("|".join(re.escape(kw) for kw in KVP_KEYWORDS))
 TABLE_INDICATOR_KEYWORDS: list[str] = [
     "合计", "总计", "同比", "环比", "增长率", "占比",
     "单位", "数量", "单价", "金额", "金额合计", "余额",
+    "交易金额", "收费金额",
 ]
 
 _TABLE_KW_PATTERN = re.compile("|".join(re.escape(kw) for kw in TABLE_INDICATOR_KEYWORDS))
@@ -224,6 +228,34 @@ def _count_table_keywords(text: str) -> int:
     for match in _TABLE_KW_PATTERN.finditer(text):
         found.add(match.group())
     return len(found)
+
+
+def _has_repeating_labels(text: str) -> bool:
+    """检测 OCR 文本中是否存在重复的标签模式（表格结构特征）。
+
+    表格型文档（如银行回单、对账单）的 OCR 输出中，同一行会出现多个
+    相同标签（如 "户名...账号...户名...账号"），这是表格网格布局的标志。
+    简单 KVP 表单中每个标签通常只出现一次。
+
+    Args:
+        text: OCR 提取的文本字符串。
+
+    Returns:
+        True 如果检测到重复标签模式。
+    """
+    if not text:
+        return False
+    # 在同一行中检测重复的关键标签（表格网格特征）
+    repeating_patterns = [
+        r"户名.*户名",  # 两列表格：付款人户名 + 收款人户名
+        r"账号.*账号",  # 两列表格：付款人账号 + 收款人账号
+        r"开户行.*开户行",  # 两列表格：付款人开户行 + 收款人开户行
+        r"金额.*金额",  # 多金额字段（交易金额 + 收费金额）
+    ]
+    for p in repeating_patterns:
+        if re.search(p, text):
+            return True
+    return False
 
 
 def _select_sample_pages(page_count: int, max_sample_pages: int = 3) -> list[int]:
@@ -361,7 +393,18 @@ def classify_document(
                 doc_type = DocType.DOCUMENT_PARSE
         else:
             # OCR 可用时的标准分类规则
-            if kvp_count >= 3 and (has_stamp or ocr_difficulty in ("medium", "high")):
+            # 优先检测表格 + KVP 混合结构（如银行回单、对账单）
+            # 这类文档有重复标签模式（同一行出现 "户名...账号...户名...账号"）
+            # 应走 Hybrid 管线由 VLM 处理表格，而非 KVP 本地引擎
+            has_repeating = _has_repeating_labels(text_sample)
+            if has_repeating and kvp_count >= 3 and table_kw_count >= 3:
+                # 表格型 KVP 文档（银行回单、对账单等）→ Hybrid 处理表格
+                logger.info(
+                    f"检测到表格+KVP混合结构（重复标签模式），"
+                    f"路由到通用解析（Hybrid后端处理表格）"
+                )
+                doc_type = DocType.DOCUMENT_PARSE
+            elif kvp_count >= 3 and (has_stamp or ocr_difficulty in ("medium", "high")):
                 doc_type = DocType.FORM_KVP
             elif kvp_count >= 5 and not has_stamp:
                 doc_type = DocType.FORM_KVP
