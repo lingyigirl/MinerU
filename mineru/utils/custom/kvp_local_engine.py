@@ -385,6 +385,33 @@ def _merge_bboxes(*bboxes: list[float]) -> list[float]:
     ]
 
 
+def _normalize_bbox(
+    bbox: list[float],
+    page_w: float,
+    page_h: float,
+) -> list[int]:
+    """将像素坐标 bbox 归一化到 1000 单位坐标系（对齐 hybrid_auto 的 content_list 格式）。
+
+    hybrid_auto 在 make_blocks_to_content_list 阶段将像素坐标归一化到
+    1000 单位（int(x * 1000 / page_width)），本函数遵循相同约定。
+
+    Args:
+        bbox: [x0, y0, x1, y1] 像素坐标（浮点数）。
+        page_w: 页面像素宽度。
+        page_h: 页面像素高度。
+
+    Returns:
+        [x0, y0, x1, y1] 归一化到 1000 单位的整数坐标。
+    """
+    x0, y0, x1, y1 = bbox
+    return [
+        int(x0 * 1000 / page_w),
+        int(y0 * 1000 / page_h),
+        int(x1 * 1000 / page_w),
+        int(y1 * 1000 / page_h),
+    ]
+
+
 def _pair_kvp(
     boxes: list[dict],
     compiled_labels: list[tuple[re.Pattern, str]],

@@ -568,10 +568,16 @@ def _convert_kvp_to_middle_json(
     images: list[dict],
     engine: str,
 ) -> dict[str, Any]:
-    """将 KVP 提取结果转换为 MinerU 兼容的 middle_json 格式。
+    """将 KVP 提取结果转换为 MinerU 兼容的 middle_json 格式（对齐 hybrid_auto 结构）。
 
-    每个 KVP 字段生成一个独立的 span，包含从 OCR 引擎获取的 bbox 信息。
-    bbox 使用页面绝对坐标（像素），与 hybrid-auto-engine 的输出格式对齐。
+    生成与 hybrid_auto 兼容的 block→line→span 层级结构：
+    - page_size: [width, height] 数组（与 hybrid_auto 的 page_size 格式一致）
+    - preproc_blocks: 每个 KVP 字段一个 text block
+    - discarded_blocks: 空列表（KVP 无废弃块）
+    - para_blocks: 初始等于 preproc_blocks
+
+    同时保留 _kvp_raw 和 _kvp_bboxes 在页面级别（向后兼容）。
+    bbox 保留像素 float 值（与 hybrid_auto middle.json 一致，归一化在 content_list 阶段）。
 
     Args:
         page_results: 每页的 KVP 提取结果（含 _kvp_bboxes 的可选 bbox 数据）。
@@ -581,42 +587,57 @@ def _convert_kvp_to_middle_json(
     Returns:
         MinerU 兼容的 middle_json 格式。
     """
-    pdf_info = []
+    from mineru.utils.enum_class import BlockType, ContentType
+
+    pdf_info: list[dict[str, Any]] = []
     for page_idx, (kvp_dict, img_dict) in enumerate(zip(page_results, images)):
         pil_img = img_dict["img_pil"]
-        w, h = pil_img.size
+        w, h = pil_img.size  # 渲染图像像素尺寸（200 DPI）
 
         # 提取 bbox 信息（本地引擎提供，VLM 引擎无此数据）
         kvp_bboxes: dict[str, Any] = kvp_dict.pop("_kvp_bboxes", {})
-        spans = []
+
+        # 构建 block→line→span 层级（对齐 hybrid_auto 的 middle_json 结构）
+        preproc_blocks: list[dict[str, Any]] = []
 
         for key, value in kvp_dict.items():
             if key.startswith("_"):
                 continue  # 跳过元数据字段
 
             span_text = f"{key}: {value}"
+            source = f"kvp_{engine}"
 
             # 如果有 bbox 信息，使用对应字段的 merged_bbox
             field_bbox = kvp_bboxes.get(key, {}).get("merged_bbox", None)
             if field_bbox is None:
                 # 无 bbox 时回退到整页（VLM 引擎路径）
-                field_bbox = [0, 0, w, h]
+                field_bbox = [0.0, 0.0, float(w), float(h)]
 
-            spans.append({
-                "type": "text",
-                "text": span_text,
-                "bbox": field_bbox,
-                "page_idx": page_idx,
-                "source": f"kvp_{engine}",
+            # 确保 bbox 为 float 列表
+            field_bbox_f = [float(v) for v in field_bbox]
+
+            preproc_blocks.append({
+                "type": BlockType.TEXT,
+                "bbox": field_bbox_f,
+                "lines": [{
+                    "bbox": field_bbox_f,
+                    "spans": [{
+                        "type": ContentType.TEXT,
+                        "content": span_text,
+                        "bbox": field_bbox_f,
+                        "source": source,
+                    }],
+                }],
             })
 
         pdf_info.append({
             "page_idx": page_idx,
-            "width": w,
-            "height": h,
-            "spans": spans,
-            "_kvp_raw": kvp_dict,  # 保留原始 KVP 结果（不含 bbox 信息）
-            "_kvp_bboxes": kvp_bboxes,  # 保留 bbox 信息供下游使用
+            "page_size": [float(w), float(h)],
+            "preproc_blocks": preproc_blocks,
+            "discarded_blocks": [],
+            "para_blocks": preproc_blocks,  # KVP 无需段落合并，直接等于 preproc_blocks
+            "_kvp_raw": kvp_dict,  # 保留原始 KVP 结果（向后兼容）
+            "_kvp_bboxes": kvp_bboxes,  # 保留 bbox 信息（向后兼容）
         })
 
     return {
@@ -624,3 +645,123 @@ def _convert_kvp_to_middle_json(
         "_backend": "kvp",
         "_kvp_engine": engine,
     }
+
+
+def _kvp_blocks_to_content_list(
+    pdf_info: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """从 KVP middle_json 的 para_blocks 生成 content_list（对齐 hybrid_auto 格式）。
+
+    遍历每页的 para_blocks，将每个 text block 转换为独立的
+    {"type": "text", "text": "...", "bbox": [int,...], "page_idx": N} 条目。
+    bbox 从像素坐标归一化到 1000 单位坐标系。
+
+    Args:
+        pdf_info: middle_json 中的 pdf_info 列表。
+
+    Returns:
+        content_list 格式的列表，每个元素含 type/text/bbox/page_idx。
+    """
+    from mineru.utils.custom.kvp_local_engine import _normalize_bbox
+
+    content_list: list[dict[str, Any]] = []
+    for page in pdf_info:
+        page_idx = page.get("page_idx", 0)
+        page_size = page.get("page_size", [1000.0, 1000.0])
+        page_w, page_h = page_size[0], page_size[1]
+
+        for block in page.get("para_blocks", []):
+            block_type = block.get("type", "text")
+            bbox = block.get("bbox", [0, 0, page_w, page_h])
+            norm_bbox = _normalize_bbox(bbox, page_w, page_h)
+
+            # 从 lines → spans 层级提取文本
+            text_parts: list[str] = []
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if span.get("type") == "text":
+                        text_parts.append(span.get("content", ""))
+
+            entry: dict[str, Any] = {
+                "type": block_type,
+                "text": "".join(text_parts),
+                "bbox": norm_bbox,
+                "page_idx": page_idx,
+            }
+            content_list.append(entry)
+
+    return content_list
+
+
+def _kvp_blocks_to_content_list_v2(
+    pdf_info: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """从 KVP middle_json 的 para_blocks 生成 content_list_v2（对齐 hybrid_auto 格式）。
+
+    生成嵌套结构：外层列表按页分组，内层每个 block 为
+    {"type": "paragraph", "content": {"paragraph_content": [...]}, "bbox": [...]}。
+    page_idx 由外层列表索引隐式表示，不写入 block 内部。
+
+    Args:
+        pdf_info: middle_json 中的 pdf_info 列表。
+
+    Returns:
+        content_list_v2 格式的嵌套列表。
+    """
+    from mineru.utils.custom.kvp_local_engine import _normalize_bbox
+    from mineru.utils.enum_class import ContentTypeV2
+
+    output: list[list[dict[str, Any]]] = []
+    for page in pdf_info:
+        page_blocks: list[dict[str, Any]] = []
+        page_size = page.get("page_size", [1000.0, 1000.0])
+        page_w, page_h = page_size[0], page_size[1]
+
+        for block in page.get("para_blocks", []):
+            bbox = block.get("bbox", [0.0, 0.0, page_w, page_h])
+            norm_bbox = _normalize_bbox(bbox, page_w, page_h)
+
+            # 构建 paragraph_content（每个 span 一个 content 条目）
+            para_content: list[dict[str, Any]] = []
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if span.get("type") == "text":
+                        para_content.append({
+                            "type": ContentTypeV2.SPAN_TEXT,
+                            "content": span.get("content", ""),
+                        })
+
+            entry = {
+                "type": ContentTypeV2.PARAGRAPH,
+                "content": {
+                    "paragraph_content": para_content,
+                },
+                "bbox": norm_bbox,
+            }
+            page_blocks.append(entry)
+
+        output.append(page_blocks)
+
+    return output
+
+
+def make_kvp_content_list(
+    pdf_info: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]]]:
+    """生成 KVP 的 content_list 和 content_list_v2（对齐 hybrid_auto 输出格式）。
+
+    从已转换为 hybrid_auto 结构的 middle_json pdf_info 中提取 para_blocks，
+    生成与 hybrid_auto pipeline 完全兼容的 content_list 和 content_list_v2。
+
+    Args:
+        pdf_info: middle_json 中的 pdf_info 列表（已由 _convert_kvp_to_middle_json
+            转换为 hybrid_auto 兼容结构，含 para_blocks）。
+
+    Returns:
+        (content_list, content_list_v2) 元组：
+        - content_list: 元素为 {"type": "text", "text": str, "bbox": list[int], "page_idx": int}
+        - content_list_v2: 元素为 [{"type": "paragraph", "content": {...}, "bbox": list[int]}, ...]
+    """
+    content_list = _kvp_blocks_to_content_list(pdf_info)
+    content_list_v2 = _kvp_blocks_to_content_list_v2(pdf_info)
+    return content_list, content_list_v2

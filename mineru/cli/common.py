@@ -723,17 +723,27 @@ def _process_form_kvp(
         md_content = _make_kvp_markdown(pdf_info, pdf_file_name, f_make_md_mode)
         md_writer.write_string(f"{pdf_file_name}.md", md_content)
 
-    # ---- 生成 content_list（对齐 MinerU 格式） ----
+    # ---- 生成 content_list（对齐 MinerU hybrid_auto 格式） ----
     if f_dump_content_list:
-        content_list = _make_kvp_content_list(pdf_info, pdf_file_name)
+        # [自定义] 使用 hybrid_auto 兼容的 content_list 生成逻辑
+        # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+        try:
+            from mineru.utils.custom.kvp_extractor import make_kvp_content_list
+            content_list, content_list_v2 = make_kvp_content_list(pdf_info)
+        except Exception as exc:
+            logger.warning(
+                f"KVP content_list hybrid_auto 格式生成失败，回退到旧格式: {exc}"
+            )
+            content_list = _make_kvp_content_list(pdf_info, pdf_file_name)
+            content_list_v2 = content_list
+
         md_writer.write_string(
             f"{pdf_file_name}_content_list.json",
             json.dumps(content_list, ensure_ascii=False, indent=4),
         )
-        # content_list_v2 复用同一结构（KVP 输出无 block 层级差异）
         md_writer.write_string(
             f"{pdf_file_name}_content_list_v2.json",
-            json.dumps(content_list, ensure_ascii=False, indent=4),
+            json.dumps(content_list_v2, ensure_ascii=False, indent=4),
         )
 
     # ---- 输出 middle_json ----
