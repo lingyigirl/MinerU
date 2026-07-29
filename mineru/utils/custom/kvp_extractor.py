@@ -570,11 +570,11 @@ def _convert_kvp_to_middle_json(
 ) -> dict[str, Any]:
     """将 KVP 提取结果转换为 MinerU 兼容的 middle_json 格式。
 
-    生成的 middle_json 包含 pdf_info 数组，每页为一个 KVP block，
-    使得下游的 Markdown/JSON 生成管线可以统一处理。
+    每个 KVP 字段生成一个独立的 span，包含从 OCR 引擎获取的 bbox 信息。
+    bbox 使用页面绝对坐标（像素），与 hybrid-auto-engine 的输出格式对齐。
 
     Args:
-        page_results: 每页的 KVP 提取结果。
+        page_results: 每页的 KVP 提取结果（含 _kvp_bboxes 的可选 bbox 数据）。
         images: 渲染后的图片列表（用于获取尺寸信息）。
         engine: 使用的引擎标识。
 
@@ -586,29 +586,37 @@ def _convert_kvp_to_middle_json(
         pil_img = img_dict["img_pil"]
         w, h = pil_img.size
 
-        # 将 KVP 转换为文本 spans（每个 KVP 对为一行）
-        lines = []
+        # 提取 bbox 信息（本地引擎提供，VLM 引擎无此数据）
+        kvp_bboxes: dict[str, Any] = kvp_dict.pop("_kvp_bboxes", {})
+        spans = []
+
         for key, value in kvp_dict.items():
             if key.startswith("_"):
                 continue  # 跳过元数据字段
-            lines.append(f"{key}: {value}")
 
-        spans = [
-            {
+            span_text = f"{key}: {value}"
+
+            # 如果有 bbox 信息，使用对应字段的 merged_bbox
+            field_bbox = kvp_bboxes.get(key, {}).get("merged_bbox", None)
+            if field_bbox is None:
+                # 无 bbox 时回退到整页（VLM 引擎路径）
+                field_bbox = [0, 0, w, h]
+
+            spans.append({
                 "type": "text",
-                "text": "\n".join(lines),
-                "bbox": [0, 0, w, h],
+                "text": span_text,
+                "bbox": field_bbox,
                 "page_idx": page_idx,
                 "source": f"kvp_{engine}",
-            }
-        ]
+            })
 
         pdf_info.append({
             "page_idx": page_idx,
             "width": w,
             "height": h,
             "spans": spans,
-            "_kvp_raw": kvp_dict,  # 保留原始 KVP 结果
+            "_kvp_raw": kvp_dict,  # 保留原始 KVP 结果（不含 bbox 信息）
+            "_kvp_bboxes": kvp_bboxes,  # 保留 bbox 信息供下游使用
         })
 
     return {

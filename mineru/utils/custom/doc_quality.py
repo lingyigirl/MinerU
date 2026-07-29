@@ -253,7 +253,7 @@ def analyze_document_quality(
     except Exception:
         logger.exception("文档质量分析失败，返回默认质量评估")
 
-    logger.debug(f"文档质量分析结果: {quality.summary()}")
+    logger.info(f"S0 文档质量分析结果: {quality.summary()}")
     return quality
 
 

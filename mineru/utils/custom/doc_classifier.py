@@ -30,14 +30,14 @@ from mineru.utils.pdf_image_tools import (
 _ocr_instance = None
 
 
-def _get_ocr():
+def get_ocr():
     """获取 PaddleOCR 单例（线程安全由 GIL 保证）。
 
     首次调用加载模型（~2s），后续调用直接复用（~50ms）。
+    KVP 本地引擎也通过此函数复用该实例，避免重复初始化。
     """
     global _ocr_instance
     if _ocr_instance is None:
-        import numpy as np
         from mineru.model.ocr.pytorch_paddle import PytorchPaddleOCR
 
         _ocr_instance = PytorchPaddleOCR(lang="ch")
@@ -147,7 +147,7 @@ def _extract_text_from_page(pil_img) -> str:
     try:
         import numpy as np
 
-        ocr = _get_ocr()  # 复用单例
+        ocr = get_ocr()  # 复用单例
         results = ocr.ocr(np.asarray(pil_img))
         if results is None or (isinstance(results, list) and len(results) == 0):
             return ""

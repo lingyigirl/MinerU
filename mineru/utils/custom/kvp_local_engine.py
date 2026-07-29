@@ -29,10 +29,13 @@ def _ocr_extract_boxes(
     pil_img,
     lang: str = "ch",
 ) -> list[dict[str, Any]]:
-    """运行 PaddleOCR 提取全部 text box。"""
-    from mineru.model.ocr.pytorch_paddle import PytorchPaddleOCR
+    """运行 PaddleOCR 提取全部 text box。
 
-    ocr = PytorchPaddleOCR(lang=lang)
+    复用 S1 分类器的 OCR 单例（get_ocr），避免 KVP 管线中重复初始化模型。
+    """
+    from mineru.utils.custom.doc_classifier import get_ocr
+
+    ocr = get_ocr()
     results = ocr.ocr(np.asarray(pil_img))
 
     if not results or not results[0]:
@@ -191,6 +194,7 @@ def _pre_split_grid_values(
     labels: list[dict],
     values: list[dict],
     kvp: dict[str, Any],
+    kvp_bboxes: dict[str, dict[str, Any]],
 ) -> None:
     """C0 阶段：在空间配对之前，检测并拆分 OCR 合并的多列网格值。
 
@@ -202,6 +206,7 @@ def _pre_split_grid_values(
         labels: 所有标签 box 列表（含 matched_label）。
         values: 所有值 box 列表（会被原地修改，移除已拆分的宽值框）。
         kvp: KVP 结果 dict（会被修改）。
+        kvp_bboxes: KVP bbox 记录 dict（会被修改）。
     """
     if len(labels) < 2 or len(values) < 2:
         return
@@ -261,15 +266,19 @@ def _pre_split_grid_values(
             # 启发式：2 列等宽拆分（如双日期字段"2024053120240531"→8+8）
             if len(covering_labels) == 2:
                 mid = total_chars // 2
+                mid_x = val_box["x1"] + (val_box["x2"] - val_box["x1"]) * (mid / total_chars) if total_chars else val_box["cx"]
                 for i, lbl in enumerate(covering_labels):
                     if i == 0:
                         portion = merged_text[:mid].strip()
+                        est_bbox = [val_box["x1"], val_box["y1"], mid_x, val_box["y2"]]
                     else:
                         portion = merged_text[mid:].strip()
+                        est_bbox = [mid_x, val_box["y1"], val_box["x2"], val_box["y2"]]
                     if portion:
                         label_name = lbl["matched_label"]
                         if label_name not in kvp:
                             kvp[label_name] = portion
+                            kvp_bboxes[label_name] = {"merged_bbox": est_bbox}
                             logger.debug(
                                 f"网格拆分(2列): '{label_name}' ← '{portion}' "
                                 f"(来自 '{merged_text[:30]}...')"
@@ -309,10 +318,16 @@ def _pre_split_grid_values(
                     end = total_chars
 
                 portion = merged_text[start:end].strip()
+                # 估算该分块的 bbox（按字符比例 + 列边界）
+                est_x1 = boundaries[i] if i < len(boundaries) - 1 else val_box["x1"]
+                est_x2 = boundaries[i + 1] if i + 1 < len(boundaries) else val_box["x2"]
+                est_bbox = [est_x1, val_box["y1"], est_x2, val_box["y2"]]
+
                 if portion:
                     label_name = lbl["matched_label"]
                     if label_name not in kvp:
                         kvp[label_name] = portion
+                        kvp_bboxes[label_name] = {"merged_bbox": est_bbox}
                         logger.debug(
                             f"网格拆分: '{label_name}' ← '{portion}' "
                             f"(来自合并文本 '{merged_text[:40]}...')"
@@ -353,6 +368,23 @@ def _is_label_modifier(text: str, compiled_labels: list[tuple[re.Pattern, str]])
     return False
 
 
+def _box_to_list(box: dict) -> list[float]:
+    """将 box 的 bbox 坐标转换为 [x1, y1, x2, y2] 列表。"""
+    return [float(box["x1"]), float(box["y1"]), float(box["x2"]), float(box["y2"])]
+
+
+def _merge_bboxes(*bboxes: list[float]) -> list[float]:
+    """合并多个 bbox 为最小包围盒。"""
+    if not bboxes:
+        return [0.0, 0.0, 0.0, 0.0]
+    return [
+        min(b[0] for b in bboxes),
+        min(b[1] for b in bboxes),
+        max(b[2] for b in bboxes),
+        max(b[3] for b in bboxes),
+    ]
+
+
 def _pair_kvp(
     boxes: list[dict],
     compiled_labels: list[tuple[re.Pattern, str]],
@@ -362,16 +394,22 @@ def _pair_kvp(
     配对策略（按优先级）：
     A. "标签：值" 冒号分隔 → 直接解析
     B. "标签值" 无分隔符拼接 → 正则拆分
+    C0. 网格预拆分 → 宽值框按标签列边界比例拆分
     C. 空间最近邻配对 → 标签找最近的未匹配值
+
+    同时记录每个字段的 bbox 信息（label_bbox + value_bbox），
+    供下游 middle_json 生成独立 span。
 
     Args:
         boxes: OCR text box 列表。
         compiled_labels: 编译后的标签词典。
 
     Returns:
-        配对后的 KVP dict。
+        包含 KVP 字段值 + _kvp_bboxes 的 dict。
     """
     kvp: dict[str, Any] = {}
+    # 记录每个字段的 bbox 信息
+    kvp_bboxes: dict[str, dict[str, Any]] = {}
 
     # 分类每个 box
     labels: list[dict] = []    # 未匹配的标签 box
@@ -379,6 +417,8 @@ def _pair_kvp(
 
     for box in boxes:
         text = box["text"]
+        box_bbox = _box_to_list(box)
+
         # A: 冒号分隔
         label_text, value_text = _try_split_colon(text)
         if label_text and value_text:
@@ -386,10 +426,12 @@ def _pair_kvp(
             if matched_label:
                 if matched_label not in kvp or box["confidence"] > 0.8:
                     kvp[matched_label] = value_text
+                    kvp_bboxes[matched_label] = {"merged_bbox": box_bbox}
                 continue
             # 未匹配到已知标签但格式正确 → 直接收录
             if label_text not in kvp:
                 kvp[label_text] = value_text
+                kvp_bboxes[label_text] = {"merged_bbox": box_bbox}
             continue
 
         # B: 无分隔符拼接
@@ -397,6 +439,7 @@ def _pair_kvp(
         if concat_label and concat_value:
             if concat_label not in kvp or box["confidence"] > 0.8:
                 kvp[concat_label] = concat_value
+                kvp_bboxes[concat_label] = {"merged_bbox": box_bbox}
             continue
 
         # C: 待空间配对
@@ -419,14 +462,14 @@ def _pair_kvp(
 
     # ---- C0: 网格预拆分（在空间配对之前，防止合并值被错误抢走） ----
     # 检测宽值框跨越多个标签列，按列比例拆分为各字段的独立值
-    _pre_split_grid_values(labels, values, kvp)
+    _pre_split_grid_values(labels, values, kvp, kvp_bboxes)
 
     # ---- C: 空间最近邻配对（仅对 C0 之后剩余的未匹配标签） ----
     MAX_PAIR_DISTANCE = 250.0   # 最大配对距离（像素）
 
     paired_value_indices: set[int] = set()
-    # 用于记录每个标签的最佳配对（含距离），供重复标签去重
-    best_pairings: dict[str, tuple[str, float]] = {}
+    # 用于记录每个标签的最佳配对（含距离 + value box index），供重复标签去重
+    best_pairings: dict[str, tuple[str, float, int]] = {}
 
     for lbl in labels:
         if lbl["matched_label"] in kvp:
@@ -454,10 +497,10 @@ def _pair_kvp(
         # 重复标签去重：保留距离更近的配对
         if label_name in best_pairings and best_dist >= best_pairings[label_name][1]:
             continue
-        best_pairings[label_name] = (values[best_vi]["text"], best_dist)
+        best_pairings[label_name] = (values[best_vi]["text"], best_dist, best_vi)
 
     # 将最佳配对写入 kvp，并标记已使用的 value
-    for label_name, (val_text, _) in best_pairings.items():
+    for label_name, (val_text, _, best_vi) in best_pairings.items():
         # 检查值是否为标签修饰符（如"大写"/"小写"），
         # 这些文本不应作为字段值
         if _is_label_modifier(val_text, compiled_labels):
@@ -466,12 +509,17 @@ def _pair_kvp(
             )
             continue
         kvp[label_name] = val_text
-        # 找到并标记对应的 value index
-        for vi, val in enumerate(values):
-            if val["text"] == val_text and vi not in paired_value_indices:
-                paired_value_indices.add(vi)
-                break
+        kvp_bboxes[label_name] = {
+            "merged_bbox": _merge_bboxes(
+                _box_to_list(values[best_vi]),
+                # 找到同名 label box 的坐标
+                *[(_box_to_list(lbl)) for lbl in labels if lbl["matched_label"] == label_name]
+            )
+        }
+        paired_value_indices.add(best_vi)
 
+    # 将 bbox 信息注入结果
+    kvp["_kvp_bboxes"] = kvp_bboxes
     return kvp
 
 

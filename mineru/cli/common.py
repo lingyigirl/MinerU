@@ -950,6 +950,13 @@ def _try_smart_routing(
 
             # 如果是 KVP 路由 → 处理
             if route.engine_backend == "kvp":
+                # 当 doc_type=auto 路由到 KVP 时，用户指定的 backend 会被覆盖
+                if backend != "kvp" and not backend.startswith("kvp"):
+                    logger.warning(
+                        f"[自定义] doc_type=auto 路由将 backend 从 '{backend}' "
+                        f"覆盖为 'kvp(pp-structure)'，"
+                        f"如需保持原 backend 请设置 doc_type=general"
+                    )
                 logger.info(
                     f"[自定义] 智能路由: {doc_type_result.value} → KVP Pipeline"
                 )
