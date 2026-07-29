@@ -10,7 +10,7 @@
 import re
 from typing import Optional
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 from loguru import logger
 
 # 常见发票表头关键词集合（用于识别合并单元格文本中的表头部分）
@@ -75,6 +75,12 @@ def split_merged_table_cells(html: str) -> str:
 
             for row in rows:
                 if not _is_merged_row(row, total_columns):
+                    # 非全行合并 → 尝试拆分部分合并的单元格
+                    # （如 VLM 将末尾 3 列合并为 1 个 td："金额 税率/征收率 税额 1769.91 13% 230.09"）
+                    if _try_split_partial_merge(row, soup, total_columns):
+                        modified = True
+                        # 拆分后重新计算总列数
+                        total_columns = _compute_total_columns(rows)
                     continue
 
                 cell = row.find(["td", "th"])
@@ -140,6 +146,137 @@ def split_merged_table_cells(html: str) -> str:
     if modified:
         return str(soup)
     return html
+
+
+def _try_split_partial_merge(
+    row: Tag,
+    soup: BeautifulSoup,
+    total_columns: int,
+) -> bool:
+    """检测并拆分表格行中部分合并的单元格（非全行合并场景）。
+
+    当一行有多个单元格，但其中某个单元格包含 "表头标签 + 数据值"
+    的拼接文本时（如 VLM 输出 "金额 税率/征收率 税额 1769.91 13% 230.09"），
+    将表头标签替换原单元格位置为新 <th>，数据值移至下一行（数据行）。
+
+    Args:
+        row: BeautifulSoup <tr> Tag。
+        soup: BeautifulSoup 对象，用于创建新标签。
+        total_columns: 当前表格总列数。
+
+    Returns:
+        True 表示有修改（至少拆分了一个单元格）。
+    """
+    cells = row.find_all(["td", "th"])
+    if len(cells) < 2:
+        return False
+
+    modified = False
+
+    for cell_idx, cell in enumerate(cells):
+        text = cell.get_text().strip()
+        if not text:
+            continue
+
+        tokens = text.split()
+        if len(tokens) < 4:
+            continue
+
+        # 用 _classify_tokens 区分表头 token 和数据 token
+        header_labels, data_values = _classify_tokens(tokens)
+        if header_labels is None or data_values is None:
+            continue
+
+        num_header = len(header_labels)
+        num_data = len(data_values)
+
+        # 至少需要 2 个表头 + 2 个数据才认为是有意义的合并
+        if num_header < 2 or num_data < 2:
+            continue
+
+        logger.info(
+            f"部分合并单元格拆分: row={cell_idx}, "
+            f"文本=\"{text[:80]}...\" → "
+            f"{num_header}个表头 + {num_data}个数据"
+        )
+
+        # 将原合并单元格替换为表头 <th> 标签
+        new_header_cells = []
+        for header in header_labels:
+            new_th = soup.new_tag("th")
+            new_th.string = header
+            new_header_cells.append(new_th)
+
+        cell.replace_with(*new_header_cells)
+        modified = True
+
+        # 将数据值移至下一行（数据行）对应列
+        next_row = row.find_next_sibling("tr")
+        if next_row and data_values:
+            _fill_data_row_columns(next_row, cell_idx, data_values, soup)
+
+    return modified
+
+
+def _fill_data_row_columns(
+    data_row: Tag,
+    merge_col_idx: int,
+    data_values: list[str],
+    soup: BeautifulSoup,
+) -> None:
+    """将数据值填入数据行中由合并单元格拆分产生的对应列。
+
+    合并单元格在表头行位置 `merge_col_idx` 被拆分为 N 个 <th>，
+    数据行需在相同列位置填入对应的 N 个数据值。
+
+    算法：
+    1. 计算 data_row 现有列的实际跨度
+    2. 若不足 merge_col_idx 则补空 <td>
+    3. 覆盖 merge_col_idx 处开始的空单元格（若该位置被 colspan 覆盖则追加）
+
+    Args:
+        data_row: 数据行 <tr> Tag。
+        merge_col_idx: 合并单元格在原行中的位置索引。
+        data_values: 数据值列表。
+        soup: BeautifulSoup 对象。
+    """
+    # 获取数据行现有的所有单元格
+    existing_cells = data_row.find_all(["td", "th"])
+
+    # 计算截止 merge_col_idx 之前的列跨度
+    span_before = 0
+    for i, ec in enumerate(existing_cells):
+        cs = int(ec.get("colspan", 1))
+        if span_before + cs > merge_col_idx:
+            # merge_col_idx 落在这个单元格的 colspan 范围内
+            # 需要插入 data_values 到这个位置
+            # 先把当前单元格之后的单元格收集起来
+            after_cells = existing_cells[i + 1:]
+            # 删除当前及之后的所有单元格
+            for ac in existing_cells[i:]:
+                ac.decompose()
+            # 添加 data_values
+            for val in data_values:
+                new_td = soup.new_tag("td")
+                new_td.string = val
+                data_row.append(new_td)
+            # 重新添加之后的单元格
+            for ac in after_cells:
+                data_row.append(ac)
+            return
+        span_before += cs
+
+    # merge_col_idx 在现有所有单元格之后，补空再追加数据
+    while span_before < merge_col_idx:
+        empty_td = soup.new_tag("td")
+        empty_td.string = ""
+        data_row.append(empty_td)
+        span_before += 1
+
+    for val in data_values:
+        new_td = soup.new_tag("td")
+        new_td.string = val
+        data_row.append(new_td)
 
 
 def _compute_total_columns(rows: list[Tag]) -> int:
@@ -1473,6 +1610,80 @@ def _infer_missing_values_in_table(
             logger.debug(
                 f"税率推断跳过：计算值{computed_rate}%超出合理范围"
             )
+
+
+# -- 购买方/销售方信息行内多行拆分 --
+_INVOICE_INFO_SPLIT_PATTERNS: list[tuple[str, str, str]] = [
+    # (正则模式, 第一行格式, 第二行格式)
+    # 格式中的 {name} {code} 会被实际值替换
+    (
+        r"名称:(.+?)统一社会信用代码/纳税人识别号:(.+)",
+        "名称: {name}",
+        "统一社会信用代码/纳税人识别号: {code}",
+    ),
+]
+
+
+def split_info_cell_multiline(html: str) -> str:
+    """将发票购买方/销售方信息单元格拆分为多行。
+
+    检测被拼接在一行的形式如：
+        "名称:赣州万吉物流有限公司统一社会信用代码/纳税人识别号:913607035584630205"
+    拆分为：
+        名称: 赣州万吉物流有限公司
+        统一社会信用代码/纳税人识别号: 913607035584630205
+
+    同样处理销售方信息、地址电话/开户行及账号等拼接字段。
+
+    Args:
+        html: 表格 HTML 字符串。
+
+    Returns:
+        处理后的 HTML 字符串；若无匹配则返回原始 HTML。
+    """
+    import re
+
+    if not html or not isinstance(html, str):
+        return html
+    if "<table" not in html.lower():
+        return html
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        logger.warning("BeautifulSoup 解析 HTML 失败，跳过信息多行拆分")
+        return html
+
+    modified = False
+
+    for td in soup.find_all("td"):
+        text = td.get_text().strip()
+        if not text:
+            continue
+
+        for pattern, fmt1, fmt2 in _INVOICE_INFO_SPLIT_PATTERNS:
+            m = re.match(pattern, text)
+            if not m:
+                continue
+
+            name_val = m.group(1).strip()
+            code_val = m.group(2).strip()
+            if not name_val or not code_val:
+                continue
+
+            line1 = fmt1.format(name=name_val)
+            line2 = fmt2.format(code=code_val)
+
+            td.clear()
+            td.append(NavigableString(line1))
+            td.append(soup.new_tag("br"))
+            td.append(NavigableString(line2))
+
+            modified = True
+            logger.info(f"购买方/销售方信息多行拆分: name=\"{name_val}\", code=\"{code_val}\"")
+            break
+
+    return str(soup) if modified else html
 
 
 def normalize_invoice_table(html: str) -> str:

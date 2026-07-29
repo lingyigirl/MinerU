@@ -108,20 +108,66 @@ def _detect_stamp_ratio(pil_img) -> float:
 
     np_img = np.asarray(pil_img.convert("RGB"))
     hsv = cv2.cvtColor(np_img, cv2.COLOR_RGB2HSV)
+    img_h, img_w = hsv.shape[:2]
+    total_pixels = img_w * img_h
 
     # 红色在 HSV 中的两个区间（跨越 0°/180° 边界）
-    lower_red_1 = np.array([0, 50, 50])
+    # S≥40, V≥40：适度放宽饱和度/明度阈值以捕获浅色/褪色印章
+    lower_red_1 = np.array([0, 40, 40])
     upper_red_1 = np.array([10, 255, 255])
-    lower_red_2 = np.array([156, 50, 50])
+    lower_red_2 = np.array([156, 40, 40])
     upper_red_2 = np.array([180, 255, 255])
 
     mask1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
     mask2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
     red_mask = mask1 | mask2
 
-    total_pixels = red_mask.size
-    red_pixels = int(np.count_nonzero(red_mask))
-    return red_pixels / total_pixels if total_pixels > 0 else 0.0
+    red_pixels_1 = int(np.count_nonzero(mask1))
+    red_pixels_2 = int(np.count_nonzero(mask2))
+    red_pixels = red_pixels_1 + red_pixels_2
+    ratio = red_pixels / total_pixels if total_pixels > 0 else 0.0
+
+    # 印章检测诊断日志（INFO 级别，便于排查印章未检出问题）
+    logger.info(
+        f"印章检测: 图片尺寸={img_w}x{img_h}, 总像素={total_pixels:,}, "
+        f"红色像素_区间1(H0-10)={red_pixels_1:,}, "
+        f"红色像素_区间2(H156-180)={red_pixels_2:,}, "
+        f"合计={red_pixels:,}, 占比={ratio:.6f} ({ratio*100:.4f}%)"
+    )
+
+    # 诊断：在 RGB 图像中查找红色区域的实际 HSV 特征（抽样中心区域）
+    # 印章通常出现在页面中央偏下的位置
+    sample_region = hsv[
+        int(img_h * 0.45):int(img_h * 0.65),
+        int(img_w * 0.25):int(img_w * 0.55),
+    ]
+    if sample_region.size > 0:
+        # 提取该区域中饱和度最高的像素，观察其 Hue 分布
+        sample_s = sample_region[:, :, 1]
+        sample_h = sample_region[:, :, 0]
+        # 高饱和度像素（S > 40）的 Hue 分布
+        high_s_mask = sample_s > 40
+        if np.count_nonzero(high_s_mask) > 0:
+            high_s_hues = sample_h[high_s_mask]
+            hue_0_10 = int(np.count_nonzero(high_s_hues <= 10))
+            hue_10_155 = int(np.count_nonzero((high_s_hues > 10) & (high_s_hues < 156)))
+            hue_156_180 = int(np.count_nonzero(high_s_hues >= 156))
+            total_high_s = hue_0_10 + hue_10_155 + hue_156_180
+            logger.info(
+                f"印章检测-中心区域高饱和度像素(S>40): 共{total_high_s:,}个, "
+                f"H[0-10]={hue_0_10:,} ({hue_0_10/max(1,total_high_s)*100:.1f}%), "
+                f"H[10-155]={hue_10_155:,} ({hue_10_155/max(1,total_high_s)*100:.1f}%), "
+                f"H[156-180]={hue_156_180:,} ({hue_156_180/max(1,total_high_s)*100:.1f}%)"
+            )
+            # 如果大量高饱和像素落在 H[10-155] 区间，说明红色阈值可能需要调整
+            if total_high_s > 1000 and (hue_0_10 + hue_156_180) / total_high_s < 0.03:
+                logger.warning(
+                    f"印章检测警告: 中心区域 {total_high_s:,} 个高饱和度像素中，"
+                    f"仅 {(hue_0_10 + hue_156_180):,} 个落在红色 Hue 区间内，"
+                    f"可能存在非标准红色印章（Hue 偏移）"
+                )
+
+    return ratio
 
 
 def _estimate_dpi_from_page(pil_img, pdf_page_size) -> int:
@@ -171,7 +217,7 @@ def _select_sample_pages(page_count: int, max_sample_pages: int = 3) -> list[int
 
 def analyze_document_quality(
     pdf_bytes: bytes,
-    dpi: int = 100,  # 质量分析用 100 DPI 足够，速度优先
+    dpi: int = 200,  # 质量分析使用 200 DPI，与 DEFAULT_PDF_IMAGE_DPI 对齐
     max_pages: int = 2,  # 只渲染前 N 页做质量分析，无需全量渲染
     max_sample_pages: int = 2,
     blur_threshold: float = 100.0,
@@ -183,7 +229,7 @@ def analyze_document_quality(
 
     Args:
         pdf_bytes: PDF 文件字节流。
-        dpi: 渲染 DPI，默认 100（质量分析对分辨率不敏感，速度优先）。
+        dpi: 渲染 DPI，默认 200（与 DEFAULT_PDF_IMAGE_DPI 对齐，确保印章检测精度）。
         max_pages: 最多渲染页数，0 表示全部页。默认 2 页。
         max_sample_pages: 最大采样页数。
         blur_threshold: 模糊判定阈值（拉普拉斯方差），低于此值判定为模糊。
@@ -231,6 +277,10 @@ def analyze_document_quality(
             try:
                 sr = _detect_stamp_ratio(pil_img)
                 stamp_ratios.append(sr)
+                logger.info(
+                    f"印章检测 第{idx}页: 红色占比={sr:.6f} ({sr*100:.4f}%), "
+                    f"图片尺寸={pil_img.size[0]}x{pil_img.size[1]}"
+                )
             except Exception:
                 logger.warning(f"印章检测失败 (page {idx})")
 
@@ -243,6 +293,13 @@ def analyze_document_quality(
         if stamp_ratios:
             quality.stamp_ratio = float(np.mean(stamp_ratios))
             quality.has_stamp = quality.stamp_ratio > stamp_threshold
+            logger.info(
+                f"印章检测汇总: 采样页数={len(stamp_ratios)}, "
+                f"平均占比={quality.stamp_ratio:.6f} ({quality.stamp_ratio*100:.4f}%), "
+                f"阈值={stamp_threshold} ({stamp_threshold*100:.1f}%), "
+                f"判定={'有印章' if quality.has_stamp else '无印章'}, "
+                f"各页占比={[f'{r:.6f}' for r in stamp_ratios]}"
+            )
 
         # 计算综合质量分
         quality.quality_score = _compute_quality_score(quality)

@@ -304,7 +304,7 @@ def _compute_image_coverage_ratio(
 def classify_document(
     pdf_bytes: bytes,
     quality: Optional[DocumentQuality] = None,
-    dpi: int = 100,  # 分类用 100 DPI 足够，速度优先
+    dpi: int = 200,  # 分类用 200 DPI，与 DEFAULT_PDF_IMAGE_DPI 对齐
     max_preview_pages: int = 2,  # 只渲染前 N 页用于分类
 ) -> DocType:
     """对文档进行快速分类，返回推荐的解析路径（S1 阶段）。
@@ -323,7 +323,7 @@ def classify_document(
     Args:
         pdf_bytes: PDF 文件字节流。
         quality: 预先计算的质量分析结果（可选，传入则复用 S0 结果）。
-        dpi: 渲染 DPI，默认 100（分类对分辨率不敏感，速度优先）。
+        dpi: 渲染 DPI，默认 200（与 DEFAULT_PDF_IMAGE_DPI 对齐）。
         max_preview_pages: 最多渲染页数。
 
     Returns:
@@ -406,6 +406,15 @@ def classify_document(
                 doc_type = DocType.DOCUMENT_PARSE
             elif kvp_count >= 3 and (has_stamp or ocr_difficulty in ("medium", "high")):
                 doc_type = DocType.FORM_KVP
+            elif kvp_count >= 5 and table_kw_count >= 3 and not has_stamp:
+                # 含表格结构的票据（如增值税发票含货物清单）
+                # KVP 本地引擎无法处理多行表格（标签只能匹配一次）
+                # 走 Hybrid 后端由 VLM 做表格结构识别
+                logger.info(
+                    f"检测到表格型 KVP 文档（table_kw={table_kw_count}），"
+                    f"路由到通用解析（Hybrid 后端处理表格）"
+                )
+                doc_type = DocType.DOCUMENT_PARSE
             elif kvp_count >= 5 and not has_stamp:
                 doc_type = DocType.FORM_KVP
             elif table_kw_count >= 5 and kvp_count < 3:

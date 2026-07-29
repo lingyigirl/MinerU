@@ -89,6 +89,16 @@ def _format_embedded_html(html, img_buket_path):
             f"normalize_invoice_table 执行失败，将使用先前结果: {exc}"
         )
 
+    # [自定义] VLM 表格 HTML 后处理：购买方/销售方信息行内多行拆分
+    # 将 "名称:xxx统一社会信用代码/纳税人识别号:yyy" 拆分为两行
+    try:
+        from mineru.utils.custom.table_utils import split_info_cell_multiline
+        formatted = split_info_cell_multiline(formatted)
+    except Exception as exc:
+        logger.warning(
+            f"split_info_cell_multiline 执行失败，将使用先前结果: {exc}"
+        )
+
     return formatted
 
 
