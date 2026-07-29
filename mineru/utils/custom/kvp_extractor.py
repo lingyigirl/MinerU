@@ -84,6 +84,12 @@ ENGINE_REGISTRY: dict[str, KvpEngineConfig] = {
         model_name="OpenGVLab/InternVL2_5-8B",
         base_url="http://localhost:30002/v1",
     ),
+    # 本地规则引擎（基于 PaddleOCR + 空间距离配对，离线可用）
+    "pp-structure": KvpEngineConfig(
+        engine="pp-structure",
+        model_name="local-kvp-engine",
+        # 本地引擎，无需 base_url / api_key
+    ),
 }
 
 
@@ -350,37 +356,77 @@ def _attempt_truncation_recovery(content: str) -> str | None:
 
 def extract_kvp_from_form(
     pdf_bytes: bytes,
-    engine: str = "qwen-vl-max",
+    engine: Optional[str] = None,
     server_url: Optional[str] = None,
     kvp_prompt: Optional[str] = None,
+    verify_engine: Optional[str] = None,
     dpi: int = DEFAULT_PDF_IMAGE_DPI,
     start_page_id: int = 0,
     end_page_id: Optional[int] = None,
 ) -> dict[str, Any]:
-    """使用专用 MLLM 提取票据/卡证的 KVP 信息（KVP Pipeline 主入口）。
+    """KVP Pipeline 主入口：支持本地引擎 + 远程 VLM + 混合纠错模式。
 
-    流程：
-    1. 渲染 PDF 页面为图片
-    2. 逐页调用 VLM API 提取 KVP
-    3. 汇总并转换为 MinerU 兼容的 middle_json 格式
+    三种运行模式（通过 engine 参数或 KVP_ENGINE 环境变量控制）：
+    - engine="pp-structure" (默认) → 纯本地 OCR + 规则配对（离线可用）
+    - engine="pp-structure" + verify_engine="qwen-vl-max" → 本地主 + VLM 纠错
+    - engine="qwen-vl-max" → 纯 VLM API（需外网）
 
     Args:
         pdf_bytes: PDF 文件字节流。
-        engine: 引擎标识符（"qwen-vl-plus" / "qwen-vl-local" / ...）。
-        server_url: 自定义 API 地址（覆盖引擎默认配置）。
-        kvp_prompt: 自定义 KVP 提取 prompt（None 则使用默认模板）。
+        engine: 主引擎标识符（None 则从 KVP_ENGINE 环境变量读取，默认 pp-structure）。
+        server_url: 自定义 API 地址。
+        kvp_prompt: 自定义 KVP 提取 prompt。
+        verify_engine: 可选的 VLM 纠错引擎（None 表示不纠错）。
         dpi: 渲染 DPI。
         start_page_id: 起始页（0-based）。
-        end_page_id: 结束页（None 表示到最后一页）。
+        end_page_id: 结束页。
 
     Returns:
-        MinerU 兼容的 middle_json 格式 dict，包含提取的 KVP 信息。
-
-    Raises:
-        ValueError: 不支持的引擎。
-        RuntimeError: KVP 提取失败。
+        MinerU 兼容的 middle_json 格式 dict。
     """
-    # 1. 获取引擎配置
+    # 默认引擎：参数 > 环境变量 KVP_ENGINE > pp-structure
+    if engine is None:
+        engine = os.environ.get("KVP_ENGINE", "pp-structure")
+
+    # 渲染页面
+    images = load_images_from_pdf_core(
+        pdf_bytes, dpi=dpi, start_page_id=start_page_id, end_page_id=end_page_id,
+    )
+    if not images:
+        raise RuntimeError("PDF 渲染后无有效页面")
+
+    # ---- 路径 1：本地规则引擎 ----
+    if engine == "pp-structure":
+        from mineru.utils.custom.kvp_local_engine import extract_kvp_local
+
+        all_page_results: list[dict[str, Any]] = []
+        for page_idx, img_dict in enumerate(images):
+            pil_img = img_dict["img_pil"]
+            try:
+                page_kvp = extract_kvp_local(pil_img)
+                all_page_results.append(page_kvp)
+                logger.debug(
+                    f"Page {page_idx + 1}/{len(images)} 本地 KVP: "
+                    f"{len(page_kvp)} 个字段"
+                )
+            except Exception:
+                logger.exception(f"Page {page_idx + 1} 本地 KVP 提取失败")
+                all_page_results.append({"_error": f"Page {page_idx + 1} 提取失败"})
+
+        # [可选] VLM 纠错
+        if verify_engine and verify_engine in ENGINE_REGISTRY:
+            all_page_results = _verify_with_vlm(
+                images, all_page_results, verify_engine, server_url, kvp_prompt,
+            )
+
+        middle_json = _convert_kvp_to_middle_json(all_page_results, images, engine)
+        logger.info(
+            f"KVP 提取完成: {len(all_page_results)} 页, "
+            f"总字段数 {sum(len(r) for r in all_page_results)}"
+        )
+        return middle_json
+
+    # ---- 路径 2：远程 VLM 引擎（原有逻辑） ----
     if engine not in ENGINE_REGISTRY:
         raise ValueError(
             f"不支持的 KVP 引擎: {engine}。"
@@ -388,7 +434,6 @@ def extract_kvp_from_form(
         )
     config = ENGINE_REGISTRY[engine]
 
-    # 覆盖自定义 URL（参数优先，其次环境变量 KVP_SERVER_URL）
     effective_url = server_url or os.environ.get("KVP_SERVER_URL")
     if effective_url:
         config = KvpEngineConfig(
@@ -403,20 +448,12 @@ def extract_kvp_from_form(
 
     prompt = kvp_prompt or DEFAULT_KVP_PROMPT_TEMPLATE
 
-    # 2. 渲染页面
-    images = load_images_from_pdf_core(
-        pdf_bytes, dpi=dpi, start_page_id=start_page_id, end_page_id=end_page_id,
-    )
-    if not images:
-        raise RuntimeError("PDF 渲染后无有效页面")
-
     logger.info(
         f"开始 KVP 提取: engine={engine}, pages={len(images)}, "
         f"dpi={dpi}, remote={config.is_remote()}"
     )
 
-    # 3. 逐页提取 KVP
-    all_page_results: list[dict[str, Any]] = []
+    all_page_results = []
     for page_idx, img_dict in enumerate(images):
         pil_img = img_dict["img_pil"]
         try:
@@ -430,7 +467,6 @@ def extract_kvp_from_form(
             logger.exception(f"Page {page_idx + 1} KVP 提取失败")
             all_page_results.append({"_error": f"Page {page_idx + 1} 提取失败"})
 
-    # 4. 转换为 MinerU middle_json 格式
     middle_json = _convert_kvp_to_middle_json(all_page_results, images, engine)
 
     logger.info(
@@ -438,6 +474,93 @@ def extract_kvp_from_form(
         f"总字段数 {sum(len(r) for r in all_page_results)}"
     )
     return middle_json
+
+
+# ---------------------------------------------------------------------------
+# VLM 纠错
+# ---------------------------------------------------------------------------
+
+def _verify_with_vlm(
+    images: list[dict],
+    page_results: list[dict[str, Any]],
+    verify_engine: str,
+    server_url: Optional[str] = None,
+    kvp_prompt: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """使用 VLM 对本地 KVP 提取结果进行高价值字段二次确认。
+
+    仅对金额、姓名、账号、日期等高价值字段调用 VLM 验证。
+    VLM 结果与本地结果不一致时，保留两者并标记差异。
+
+    Args:
+        images: 已渲染的页面图片列表。
+        page_results: 本地引擎的 KVP 提取结果。
+        verify_engine: 验证用的 VLM 引擎标识。
+        server_url: 自定义 API 地址。
+        kvp_prompt: 自定义 prompt。
+
+    Returns:
+        合并后的 page_results 列表。
+    """
+    logger.info(f"开始 VLM 纠错: engine={verify_engine}")
+
+    HIGH_VALUE_KEYS = {
+        "户名", "账号", "存入金额(大写)", "存入金额(小写)",
+        "金额(大写)", "金额(小写)", "金额", "证件号码",
+        "客户号", "开户日", "起息日", "到期日",
+    }
+
+    config = ENGINE_REGISTRY[verify_engine]
+    effective_url = server_url or os.environ.get("KVP_SERVER_URL")
+    if effective_url:
+        config = KvpEngineConfig(
+            engine=config.engine,
+            model_name=config.model_name,
+            base_url=effective_url,
+            api_key=config.api_key,
+            temperature=0.0,  # 纠错模式使用确定性输出
+            max_tokens=config.max_tokens,
+            timeout=config.timeout,
+        )
+
+    verify_prompt = """请仔细辨认图片中的以下关键字段，输出JSON：
+- 户名（姓名）
+- 账号
+- 存入金额的大写和小写
+- 开户日和到期日
+- 客户号
+
+直接输出JSON，只包含你能清晰辨认的字段。不确定的字段不要输出。"""
+
+    for page_idx, img_dict in enumerate(images):
+        if page_idx >= len(page_results):
+            break
+
+        pil_img = img_dict["img_pil"]
+        local_kvp = page_results[page_idx]
+
+        try:
+            vlm_kvp = _call_vlm_api(pil_img, verify_prompt, config)
+
+            # 对比差异
+            differences = {}
+            for key in HIGH_VALUE_KEYS:
+                local_val = local_kvp.get(key)
+                vlm_val = vlm_kvp.get(key)
+                if local_val and vlm_val and local_val != vlm_val:
+                    differences[key] = {"local": local_val, "vlm": vlm_val}
+                    logger.warning(
+                        f"VLM 纠错差异 [{key}]: local={local_val}, vlm={vlm_val}"
+                    )
+
+            if differences:
+                local_kvp["_vlm_differences"] = differences
+                logger.info(f"Page {page_idx + 1} VLM 纠错发现 {len(differences)} 处差异")
+
+        except Exception:
+            logger.exception(f"Page {page_idx + 1} VLM 纠错失败，保留本地结果")
+
+    return page_results
 
 
 def _convert_kvp_to_middle_json(

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -55,6 +56,7 @@ def select_engine_route(
     user_backend: Optional[str] = None,
     user_kvp_engine: Optional[str] = None,
     user_kvp_server_url: Optional[str] = None,
+    user_kvp_verify_engine: Optional[str] = None,
 ) -> EngineRoute:
     """根据分类结果和质量评估选择最优解析路径。
 
@@ -64,6 +66,7 @@ def select_engine_route(
         user_backend: 用户指定的 MinerU 后端（None 则自动选择）。
         user_kvp_engine: 用户指定的 KVP 引擎。
         user_kvp_server_url: 用户指定的 KVP 服务地址。
+        user_kvp_verify_engine: VLM 纠错引擎（None 表示不纠错）。
 
     Returns:
         EngineRoute 对象，包含选定的引擎和后端配置。
@@ -79,8 +82,19 @@ def select_engine_route(
 
     if doc_type == DocType.FORM_KVP:
         # 🔴 票据/卡证 → KVP Pipeline
-        kvp_engine = user_kvp_engine or "qwen-vl-max"
-        kvp_url = user_kvp_server_url or None
+        # 默认引擎优先级：用户指定 > 环境变量 KVP_ENGINE > pp-structure（离线优先）
+        kvp_engine = (
+            user_kvp_engine
+            or os.environ.get("KVP_ENGINE")
+            or "pp-structure"
+        )
+        kvp_url = user_kvp_server_url or os.environ.get("KVP_SERVER_URL") or None
+        # VLM 纠错引擎：环境变量 KVP_VERIFY_ENGINE 可配置
+        kvp_verify = (
+            user_kvp_verify_engine
+            or os.environ.get("KVP_VERIFY_ENGINE")
+            or None
+        )
         return EngineRoute(
             doc_type=doc_type,
             engine_backend="kvp",
@@ -88,6 +102,7 @@ def select_engine_route(
             extra_kwargs={
                 "kvp_engine": kvp_engine,
                 "kvp_server_url": kvp_url,
+                "kvp_verify_engine": kvp_verify,
             },
             quality=quality,
             fallback_engine="hybrid-auto-engine",  # KVP 失败时回退

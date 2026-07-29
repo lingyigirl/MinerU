@@ -653,6 +653,7 @@ def _process_form_kvp(
     f_dump_model_output: bool,
     f_dump_content_list: bool,
     f_make_md_mode,
+    kvp_verify_engine: str | None = None,
 ) -> None:
     """使用 KVP Pipeline 处理票据/卡证文档并生成输出。
 
@@ -690,6 +691,7 @@ def _process_form_kvp(
             pdf_bytes,
             engine=kvp_engine,
             server_url=kvp_server_url,
+            verify_engine=kvp_verify_engine,
         )
     except Exception:
         logger.exception(f"KVP 提取失败: {pdf_file_name}")
@@ -878,6 +880,7 @@ def _try_smart_routing(
     server_url: str | None,
     start_page_id: int,
     end_page_id: int | None,
+    kvp_verify_engine: str | None = None,
     **kwargs,
 ) -> bool:
     """S0 → S1 → KVP 智能路由入口。
@@ -916,6 +919,7 @@ def _try_smart_routing(
             f_dump_model_output=f_dump_model_output,
             f_dump_content_list=f_dump_content_list,
             f_make_md_mode=f_make_md_mode,
+            kvp_verify_engine=kvp_verify_engine,
         )
         return True
 
@@ -938,6 +942,7 @@ def _try_smart_routing(
                 quality=quality,
                 user_kvp_engine=kvp_engine,
                 user_kvp_server_url=kvp_server_url,
+                user_kvp_verify_engine=kvp_verify_engine,
             )
 
             # 生成路由摘要（日志用）
@@ -959,6 +964,7 @@ def _try_smart_routing(
                     f_dump_model_output=f_dump_model_output,
                     f_dump_content_list=f_dump_content_list,
                     f_make_md_mode=f_make_md_mode,
+                    kvp_verify_engine=route.extra_kwargs.get("kvp_verify_engine", kvp_verify_engine),
                 )
                 return True
 
@@ -999,8 +1005,9 @@ def do_parse(
         image_analysis=True,
         # [自定义] 多引擎路由参数
         doc_type: str = "auto",
-        kvp_engine: str = "qwen-vl-max",
+        kvp_engine: str | None = None,
         kvp_server_url: str | None = None,
+        kvp_verify_engine: str | None = None,
         **kwargs,
 ):
     need_remove_index = _process_office_doc(
@@ -1051,6 +1058,7 @@ def do_parse(
         server_url=server_url,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
+        kvp_verify_engine=kvp_verify_engine,
         **kwargs,
     )
     if _routed:
@@ -1127,8 +1135,9 @@ async def aio_do_parse(
         image_analysis=True,
         # [自定义] 多引擎路由参数
         doc_type: str = "auto",
-        kvp_engine: str = "qwen-vl-max",
+        kvp_engine: str | None = None,
         kvp_server_url: str | None = None,
+        kvp_verify_engine: str | None = None,
         **kwargs,
 ):
     # Office 解析是同步且可能耗时的操作，异步入口需要放到线程中避免阻塞事件循环。
@@ -1180,6 +1189,7 @@ async def aio_do_parse(
         server_url=server_url,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
+        kvp_verify_engine=kvp_verify_engine,
         **kwargs,
     )
     if _routed:

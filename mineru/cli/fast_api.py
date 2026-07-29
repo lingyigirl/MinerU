@@ -163,8 +163,9 @@ class AsyncParseTask:
     uploads: list[str]
     # [自定义] 多引擎路由参数
     doc_type: str = "auto"
-    kvp_engine: str = "qwen-vl-plus"
+    kvp_engine: str = "qwen-vl-max"
     kvp_server_url: Optional[str] = None
+    kvp_verify_engine: Optional[str] = None
     submit_order: int = 0
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -865,8 +866,9 @@ async def run_parse_job(
         end_page_id=request_options.end_page_id,
         # [自定义] 多引擎路由参数
         doc_type=getattr(request_options, "doc_type", "auto"),
-        kvp_engine=getattr(request_options, "kvp_engine", "qwen-vl-plus"),
+        kvp_engine=getattr(request_options, "kvp_engine", "qwen-vl-max"),
         kvp_server_url=getattr(request_options, "kvp_server_url", None),
+        kvp_verify_engine=getattr(request_options, "kvp_verify_engine", None),
         **config,
     )
 
@@ -922,6 +924,7 @@ async def create_async_parse_task(
             doc_type=request_options.doc_type,
             kvp_engine=request_options.kvp_engine,
             kvp_server_url=request_options.kvp_server_url,
+            kvp_verify_engine=request_options.kvp_verify_engine,
             upload_names=[upload.original_name for upload in uploads],
             uploads=[upload.path for upload in uploads],
         )
