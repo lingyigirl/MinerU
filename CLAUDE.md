@@ -320,27 +320,30 @@ PDF/图片/DOCX/PPTX/XLSX
 **归档操作**：
 ```bash
 mkdir -p agents_logs/plans
+# 命名规则：日期_描述性名称.md（如 2026-07-29_kvp-独立span-bbox.md）
+# 描述需简洁反映 plan 的核心内容，不使用 Claude 内部随机名
 latest=$(ls -t /root/.claude/plans/*.md 2>/dev/null | head -1)
 if [ -n "$latest" ]; then
-    basename=$(basename "$latest")
-    timestamp=$(date +%Y-%m-%d_%H%M%S)
-    cp "$latest" "agents_logs/plans/${timestamp}_${basename}"
-    echo "已归档: agents_logs/plans/${timestamp}_${basename}"
+    date_prefix=$(date +%Y-%m-%d)
+    # 取描述性名称 — 由执行者根据 plan 内容手动命名
+    desc_name="<核心描述>.md"
+    cp "$latest" "agents_logs/plans/${date_prefix}_${desc_name}"
+    echo "已归档: agents_logs/plans/${date_prefix}_${desc_name}"
 fi
 ```
 
-**元数据要求**：归档后在文件头部插入以下格式的元数据块：
+**元数据要求**：归档后使用 Edit 工具在文件**头部插入**以下可见的元数据节：
 
 ```markdown
-<!--
-归档日期: YYYY-MM-DD HH:MM:SS
-来源文件: <原始文件名>
-项目版本: 4.2.0
-Git分支: <当前分支>
-归档原因: <一句话说明为什么要做这个 plan>
-背景: <问题背景描述>
-结论: <plan 达成的决策/结果>
--->
+> **归档日期**: YYYY-MM-DD HH:MM
+> **来源文件**: <原始 Claude plan 文件名>
+> **项目版本**: 4.2.0
+> **Git 分支**: <当前分支>
+> **原因**: <一句话说明为什么要做这个 plan>
+> **背景**: <问题背景，2-3 句话>
+> **结论**: <plan 达成的决策或实施方案概要>
+
+---
 ```
 
 **再次强调**：此操作必须在每次对话结束前完成。归档文件缺乏元数据或有遗漏时，应在下次对话中补全。
