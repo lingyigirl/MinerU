@@ -128,6 +128,9 @@ TABLE_INDICATOR_KEYWORDS: list[str] = [
     "合计", "总计", "同比", "环比", "增长率", "占比",
     "单位", "数量", "单价", "金额", "金额合计", "余额",
     "交易金额", "收费金额",
+    # 金融数据表格常见术语（信用报告、对账单、交易明细等）
+    "账户", "交易日期", "借方", "贷方",
+    "期初余额", "期末余额", "序号", "备注",
 ]
 
 _TABLE_KW_PATTERN = re.compile("|".join(re.escape(kw) for kw in TABLE_INDICATOR_KEYWORDS))
@@ -230,6 +233,28 @@ def _count_table_keywords(text: str) -> int:
     return len(found)
 
 
+def _count_repeating_kvp_labels(text: str) -> int:
+    """统计 OCR 文本中出现 ≥2 次的 KVP 标签数量。
+
+    银行回单等表格型票据的核心特征是同一标签对应多个实体
+    （如付款人户名 vs 收款人户名），导致 KVP 标签重复出现。
+    这种重复标签是表格结构的强信号——简单表单中每个标签通常只出现一次。
+
+    Args:
+        text: OCR 提取的文本字符串。
+
+    Returns:
+        重复出现的 KVP 标签数量（出现次数 ≥ 2 的标签个数）。
+    """
+    if not text:
+        return 0
+    from collections import Counter
+
+    matches = _KVP_PATTERN.findall(text)
+    counter = Counter(matches)
+    return sum(1 for count in counter.values() if count >= 2)
+
+
 def _has_repeating_labels(text: str) -> bool:
     """检测 OCR 文本中是否存在重复的标签模式（表格结构特征）。
 
@@ -316,9 +341,15 @@ def classify_document(
     4. 无嵌入文本时回退到 PaddleOCR（复用单例）
 
     分类策略（按优先级）：
-    1. FORM_KVP：KVP 关键词 ≥ 3 个 且（有印章 或 OCR 难度高）
-    2. STRUCTURED_TABLE：表格关键词 ≥ 5 个 且 KVP 关键词 < 3 个
-    3. DOCUMENT_PARSE：其他所有文档
+    1. DOCUMENT_PARSE：重复标签模式（同一行出现 "户名...户名" 等表格结构）
+    2. DOCUMENT_PARSE：重复 KVP 标签 ≥ 2 个 + KVP≥5 + 有印章
+       （银行回单等表格型票据，标签重复出现说明有二维结构，不限页数）
+    3. FORM_KVP：KVP 关键词 ≥ 3 个 且（有印章 或 OCR 难度高）
+    4. DOCUMENT_PARSE：KVP≥5 + 表格关键词≥3 + 无印章（发票含货物清单）
+    5. FORM_KVP：KVP 关键词 ≥ 5 个 且 无印章 且 短文档（≤2 页）
+       （多页文档虽 KVP 术语密集但通常是金融报告/对账单，走 DOCUMENT_PARSE）
+    6. STRUCTURED_TABLE：表格关键词 ≥ 5 个 且 KVP 关键词 < 3 个
+    7. DOCUMENT_PARSE：其他所有文档
 
     Args:
         pdf_bytes: PDF 文件字节流。
@@ -358,6 +389,7 @@ def classify_document(
         text_sample = _extract_text_sample(pdf_bytes, preview_images, max_ocr_pages=max_preview_pages)
         kvp_count = _count_kvp_keywords(text_sample)
         table_kw_count = _count_table_keywords(text_sample)
+        repeating_kvp_count = _count_repeating_kvp_labels(text_sample)
 
         # 特征 2: 是否有印章（复用 S0 结果或独立计算）
         # 单页/少页文档降低印章阈值：单页票据 1.5% 红章已是明显信号
@@ -376,6 +408,7 @@ def classify_document(
 
         logger.debug(
             f"文档分类特征: kvp_count={kvp_count}, table_kw={table_kw_count}, "
+            f"repeating_kvp={repeating_kvp_count}, "
             f"stamp={has_stamp}, image_cov={image_coverage:.2%}, "
             f"ocr_diff={ocr_difficulty}, pages={page_count}"
         )
@@ -404,6 +437,19 @@ def classify_document(
                     f"路由到通用解析（Hybrid后端处理表格）"
                 )
                 doc_type = DocType.DOCUMENT_PARSE
+            elif (kvp_count >= 5 and repeating_kvp_count >= 2
+                  and has_stamp):
+                # 重复标签型 KVP 文档（银行回单、对账单等）
+                # 虽有印章但 KVP 标签重复出现（如付款人户名 vs 收款人户名），
+                # 说明存在二维表格结构，KVP 本地引擎无法处理合并单元格
+                # 走 Hybrid 后端由 VLM 做表格结构识别
+                # 注意：不再限制 page_count <= 2，多页文档中重复标签同样是表格强信号
+                logger.info(
+                    f"检测到表格型 KVP 文档（重复KVP标签="
+                    f"{repeating_kvp_count}），虽有印章但路由到"
+                    f"通用解析（Hybrid 后端处理表格）"
+                )
+                doc_type = DocType.DOCUMENT_PARSE
             elif kvp_count >= 3 and (has_stamp or ocr_difficulty in ("medium", "high")):
                 doc_type = DocType.FORM_KVP
             elif kvp_count >= 5 and table_kw_count >= 3 and not has_stamp:
@@ -415,7 +461,10 @@ def classify_document(
                     f"路由到通用解析（Hybrid 后端处理表格）"
                 )
                 doc_type = DocType.DOCUMENT_PARSE
-            elif kvp_count >= 5 and not has_stamp:
+            elif kvp_count >= 5 and not has_stamp and page_count <= 2:
+                # 短文档 + KVP 关键词多 + 无印章 → 表单（存单、回单等）
+                # 多页文档（≥3 页）不应仅凭 KVP 关键词就判定为表单，
+                # 金融报告、对账单等虽术语密集但本质是表格报告，走 DOCUMENT_PARSE
                 doc_type = DocType.FORM_KVP
             elif table_kw_count >= 5 and kvp_count < 3:
                 doc_type = DocType.STRUCTURED_TABLE
