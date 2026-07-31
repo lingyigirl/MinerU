@@ -790,6 +790,174 @@ def make_blocks_to_content_list_v2(para_block, img_buket_path, page_size):
     return para_content
 
 
+def make_blocks_to_content_list_compatibility(para_block, img_buket_path, page_idx, page_size):
+    """生成兼容格式：以 v1 扁平结构为基础，注入 v2 的增强字段。
+
+    合并策略：
+    - 非 list 类型：1:1 映射，v1 扁平字段 + v2 增强字段注入
+    - list 类型：N:1 炸开，每个 list item 独立成 v1 风格的 {"type": "text", ...} 条目，
+      各自拥有独立的 bbox 坐标
+
+    Args:
+        para_block: 段落块数据。
+        img_buket_path: 图片路径前缀。
+        page_idx: 页面索引。
+        page_size: 页面尺寸 (width, height)，用于 bbox 归一化。
+
+    Returns:
+        list[dict]: 非 list 类型返回 1 个元素，list 类型返回 N 个元素。
+    """
+    para_type = para_block.get('type')
+
+    # ---- list 类型：炸开为多个独立条目 ----
+    if para_type == BlockType.LIST:
+        return _explode_list_to_v1_entries(para_block, img_buket_path, page_idx, page_size)
+
+    # ---- 其他类型：1:1 映射 ----
+    result = make_blocks_to_content_list(para_block, img_buket_path, page_idx, page_size)
+    v2_content = make_blocks_to_content_list_v2(para_block, img_buket_path, page_size)
+    _inject_v2_enhanced_fields(result, v2_content)
+    return [result]
+
+
+def _explode_list_to_v1_entries(para_block, img_buket_path, page_idx, page_size):
+    """将 list 类型的 para_block 炸开为多个 v1 风格的独立条目。
+
+    每个 list item 生成一个 {"type": "text", "text": "...", "bbox": [...],
+    "page_idx": N, "v2_type": "list_item", ...} 条目，bbox 使用该子项的独立坐标。
+
+    Args:
+        para_block: LIST 类型的段落块数据。
+        img_buket_path: 图片路径前缀。
+        page_idx: 页面索引。
+        page_size: 页面尺寸 (width, height)。
+
+    Returns:
+        list[dict]: 每个 list item 一个独立的 v1 风格条目。
+    """
+    page_width, page_height = page_size
+    entries = []
+
+    # 确定 list_type（与 v2 保持一致）
+    if para_block.get('sub_type') == BlockType.REF_TEXT:
+        v2_list_type = ContentTypeV2.LIST_REF
+    else:
+        v2_list_type = ContentTypeV2.LIST_TEXT
+
+    sub_blocks = para_block.get('blocks', [])
+    for idx, block in enumerate(sub_blocks):
+        # 提取 item 纯文本（与 v1 list_items 字符串一致）
+        item_text = merge_para_with_text(block, escape_text_block_prefix=False)
+        if not item_text.strip():
+            continue
+
+        # 提取子 block 的 bbox 并归一化
+        item_entry = {
+            'type': 'text',
+            'text': item_text,
+            'page_idx': page_idx,
+            # v2 增强字段：标记来源，便于需要 v2 信息的消费者识别
+            'v2_type': 'list_item',
+            'v2_list_type': v2_list_type,
+            'list_index': idx,
+        }
+
+        # 子 block 的 bbox（独立坐标！）
+        block_bbox = block.get('bbox')
+        if block_bbox:
+            x0, y0, x1, y1 = block_bbox
+            item_entry['bbox'] = [
+                int(x0 * 1000 / page_width),
+                int(y0 * 1000 / page_height),
+                int(x1 * 1000 / page_width),
+                int(y1 * 1000 / page_height),
+            ]
+        elif para_block.get('bbox'):
+            # 回退：子 block 无独立 bbox 时使用父级 bbox
+            x0, y0, x1, y1 = para_block['bbox']
+            item_entry['bbox'] = [
+                int(x0 * 1000 / page_width),
+                int(y0 * 1000 / page_height),
+                int(x1 * 1000 / page_width),
+                int(y1 * 1000 / page_height),
+            ]
+
+        entries.append(item_entry)
+
+    return entries
+
+
+def _inject_v2_enhanced_fields(result: dict, v2: dict) -> None:
+    """将 v2 格式中的增强字段注入到兼容结果中（原地修改）。
+
+    只处理 1:1 映射类型（title/paragraph/table/header/image 等），
+    list 类型由 _explode_list_to_v1_entries 单独处理。
+
+    Args:
+        result: v1 格式的 dict（会被原地修改）。
+        v2: v2 格式的 dict。
+    """
+    v2_type = v2.get('type', '')
+
+    # ---- 文本类：title / paragraph 语义区分 ----
+    if v2_type == 'title':
+        result['type'] = 'title'
+        result['v2_type'] = 'title'
+        if 'content' in v2:
+            result['v2_content'] = v2['content']
+    elif v2_type == 'paragraph':
+        result['type'] = 'paragraph'
+        result['v2_type'] = 'paragraph'
+        if 'content' in v2:
+            result['v2_content'] = v2['content']
+    elif v2_type in ('page_header', 'page_footer', 'page_aside_text',
+                     'page_number', 'page_footnote'):
+        # 页面装饰类：标记更具体的 v2 子类型
+        result['v2_type'] = v2_type
+        if 'content' in v2:
+            result['v2_content'] = v2['content']
+
+    # ---- 表格类：注入 table_type / table_nest_level ----
+    elif v2_type == 'table':
+        result['v2_type'] = 'table'
+        v2_table_content = v2.get('content', {})
+        if v2_table_content.get('table_type'):
+            result['table_type'] = v2_table_content['table_type']
+        if v2_table_content.get('table_nest_level'):
+            result['table_nest_level'] = v2_table_content['table_nest_level']
+
+    # ---- 图片类：注入结构化 image_caption / image_footnote ----
+    elif v2_type == 'image':
+        v2_img_content = v2.get('content', {})
+        if v2_img_content.get('image_caption'):
+            result['image_caption'] = v2_img_content['image_caption']
+        if v2_img_content.get('image_footnote'):
+            result['image_footnote'] = v2_img_content['image_footnote']
+
+    # ---- 公式类：注入 math_type / image_source ----
+    elif v2_type == 'equation_interline':
+        result['v2_type'] = 'equation_interline'
+        v2_eq_content = v2.get('content', {})
+        if v2_eq_content.get('math_type'):
+            result['math_type'] = v2_eq_content['math_type']
+        if v2_eq_content.get('image_source'):
+            result['v2_image_source'] = v2_eq_content['image_source']
+
+    # ---- 图表类：注入结构化 chart_caption / chart_footnote ----
+    elif v2_type == 'chart':
+        v2_chart_content = v2.get('content', {})
+        if v2_chart_content.get('chart_caption'):
+            result['chart_caption'] = v2_chart_content['chart_caption']
+        if v2_chart_content.get('chart_footnote'):
+            result['chart_footnote'] = v2_chart_content['chart_footnote']
+
+    # ---- 代码类：注入 code_language ----
+    elif v2_type in ('code', 'algorithm'):
+        v2_code_content = v2.get('content', {})
+        if v2_code_content.get('code_language'):
+            result['code_language'] = v2_code_content['code_language']
+        if v2_code_content.get('code_caption'):
+            result['code_caption'] = v2_code_content['code_caption']
 
 
 
@@ -964,10 +1132,22 @@ def union_make(pdf_info_dict: list,
                         )
                     page_contents.append(para_content)
             output_content.append(page_contents)
+        elif make_mode == MakeMode.CONTENT_LIST_COMPATIBILITY:
+            # 兼容格式：v1 扁平结构（含 page_idx）+ v2 增强字段
+            # 注意：返回 list[dict]（list 类型炸开后 N 个条目），使用 extend
+            para_blocks = (paras_of_layout or []) + (paras_of_discarded or [])
+            if not para_blocks:
+                continue
+            for para_block in para_blocks:
+                para_contents = make_blocks_to_content_list_compatibility(
+                    para_block, img_buket_path, page_idx, page_size,
+                )
+                output_content.extend(para_contents)
 
     if make_mode in [MakeMode.MM_MD, MakeMode.NLP_MD]:
         return '\n\n'.join(output_content)
-    elif make_mode in [MakeMode.CONTENT_LIST, MakeMode.CONTENT_LIST_V2]:
+    elif make_mode in [MakeMode.CONTENT_LIST, MakeMode.CONTENT_LIST_V2,
+                       MakeMode.CONTENT_LIST_COMPATIBILITY]:
         return output_content
     return None
 

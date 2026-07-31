@@ -8,6 +8,7 @@ from mineru.utils.char_utils import full_to_half_exclude_marks, is_hyphen_at_lin
 from mineru.utils.config_reader import get_latex_delimiter_config
 from mineru.backend.pipeline.para_split import ListLineTag
 from mineru.utils.enum_class import BlockType, ContentType, ContentTypeV2, MakeMode
+from mineru.backend.vlm.vlm_middle_json_mkcontent import _inject_v2_enhanced_fields, _explode_list_to_v1_entries
 from mineru.utils.language import detect_lang
 from mineru.backend.utils.markdown_utils import (
     escape_conservative_markdown_text,
@@ -965,6 +966,38 @@ def make_blocks_to_content_list_v2(para_block, img_buket_path, page_size):
     return para_content
 
 
+def make_blocks_to_content_list_compatibility(para_block, img_buket_path, page_idx, page_size):
+    """生成兼容格式：以 v1 扁平结构为基础，注入 v2 的增强字段。
+
+    合并策略与 VLM 后端一致：
+    - 非 list 类型：1:1 映射，v1 扁平字段 + v2 增强字段注入
+    - list 类型：N:1 炸开，每个 list item 独立成 v1 风格条目
+
+    Args:
+        para_block: 段落块数据。
+        img_buket_path: 图片路径前缀。
+        page_idx: 页面索引。
+        page_size: 页面尺寸 (width, height)，用于 bbox 归一化。
+
+    Returns:
+        list[dict]: 非 list 类型返回 1 个元素，list 类型返回 N 个元素。
+    """
+    para_type = para_block.get('type')
+
+    # ---- list 类型：炸开为多个独立条目 ----
+    if para_type == BlockType.LIST:
+        return _explode_list_to_v1_entries(para_block, img_buket_path, page_idx, page_size)
+
+    # ---- 其他类型：1:1 映射 ----
+    result = make_blocks_to_content_list(para_block, img_buket_path, page_idx, page_size)
+    if not result:
+        return [result]  # 保持一致的返回类型
+
+    v2_content = make_blocks_to_content_list_v2(para_block, img_buket_path, page_size)
+    _inject_v2_enhanced_fields(result, v2_content)
+    return [result]
+
+
 def union_make(pdf_info_dict: list,
                make_mode: str,
                img_buket_path: str = '',
@@ -1001,10 +1034,25 @@ def union_make(pdf_info_dict: list,
                     if para_content:
                         page_contents.append(para_content)
             output_content.append(page_contents)
+        elif make_mode == MakeMode.CONTENT_LIST_COMPATIBILITY:
+            # 兼容格式：v1 扁平结构（含 page_idx）+ v2 增强字段
+            # 注意：返回 list[dict]（list 类型炸开后 N 个条目），使用 extend
+            para_blocks = merge_adjacent_ref_text_blocks_for_content(
+                (paras_of_layout or []) + (paras_of_discarded or [])
+            )
+            if not para_blocks:
+                continue
+            for para_block in para_blocks:
+                para_contents = make_blocks_to_content_list_compatibility(
+                    para_block, img_buket_path, page_idx, page_size,
+                )
+                if para_contents:
+                    output_content.extend(para_contents)
 
     if make_mode in [MakeMode.MM_MD, MakeMode.NLP_MD]:
         return '\n\n'.join(output_content)
-    elif make_mode in [MakeMode.CONTENT_LIST, MakeMode.CONTENT_LIST_V2]:
+    elif make_mode in [MakeMode.CONTENT_LIST, MakeMode.CONTENT_LIST_V2,
+                       MakeMode.CONTENT_LIST_COMPATIBILITY]:
         return output_content
     else:
         logger.error(f"Unsupported make mode: {make_mode}")

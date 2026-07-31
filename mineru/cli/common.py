@@ -305,6 +305,16 @@ def _process_output(
             json.dumps(content_list_v2, ensure_ascii=False, indent=4),
         )
 
+        # [自定义] 兼容格式：v1 扁平结构（含 page_idx）+ v2 增强字段
+        # 合并上游时注意：此 hook 只依赖 MakeMode.CONTENT_LIST_COMPATIBILITY 枚举值
+        content_list_compat = make_func(
+            pdf_info, MakeMode.CONTENT_LIST_COMPATIBILITY, image_dir,
+        )
+        md_writer.write_string(
+            f"{pdf_file_name}_content_list_compatibility.json",
+            json.dumps(content_list_compat, ensure_ascii=False, indent=4),
+        )
+
 
     if f_dump_middle_json:
         md_writer.write_string(

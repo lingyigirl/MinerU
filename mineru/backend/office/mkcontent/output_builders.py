@@ -2,6 +2,7 @@
 import re
 
 from mineru.utils.enum_class import MakeMode, BlockType, ContentType, ContentTypeV2
+from mineru.backend.vlm.vlm_middle_json_mkcontent import _inject_v2_enhanced_fields
 from mineru.backend.office.mkcontent.inline_renderer import (
     _append_hyperlink_part,
     _append_text_part,
@@ -753,6 +754,64 @@ def merge_para_with_text_v2(para_block):
     return para_content
 
 
+def make_blocks_to_content_list_compatibility(para_block, img_buket_path, page_idx):
+    """生成兼容格式（Office 后端）：以 v1 扁平结构为基础，注入 v2 的增强字段。
+
+    Office 后端不使用 page_size（无 bbox 归一化），list 类型同样炸开为独立条目。
+
+    Args:
+        para_block: 段落块数据。
+        img_buket_path: 图片路径前缀。
+        page_idx: 页面索引。
+
+    Returns:
+        list[dict]: 非 list 类型返回 1 个元素，list 类型返回 N 个元素。
+    """
+    para_type = para_block.get('type')
+
+    # ---- list 类型：炸开为多个独立条目 ----
+    if para_type == BlockType.LIST:
+        entries = []
+        v2_list_type = ContentTypeV2.LIST_TEXT
+        sub_blocks = para_block.get('blocks', [])
+        for idx, block in enumerate(sub_blocks):
+            item_text = _merge_para_text_office_list_item(block)
+            if not item_text.strip():
+                continue
+            entry = {
+                'type': 'text',
+                'text': item_text,
+                'page_idx': page_idx,
+                'v2_type': 'list_item',
+                'v2_list_type': v2_list_type,
+                'list_index': idx,
+            }
+            # Office 不使用 bbox 归一化，直接使用原始 bbox（如存在）
+            block_bbox = block.get('bbox')
+            if block_bbox:
+                entry['bbox'] = [float(v) for v in block_bbox]
+            elif para_block.get('bbox'):
+                entry['bbox'] = [float(v) for v in para_block['bbox']]
+            entries.append(entry)
+        return entries
+
+    # ---- 其他类型：1:1 映射 ----
+    result = make_blocks_to_content_list(para_block, img_buket_path, page_idx)
+    v2_content = make_blocks_to_content_list_v2(para_block, img_buket_path)
+    _inject_v2_enhanced_fields(result, v2_content)
+    return [result]
+
+
+def _merge_para_text_office_list_item(block):
+    """从 Office 后端 list 子 block 中提取纯文本（与 v1 list_items 字符串一致）。"""
+    text_parts = []
+    for line in block.get('lines', []):
+        for span in line.get('spans', []):
+            if span.get('type') == ContentType.TEXT:
+                text_parts.append(span.get('content', ''))
+    return ''.join(text_parts)
+
+
 def union_make(pdf_info_dict: list,
                make_mode: str,
                img_buket_path: str = '',
@@ -785,9 +844,21 @@ def union_make(pdf_info_dict: list,
                     para_content = make_blocks_to_content_list_v2(para_block, img_buket_path)
                     page_contents.append(para_content)
             output_content.append(page_contents)
+        elif make_mode == MakeMode.CONTENT_LIST_COMPATIBILITY:
+            # 兼容格式：v1 扁平结构（含 page_idx）+ v2 增强字段
+            # 注意：返回 list[dict]（list 类型炸开后 N 个条目），使用 extend
+            para_blocks = (paras_of_layout or []) + (paras_of_discarded or [])
+            if not para_blocks:
+                continue
+            for para_block in para_blocks:
+                para_contents = make_blocks_to_content_list_compatibility(
+                    para_block, img_buket_path, page_idx,
+                )
+                output_content.extend(para_contents)
 
     if make_mode in [MakeMode.MM_MD, MakeMode.NLP_MD]:
         return '\n\n'.join(output_content)
-    elif make_mode in [MakeMode.CONTENT_LIST, MakeMode.CONTENT_LIST_V2]:
+    elif make_mode in [MakeMode.CONTENT_LIST, MakeMode.CONTENT_LIST_V2,
+                       MakeMode.CONTENT_LIST_COMPATIBILITY]:
         return output_content
     return None
