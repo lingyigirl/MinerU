@@ -956,6 +956,19 @@ def _try_smart_routing(
             # S1: 文档分类
             doc_type_result = classify_document(pdf_bytes, quality=quality)
 
+            # [自定义] doc_type=auto 不自动路由到 KVP Pipeline。
+            # KVP pp-structure（PaddleOCR + 空间距离配对）对任何含表格结构的
+            # 票据（发票、银行回单等）均不如 hybrid_auto。KVP 仅保留为显式
+            # opt-in（doc_type=form_kvp），等将来部署 qwen-vl-max 等专用 VLM
+            # 引擎后再恢复自动路由。
+            if doc_type_result == DocType.FORM_KVP:
+                logger.info(
+                    f"[自定义] 检测到票据特征（kvp={doc_type_result}），"
+                    f"但当前 KVP 引擎(pp-structure)质量不如 Hybrid，"
+                    f"降级为通用解析。如需使用 KVP 请显式指定 doc_type=form_kvp"
+                )
+                doc_type_result = DocType.DOCUMENT_PARSE
+
             # 选择引擎路由
             route = select_engine_route(
                 doc_type=doc_type_result,

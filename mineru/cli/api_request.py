@@ -173,11 +173,11 @@ async def parse_request_form(
         str,
         Form(
             description="""Document classification mode:
-- auto: Automatically classify and route to the best engine (default, fast)
-- general: Force MinerU general-purpose parsing (fastest, no routing)
+- auto: Run S0/S1 quality analysis and classification (logs only, same result as general)
+- general: Force MinerU general-purpose parsing via hybrid-auto-engine (default, fastest)
 - form_kvp: Force KVP pipeline for receipt/certificate KVP extraction""",
         ),
-    ] = "auto",
+    ] = "general",
     kvp_engine: Annotated[
         Optional[str],
         Form(
