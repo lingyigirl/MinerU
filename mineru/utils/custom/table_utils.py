@@ -548,6 +548,10 @@ def _is_data_value(token: str) -> bool:
     # 数字
     if re.match(r'^[\d.,]+$', token):
         return True
+    # 中文表头后缀接数值（如 "金额222875.57"、"税额28973.82"、"数量319620"）
+    # VLM 常将表头标签和数值拼接在同一个 token 中，此处提取尾部数值部分
+    if re.match(r'^[一-鿿]+[¥￥]?\d[\d.,]*$', token):
+        return True
     return False
 
 
@@ -1091,13 +1095,24 @@ def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
             # 嵌入模式：更新原单元格为纯数据标签，然后插入合计行
             cell.string = data_part
 
-            # 创建合计行：复制当前行各单元格，但第一列改为合计标签
-            _insert_summary_row_after(
-                soup, row, matched_keyword, cells, total_columns
+            # 检测数据行是否存在 rowspan > 1 的单元格
+            # 若存在，需特殊处理以避免 rowspan 溢出到新插入的合计行
+            has_rowspan = any(
+                int(c.get("rowspan", 1)) > 1 for c in cells
             )
 
+            if has_rowspan:
+                _handle_summary_split_with_rowspan(
+                    soup, row, cells, matched_keyword, total_columns
+                )
+            else:
+                _insert_summary_row_after(
+                    soup, row, matched_keyword, cells, total_columns
+                )
+
             logger.debug(
-                f"合计标签拆分（嵌入模式）：行{row_idx}列{cell_idx}，"
+                f"合计标签拆分（嵌入模式{' +rowspan' if has_rowspan else ''}）："
+                f"行{row_idx}列{cell_idx}，"
                 f"关键词={matched_keyword}，数据部分={data_part[:30]}"
             )
             return  # 每个表格只处理一次
@@ -1191,17 +1206,18 @@ def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
 def _find_trailing_summary_keyword(text: str) -> Optional[str]:
     """检查文本末尾是否包含合计/小计类摘要关键词。
 
+    支持 VLM 输出中关键词内嵌空格的变体（如 "合 计" 等同于 "合计"）。
+
     Args:
         text: 单元格文本。
 
     Returns:
-        匹配到的关键词字符串，或 None。
+        匹配到的关键词字符串（规范形式，无内嵌空格），或 None。
     """
+    # 规范化：去除文本中所有空白字符以兼容 VLM 内嵌空格变体
+    collapsed = re.sub(r'\s+', '', text)
     for kw in sorted(_SPLIT_SUMMARY_KEYWORDS, key=len, reverse=True):
-        if text.endswith(kw):
-            return kw
-        # 也检查关键词前有空格分隔的情况
-        if f" {kw}" in text:
+        if collapsed.endswith(kw):
             return kw
     return None
 
@@ -1209,22 +1225,21 @@ def _find_trailing_summary_keyword(text: str) -> Optional[str]:
 def _strip_summary_keyword(text: str, keyword: str) -> str:
     """从文本中移除末尾的摘要关键词。
 
+    支持 VLM 输出中关键词内嵌空格的变体（如 "合 计" 等同于 "合计"）。
+
     Args:
         text: 原始文本。
-        keyword: 要移除的关键词。
+        keyword: 要移除的关键词（规范形式，无内嵌空格）。
 
     Returns:
         剥离后的文本。
     """
-    # 精确末尾匹配
-    if text.endswith(keyword):
-        result = text[:-len(keyword)].rstrip()
-        return result
-    # 关键词前有空格
-    idx = text.rfind(f" {keyword}")
-    if idx >= 0:
-        result = text[:idx].rstrip()
-        return result
+    # 构建正则：关键词各字符之间允许零或多个空白（如 "合 计"、"合  计"）
+    spaced_pattern = r'\s*'.join(list(keyword)) + r'\s*$'
+    m = re.search(spaced_pattern, text)
+    if m:
+        return text[:m.start()].rstrip()
+    return text
     return text
 
 
@@ -1273,6 +1288,131 @@ def _insert_summary_row_after(
         summary_tr.append(td)
 
     data_row.insert_after(summary_tr)
+
+
+def _handle_summary_split_with_rowspan(
+    soup: BeautifulSoup,
+    data_row: Tag,
+    data_cells: list[Tag],
+    summary_label: str,
+    total_columns: int,
+) -> None:
+    """处理带 rowspan 的合计行拆分。
+
+    当数据行包含 rowspan>1 的单元格时（如增值税发票中"货物名称"、
+    "规格型号"等列跨两行，"金额"和"税额"列不跨行），
+    分析列结构后将表头标签提取为独立的 <th> 行，将 ¥ 值合并到数据行。
+
+    策略：
+    1. 分析各列 rowspan 状态，找出非 rowspan 列（¥ 值所在列）
+    2. 减少 rowspan
+    3. 提取表头标签 + 清理数据单元格 + 插入 <th> 表头行
+    4. 合并 ¥ 行值到数据行 + 删除 ¥ 行
+    5. 创建合计行
+
+    Args:
+        soup: BeautifulSoup 对象。
+        data_row: 当前数据行 <tr>。
+        data_cells: 数据行的单元格列表。
+        summary_label: 摘要标签（如"合计"）。
+        total_columns: 表格总列数。
+    """
+    # 1. 分析各列的 rowspan 状态
+    non_rowspan_cols: list[tuple[int, int]] = []  # [(cell_index, effective_start_col)]
+    current_col = 0
+    for i, cell in enumerate(data_cells):
+        colspan = int(cell.get("colspan", 1))
+        rowspan = int(cell.get("rowspan", 1))
+        if rowspan <= 1:
+            non_rowspan_cols.append((i, current_col))
+        current_col += colspan
+
+    # 2. 减少 rowspan
+    for cell in data_cells:
+        rs = int(cell.get("rowspan", 1))
+        if rs > 1:
+            if rs == 2:
+                del cell["rowspan"]
+            else:
+                cell["rowspan"] = str(rs - 1)
+
+    # 3. 提取表头标签 + 清理数据 + 插入 <th> 表头行
+    #    VLM 输出如 "单位kw.h"、"金额222875.57" 是表头+值拼接，
+    #    利用 _strip_header_prefix 和 _INVOICE_HEADER_KEYWORDS 做分离
+    header_labels: list[tuple[int, str, int]] = []  # [(col_idx, label, colspan)]
+    for i, cell in enumerate(data_cells):
+        text = cell.get_text().strip()
+        colspan = int(cell.get("colspan", 1))
+        if not text:
+            continue
+
+        # 情况 A：纯表头关键词（如"规格型号"）→ 数据行该列清空
+        if text in _INVOICE_HEADER_KEYWORDS:
+            header_labels.append((i, text, colspan))
+            cell.string = ""
+        # 情况 B：表头+值拼接（如"单位kw.h"）→ 分离后保留纯数据值
+        elif (stripped := _strip_header_prefix(text)):
+            header_labels.append((i, stripped["header"], colspan))
+            cell.string = stripped["data"]
+        # 情况 C：无法拆分 → 保持原样
+
+    if header_labels:
+        header_tr = soup.new_tag("tr")
+        for _col_idx, label, cs in header_labels:
+            th = soup.new_tag("th")
+            th.string = label
+            if cs > 1:
+                th["colspan"] = str(cs)
+            header_tr.append(th)
+        data_row.insert_before(header_tr)
+        logger.debug(
+            f"表头行提取：{len(header_labels)} 个标签"
+        )
+
+    # 4. 合并 ¥ 行值到数据行 + 删除 ¥ 行
+    #    ¥ 行原有的 ¥222875.57 / ¥28973.82 合并到数据行对应列
+    #    消除数据行中 "金额222875.57" 和 ¥ 行 "¥222875.57" 的重复
+    next_row = data_row.find_next_sibling("tr")
+    next_cells = next_row.find_all(["td", "th"]) if next_row else []
+
+    for idx, (cell_idx, _eff_col) in enumerate(non_rowspan_cols):
+        if idx < len(next_cells) and cell_idx < len(data_cells):
+            data_cells[cell_idx].string = next_cells[idx].get_text().strip()
+
+    if next_row:
+        next_row.decompose()
+
+    # 5. 创建合计行——从合并后的数据行取值
+    summary_tr = soup.new_tag("tr")
+    non_rowspan_col_set = {col for _, col in non_rowspan_cols}
+
+    for col_idx in range(total_columns):
+        td = soup.new_tag("td")
+        if col_idx == 0:
+            td.string = summary_label
+        elif col_idx in non_rowspan_col_set:
+            match_idx = None
+            for j, (_, eff_col) in enumerate(non_rowspan_cols):
+                if eff_col == col_idx:
+                    match_idx = j
+                    break
+            if match_idx is not None and match_idx < len(non_rowspan_cols):
+                cell_idx = non_rowspan_cols[match_idx][0]
+                if cell_idx < len(data_cells):
+                    val = data_cells[cell_idx].get_text().strip()
+                    td.string = val if _is_data_value(val) else ""
+            else:
+                td.string = ""
+        else:
+            td.string = ""
+        summary_tr.append(td)
+
+    data_row.insert_after(summary_tr)
+
+    logger.debug(
+        f"合计标签拆分（rowspan模式）：非rowspan列={non_rowspan_cols}，"
+        f"¥行已合并删除"
+    )
 
 
 def _find_isolated_summary_cell(cells: list[Tag]) -> Optional[int]:
@@ -1613,27 +1753,31 @@ def _infer_missing_values_in_table(
 
 
 # -- 购买方/销售方信息行内多行拆分 --
-_INVOICE_INFO_SPLIT_PATTERNS: list[tuple[str, str, str]] = [
-    # (正则模式, 第一行格式, 第二行格式)
-    # 格式中的 {name} {code} 会被实际值替换
-    (
-        r"名称:(.+?)统一社会信用代码/纳税人识别号:(.+)",
-        "名称: {name}",
-        "统一社会信用代码/纳税人识别号: {code}",
-    ),
-]
+
+# 信息单元格中可识别为行分隔点的字段标签正则
+# 在"名称:"之后出现的这些标签前插入 <br/> 实现多行拆分
+# (统一社会信用代码/)?纳税人识别号 兼容有无"统一社会信用代码/"前缀的两种情况
+_INFO_LINE_BREAK_RE = re.compile(
+    r'(?<=.)(?:(统一社会信用代码/)?纳税人识别号:|地址、电话:|开户行及账号:)'
+)
 
 
 def split_info_cell_multiline(html: str) -> str:
-    """将发票购买方/销售方信息单元格拆分为多行。
+    """将发票购买方/销售方信息单元格在字段边界处拆分为多行。
 
     检测被拼接在一行的形式如：
-        "名称:赣州万吉物流有限公司统一社会信用代码/纳税人识别号:913607035584630205"
-    拆分为：
-        名称: 赣州万吉物流有限公司
-        统一社会信用代码/纳税人识别号: 913607035584630205
+        "名称:xxx纳税人识别号:yyy地址、电话:zzz开户行及账号:www"
+    在各字段标签前插入 <br/> 拆分为：
+        名称:xxx
+        纳税人识别号:yyy
+        地址、电话:zzz
+        开户行及账号:www
 
-    同样处理销售方信息、地址电话/开户行及账号等拼接字段。
+    兼容两种税号标签格式：
+    - 统一社会信用代码/纳税人识别号:（含前缀）
+    - 纳税人识别号:（无前缀）
+
+    使用 re.sub 在各字段标签前插入 <br/>，完整保留所有字段内容。
 
     Args:
         html: 表格 HTML 字符串。
@@ -1641,8 +1785,6 @@ def split_info_cell_multiline(html: str) -> str:
     Returns:
         处理后的 HTML 字符串；若无匹配则返回原始 HTML。
     """
-    import re
-
     if not html or not isinstance(html, str):
         return html
     if "<table" not in html.lower():
@@ -1661,27 +1803,32 @@ def split_info_cell_multiline(html: str) -> str:
         if not text:
             continue
 
-        for pattern, fmt1, fmt2 in _INVOICE_INFO_SPLIT_PATTERNS:
-            m = re.match(pattern, text)
-            if not m:
-                continue
+        # 跳过已包含 <br/> 的单元格（已拆分过）
+        if td.find("br"):
+            continue
 
-            name_val = m.group(1).strip()
-            code_val = m.group(2).strip()
-            if not name_val or not code_val:
-                continue
+        # 必须包含"名称:"才可能是发票信息单元格
+        if not text.startswith("名称:"):
+            continue
 
-            line1 = fmt1.format(name=name_val)
-            line2 = fmt2.format(code=code_val)
+        # 在字段标签前插入 <br/> 实现分行的同时保留所有字段内容
+        new_text = _INFO_LINE_BREAK_RE.sub(r'<br/>\g<0>', text)
+        if new_text == text:
+            # 没有匹配到任何可分行的字段标签
+            continue
 
-            td.clear()
-            td.append(NavigableString(line1))
-            td.append(soup.new_tag("br"))
-            td.append(NavigableString(line2))
+        td.clear()
+        # 将 <br/> 替换为实际的 BeautifulSoup <br> 标签
+        parts = new_text.split("<br/>")
+        for i, part in enumerate(parts):
+            if i > 0:
+                td.append(soup.new_tag("br"))
+            td.append(NavigableString(part))
 
-            modified = True
-            logger.info(f"购买方/销售方信息多行拆分: name=\"{name_val}\", code=\"{code_val}\"")
-            break
+        modified = True
+        logger.info(
+            f"购买方/销售方信息多行拆分：{len(parts)} 个字段"
+        )
 
     return str(soup) if modified else html
 
