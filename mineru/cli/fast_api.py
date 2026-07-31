@@ -585,6 +585,18 @@ def create_result_zip(
                         ),
                     )
 
+                # [自定义] content_list 兼容格式（v1 扁平 + v2 增强字段）
+                path = os.path.join(parse_dir, f"{pdf_name}_content_list_compatibility.json")
+                if os.path.exists(path):
+                    zf.write(
+                        path,
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            f"{pdf_name}_content_list_compatibility.json",
+                        ),
+                    )
+
             if return_images:
                 images_dir = os.path.join(parse_dir, "images")
                 image_paths = get_images_dir_image_paths(images_dir)
