@@ -319,23 +319,24 @@ PDF/图片/DOCX/PPTX/XLSX
 
 **归档操作**：
 ```bash
-mkdir -p agents_logs/plans
+# 按日期建立子目录，同一天的 plan 文件放在同一目录下
+date_dir=$(date +%Y-%m-%d)
+mkdir -p agents_logs/plans/${date_dir}
 # 命名规则：日期_描述性名称.md（如 2026-07-29_kvp-独立span-bbox.md）
 # 描述需简洁反映 plan 的核心内容，不使用 Claude 内部随机名
 latest=$(ls -t /root/.claude/plans/*.md 2>/dev/null | head -1)
 if [ -n "$latest" ]; then
-    date_prefix=$(date +%Y-%m-%d)
     # 取描述性名称 — 由执行者根据 plan 内容手动命名
     desc_name="<核心描述>.md"
-    cp "$latest" "agents_logs/plans/${date_prefix}_${desc_name}"
-    echo "已归档: agents_logs/plans/${date_prefix}_${desc_name}"
+    cp "$latest" "agents_logs/plans/${date_dir}/${date_dir}_${desc_name}"
+    echo "已归档: agents_logs/plans/${date_dir}/${date_dir}_${desc_name}"
 fi
 ```
 
 **元数据要求**：归档后使用 Edit 工具在文件**头部插入**以下可见的元数据节：
 
 ```markdown
-> **归档日期**: YYYY-MM-DD HH:MM
+> **归档时间**: YYYY-MM-DD HH:MM
 > **来源文件**: <原始 Claude plan 文件名>
 > **项目版本**: 4.2.0
 > **Git 分支**: <当前分支>
