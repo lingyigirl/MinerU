@@ -31,7 +31,6 @@ COPY mineru/ ./mineru/
 
 # ---- 安装核心依赖 ----
 RUN python3 -m pip install --no-cache-dir -e ".[core]" --break-system-packages && \
-    python3 -m pip install --no-cache-dir "mineru-vl-utils>=1.0.0" --break-system-packages && \
     python3 -m pip install --no-cache-dir "pdftext<0.7.0" --break-system-packages && \
     python3 -m pip cache purge
 
