@@ -1,0 +1,76 @@
+# ============================================================
+# MinerU 3.4.4 生产环境 Docker Compose 配置模板
+#
+# 使用前修改:
+#   1. device_ids — 你的 GPU 编号
+#   2. ports — 映射端口
+#   3. mineru.json 路径 — 配置文件的宿主机路径
+#   4. 模型路径 — 与 mineru.json 中的 models-dir 一致
+#   5. 输出目录 — 解析结果存放位置
+#
+# 启动: docker compose -f compose-prod.yaml up -d
+# 停止: docker compose -f compose-prod.yaml down
+# 日志: docker compose -f compose-prod.yaml logs -f
+# ============================================================
+services:
+  mineru-api:
+    image: mineru:3.4.4
+    container_name: mineru-api
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      # ======== 必填 ========
+      MINERU_MODEL_SOURCE: local         # 离线部署必须为 local
+
+      # ======== 可选（按需修改） ========
+      MINERU_DEVICE_MODE: cuda
+      MINERU_BACKEND: hybrid-auto-engine # 默认最佳精度；纯 CPU 用 pipeline
+      MINERU_VLM_FORMULA_ENABLE: "true"
+      MINERU_VLM_TABLE_ENABLE: "true"
+      MINERU_TABLE_MERGE_ENABLE: "true"
+      MINERU_PROCESSING_WINDOW_SIZE: "64"
+      MINERU_LOG_LEVEL: INFO
+      MINERU_LOG_FILE_ENABLE: "false"    # Docker 部署推荐 false
+      MINERU_API_OUTPUT_ROOT: /vllm-workspace/output
+
+      # ======== 如需覆盖配置路径 ========
+      # MINERU_TOOLS_CONFIG_JSON: /root/mineru.json
+
+    entrypoint: mineru-api
+    volumes:
+      # ---- 配置文件（只读） ----
+      - /root/mineru.json:/root/mineru.json:ro
+      # ---- 模型文件（只读，路径与 mineru.json 中 models-dir 一致） ----
+      - /data/mineru_models:/data/mineru_models:ro
+      # ---- 输出目录 ----
+      - /data/mineru_output:/vllm-workspace/output
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --gpu-memory-utilization 0.5
+      # --data-parallel-size 2            # 多 GPU 并行
+      # --allow-public-http-client        # 允许公网客户端
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start-period: 180s
+      retries: 3
+    # ---- 日志轮转（防止占满磁盘） ----
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]            # ← 修改为你的 GPU 编号
+              capabilities: [gpu]
