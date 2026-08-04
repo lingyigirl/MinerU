@@ -850,6 +850,7 @@ def doc_analyze(
             hybrid_pipeline_model,
             _ocr_enable,
             _vlm_ocr_enable,
+            image_writer=image_writer,
         )
         close_pdfium_document(pdf_doc)
         doc_closed = True
@@ -1001,6 +1002,7 @@ async def aio_doc_analyze(
             hybrid_pipeline_model,
             _ocr_enable,
             _vlm_ocr_enable,
+            image_writer=image_writer,
         )
         close_pdfium_document(pdf_doc)
         doc_closed = True

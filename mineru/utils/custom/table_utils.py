@@ -2217,17 +2217,249 @@ def _build_ocr_text_grid(
     return grid
 
 
+def _append_text_to_cell(cell_tag: Tag, text: str) -> None:
+    """向表格单元格追加文本，保留已有内容（如图片标签）。
+
+    使用 Tag.append() 在单元格末尾添加文本节点，
+    避免 cell_tag.string 赋值会清除 <img> 等子元素的问题。
+
+    Args:
+        cell_tag: BeautifulSoup Tag（<td> 或 <th>）。
+        text: 要追加的文本。
+    """
+    existing = cell_tag.get_text().strip()
+    prefix = " " if existing else ""
+    cell_tag.append(NavigableString(f"{prefix}{text}"))
+
+
+def _parse_vlm_table_structure(rows: list[Tag]) -> tuple[list[list[str]], list[list[Tag]]]:
+    """解析 VLM 表格结构，展开 colspan 生成等宽网格。
+
+    Args:
+        rows: <tr> 标签列表。
+
+    Returns:
+        (vlm_data, vlm_cells): 文本网格和对应的 Tag 网格。
+        colspan 单元格被重复展开为等宽表示。
+    """
+    vlm_data = []
+    vlm_cells = []
+    for row in rows:
+        row_cells = row.find_all(["td", "th"])
+        if not row_cells:
+            continue
+        row_texts = []
+        row_tags = []
+        for cell in row_cells:
+            colspan = int(cell.get("colspan", 1))
+            text = cell.get_text().strip()
+            for _ in range(colspan):
+                row_texts.append(text)
+                row_tags.append(cell)
+        vlm_data.append(row_texts)
+        vlm_cells.append(row_tags)
+    return vlm_data, vlm_cells
+
+
+def _detect_data_row_start(rows: list[Tag], vlm_data: list[list[str]]) -> int:
+    """检测数据行起始位置。
+
+    规则：
+    1. 含 <th> 的行视为表头。
+    2. 含 <img> 的行视为数据行（含手写/签章图片），不参与表头扩展。
+    3. 全短标签行（<15 字且非数据值）视为类表头。
+
+    Args:
+        rows: <tr> 标签列表。
+        vlm_data: 展开后的文本网格。
+
+    Returns:
+        第一个数据行的索引。
+    """
+    data_row_start = 0
+    for i, row in enumerate(rows):
+        if row.find("th"):
+            data_row_start = i + 1
+        elif row.find("img"):
+            # 含图片的行是数据行，终止表头扩展
+            break
+        else:
+            cells = row.find_all("td")
+            texts = [c.get_text().strip() for c in cells]
+            if texts and all(
+                len(t) < 15 and not _is_data_value(t)
+                for t in texts if t
+            ):
+                data_row_start = i + 1
+    return data_row_start
+
+
+def _normalize_for_matching(text: str) -> str:
+    """规范化文本用于模糊匹配。
+
+    将 OCR 输出中常见的全角标点转换为半角，
+    解决 VLM（半角）与 OCR（全角）之间的字符编码差异。
+
+    Args:
+        text: 待规范化的文本。
+
+    Returns:
+        规范化后的文本。
+    """
+    full_to_half = {
+        "（": "(", "）": ")", "：": ":", "，": ",",
+        "。": ".", "！": "!", "？": "?", "；": ";",
+        "“": '"', "”": '"', "【": "[", "】": "]",
+        "《": "<", "》": ">", "％": "%", "＋": "+",
+        "－": "-", "＝": "=", "０": "0", "１": "1",
+        "２": "2", "３": "3", "４": "4", "５": "5",
+        "６": "6", "７": "7", "８": "8", "９": "9",
+        " ": " ", "　": " ",
+    }
+    result = text
+    for full, half in full_to_half.items():
+        result = result.replace(full, half)
+    return result
+
+
+def _align_ocr_to_vlm_rows(
+    ocr_grid: list[list[str]],
+    vlm_data: list[list[str]],
+    data_row_start: int,
+) -> dict[int, list[str]]:
+    """使用标签锚点将 OCR 网格行对齐到 VLM 数据行。
+
+    OCR 网格（由 _build_ocr_text_grid 按 y 坐标聚类生成）的行数通常
+    多于 VLM 表格的行数。此函数通过标签子串匹配将 OCR 行分配到对应的
+    VLM 数据行，形成每个 VLM 行的 OCR 文本池。
+
+    匹配规则：
+    - 若 OCR 行中含某 VLM 数据行的标签文本（规范化后子串匹配）→ 锚定到该 VLM 行
+    - 若无标签匹配 → 向前看一行：若下一行是标签 → 使用下一行的 VLM 行
+    - 否则 → 跟随上一个锚定的 VLM 行
+
+    Args:
+        ocr_grid: OCR 识别的文字网格。
+        vlm_data: 展开后的 VLM 文本网格。
+        data_row_start: 数据行起始索引。
+
+    Returns:
+        {vlm_row_idx: [ocr_text, ...]} 映射。
+    """
+    vlm_nrows = len(vlm_data)
+    ocr_pool: dict[int, list[str]] = {
+        vi: [] for vi in range(data_row_start, vlm_nrows)
+    }
+    if not ocr_pool:
+        return ocr_pool
+
+    # 预先规范化 VLM 数据行文本
+    vlm_norm: list[list[str]] = [
+        [_normalize_for_matching(t) for t in row] for row in vlm_data
+    ]
+
+    current_vlm_row = data_row_start
+
+    for oi, ocr_row in enumerate(ocr_grid):
+        # 查找该 OCR 行最匹配的 VLM 数据行
+        best_row = None
+        best_score = 0
+        for vi in range(data_row_start, vlm_nrows):
+            score = 0
+            for ot in ocr_row:
+                if not ot:
+                    continue
+                ot_norm = _normalize_for_matching(ot)
+                for vt_norm in vlm_norm[vi]:
+                    if vt_norm and (ot_norm in vt_norm or vt_norm in ot_norm):
+                        # 匹配长度加权：越长匹配越可靠
+                        score += min(len(ot_norm), len(vt_norm))
+            if score > best_score:
+                best_score = score
+                best_row = vi
+
+        if best_row is not None:
+            current_vlm_row = best_row
+        elif oi + 1 < len(ocr_grid):
+            # 向前看一行：OCR 识别中值文本常出现在标签文本上方（存单/票据模式）
+            # 守卫条件：仅当当前行是"稀疏文本行"（≤2项，全部为 text 类型）时才 peek-ahead
+            # 防止发票场景中将纯数值行（¥226.42, ¥29.43）错误前推到合计行
+            curr_non_empty = [t for t in ocr_row if t]
+            curr_types = [_classify_ocr_item_type(t) for t in curr_non_empty]
+            is_sparse_text = (
+                len(curr_non_empty) <= 2
+                and all(t == "text" for t in curr_types)
+            ) if curr_types else False
+
+            if is_sparse_text:
+                # 若下一行有标签匹配，则当前值归属于下一行所属的 VLM 行
+                next_row = ocr_grid[oi + 1]
+                next_best = None
+                next_score = 0
+                for vi in range(data_row_start, vlm_nrows):
+                    score = 0
+                    for ot in next_row:
+                        if not ot:
+                            continue
+                        ot_norm = _normalize_for_matching(ot)
+                        for vt_norm in vlm_norm[vi]:
+                            if vt_norm and (ot_norm in vt_norm or vt_norm in ot_norm):
+                                score += min(len(ot_norm), len(vt_norm))
+                    if score > next_score:
+                        next_score = score
+                        next_best = vi
+                if next_best is not None:
+                    current_vlm_row = next_best
+
+        if current_vlm_row in ocr_pool:
+            ocr_pool[current_vlm_row].extend([t for t in ocr_row if t])
+
+    return ocr_pool
+
+
+def _get_fillable_columns(
+    vlm_row: list[str],
+    vlm_tag_row: list[Tag],
+    header_types: dict[int, str],
+) -> list[tuple[int, str, str]]:
+    """找出 VLM 行中可填充的列。
+
+    Args:
+        vlm_row: 展开后的文本行。
+        vlm_tag_row: 展开后的 Tag 行。
+        header_types: 列类型映射。
+
+    Returns:
+        [(col_idx, column_type, mode), ...] 列表。
+        mode: "append"（含图片的单元格，追加值）或 "empty"（完全空的单元格）。
+    """
+    fillable = []
+    for vc in range(len(vlm_row)):
+        text = vlm_row[vc].strip()
+        cell_tag = vlm_tag_row[vc]
+        has_img = cell_tag.find("img") is not None
+        col_type = header_types.get(vc, "text")
+
+        if has_img:
+            # 含图片的单元格 → 追加 OCR 识别的值文本
+            fillable.append((vc, col_type, "append"))
+        elif not text:
+            # 纯空单元格 → 可直接填充
+            fillable.append((vc, col_type, "empty"))
+    return fillable
+
+
 def _fill_empty_cells_from_ocr_grid(
     soup: BeautifulSoup,
     table: Tag,
     ocr_grid: list[list[str]],
 ) -> bool:
-    """将 OCR 网格中的文字填充到表格中的空单元格。
+    """将 OCR 网格中的文字填充到表格中的空单元格和含图片单元格。
 
-    匹配策略：
-    1. 遍历 VLM 表格所有行，收集每个 <td> 的文本
-    2. 识别哪一行/列对应 OCR 网格的哪一行/列
-    3. 对于每个空单元格，尝试从 OCR 网格对应位置取文字填充
+    修复了三个关键问题：
+    1. 含 <img> 的行不再被误判为表头（Bug 1）
+    2. 使用标签锚点对齐 OCR 行与 VLM 行，而非简单索引映射（Bug 2）
+    3. 使用 Tag.append() 追加文本，保留已有 <img> 子元素（Bug 3）
 
     Args:
         soup: BeautifulSoup 对象。
@@ -2241,108 +2473,106 @@ def _fill_empty_cells_from_ocr_grid(
     if not rows:
         return False
 
-    # 解析 VLM 表格：收集每行的单元格文本和行列信息
-    vlm_data = []  # list[list[str]]  每行每列的文本
-    vlm_cells = []  # list[list[Tag]]  对应的 BeautifulSoup Tag
-
-    for row in rows:
-        row_cells = row.find_all(["td", "th"])
-        if not row_cells:
-            continue
-
-        row_texts = []
-        row_tags = []
-        for cell in row_cells:
-            colspan = int(cell.get("colspan", 1))
-            text = cell.get_text().strip()
-            # colspan > 1 的单元格展开（重复填入多次以对齐网格）
-            for _ in range(colspan):
-                row_texts.append(text)
-                row_tags.append(cell)
-        vlm_data.append(row_texts)
-        vlm_cells.append(row_tags)
-
-    if not vlm_data:
-        return False
-
-    # 确定 VLM 表格的列数（取最大行宽）
-
-    # 计算 OCR 网格的维度（取最大列数）
     ocr_nrows = len(ocr_grid)
     if ocr_nrows == 0:
         return False
 
-    # 跳过表头行（第一行 + 任何包含 <th> 的行）
-    data_row_start = 0
-    for i, row in enumerate(rows):
-        if row.find("th"):
-            data_row_start = i + 1
-        else:
-            # 检查第一个非表头的全文本行（类表头）
-            cells = row.find_all("td")
-            texts = [c.get_text().strip() for c in cells]
-            if texts and all(
-                len(t) < 15 and not _is_data_value(t)
-                for t in texts if t
-            ):
-                data_row_start = i + 1
+    # 1. 解析 VLM 表格结构
+    vlm_data, vlm_cells = _parse_vlm_table_structure(rows)
+    if not vlm_data:
+        return False
 
-    # 匹配：从表头推断列类型，按类型匹配 OCR 文字到空列
-    modified = False
+    # 2. 检测数据行起始（含 <img> 的行终止表头扩展）
+    data_row_start = _detect_data_row_start(rows, vlm_data)
 
-    # 第一步：从表头行推断每列的预期数据类型
-    # ['项目名称'(text), '规格型号'(text), '单位'(text), '数量'(num), '单价'(num), '金额'(num), '税率/征收率'(rate), '税额'(num)]
+    # 3. 使用标签锚点将 OCR 行对齐到 VLM 数据行
+    ocr_pool = _align_ocr_to_vlm_rows(ocr_grid, vlm_data, data_row_start)
+
+    # 4. 推断列类型
     header_types = _infer_column_types_from_header(vlm_data, vlm_cells)
+
+    # 5. 按行填充
+    modified = False
+    filled_cell_ids = set()  # 记录已填充的 Tag id，处理 colspan 重复引用
 
     for vlm_row_idx in range(data_row_start, len(vlm_data)):
         vlm_row = vlm_data[vlm_row_idx]
         vlm_tag_row = vlm_cells[vlm_row_idx]
 
-        # 映射到 OCR 网格行
-        ocr_row_idx = vlm_row_idx - data_row_start
-        if ocr_row_idx >= ocr_nrows:
-            break
-        ocr_row = ocr_grid[ocr_row_idx]
+        # 收集该 VLM 行对应的 OCR 文本（过滤已在 VLM 中存在的标签）
+        ocr_texts = ocr_pool.get(vlm_row_idx, [])
+        ocr_new: list[tuple[str, str]] = []
+        for ot in ocr_texts:
+            # 跳过已在 VLM 行中精确匹配的值
+            if any(ot == vt for vt in vlm_row if vt):
+                continue
+            item_type = _classify_ocr_item_type(ot)
+            ocr_new.append((ot, item_type))
 
-        # 找出 VLM 行中的空列及其预期类型
-        empty_columns = []  # [(col_idx, header_type)]
-        for vc in range(len(vlm_row)):
-            if not vlm_row[vc].strip():
-                col_type = header_types.get(vc, "text")
-                empty_columns.append((vc, col_type))
-
-        if not empty_columns:
+        if not ocr_new:
             continue
 
-        # 将 OCR 项分类（跳过 VLM 已存在的值）
-        ocr_new_items = []  # [(text, item_type)]
-        for ocr_text in ocr_row:
-            if not ocr_text:
-                continue
-            # 跳过已在 VLM 行中存在的值
-            if any(ocr_text == vlm_row[vc] for vc in range(len(vlm_row))):
-                continue
-            item_type = _classify_ocr_item_type(ocr_text)
-            ocr_new_items.append((ocr_text, item_type))
-
-        if not ocr_new_items:
+        # 找出可填充的列
+        fillable = _get_fillable_columns(vlm_row, vlm_tag_row, header_types)
+        if not fillable:
             continue
 
-        # 按类型匹配：OCR 项 → 同类型空列
-        for ocr_text, item_type in ocr_new_items:
-            # 找到第一个匹配类型的空列
-            for ec_idx, (vc, col_type) in enumerate(empty_columns):
-                if item_type == col_type:
+        # 匹配填充：优先将 OCR 文本填到含图片的单元格（append），再填纯空单元格
+        # 文本类 OCR 优先填 append 单元格（如姓名），数字类 OCR 可填任意匹配类型
+        # 注意：filled_cell_ids 仅对 "empty" 模式生效（防止重复填充空单元格），
+        # "append" 模式允许同一 Tag 多次追加（单 colspan 行含多个 <img> 场景）
+        for ocr_text, ocr_type in ocr_new:
+            placed = False
+            # 第一轮：文本类型 → append 模式单元格
+            if ocr_type == "text":
+                for fi, (vc, ct, mode) in enumerate(fillable):
                     cell_tag = vlm_tag_row[vc]
-                    if cell_tag.name == "th":
+                    if mode != "append":
                         continue
-                    cell_tag.string = ocr_text
+                    _append_text_to_cell(cell_tag, ocr_text)
                     modified = True
                     logger.debug(
-                        f"OCR 填充({item_type}): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
+                        f"OCR 填充(append): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
                     )
-                    empty_columns.pop(ec_idx)
+                    fillable.pop(fi)
+                    placed = True
                     break
+            if placed:
+                continue
+
+            # 第二轮：任意类型 → 同类型可填充列（优先 empty 模式）
+            for fi, (vc, ct, mode) in enumerate(fillable):
+                cell_tag = vlm_tag_row[vc]
+                if mode == "empty" and id(cell_tag) in filled_cell_ids:
+                    continue
+                if ocr_type == ct or mode == "empty":
+                    _append_text_to_cell(cell_tag, ocr_text)
+                    if mode == "empty":
+                        filled_cell_ids.add(id(cell_tag))
+                    modified = True
+                    logger.debug(
+                        f"OCR 填充({mode}): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
+                    )
+                    fillable.pop(fi)
+                    placed = True
+                    break
+            if placed:
+                continue
+
+            # 第三轮：兜底 → 任意剩余可填充列
+            for fi, (vc, ct, mode) in enumerate(fillable):
+                cell_tag = vlm_tag_row[vc]
+                if mode == "empty" and id(cell_tag) in filled_cell_ids:
+                    continue
+                _append_text_to_cell(cell_tag, ocr_text)
+                if mode == "empty":
+                    filled_cell_ids.add(id(cell_tag))
+                modified = True
+                logger.debug(
+                    f"OCR 填充(fallback): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
+                )
+                fillable.pop(fi)
+                break
 
     return modified
 
@@ -2414,6 +2644,7 @@ def _classify_ocr_item_type(text: str) -> str:
 def supplement_vlm_table_cells_with_ocr(
     pdf_info_list: list,
     hybrid_pipeline_model,
+    image_writer=None,
 ) -> None:
     """使用 Pipeline OCR 识别结果补充 VLM 表格 HTML 中的空单元格。
 
@@ -2429,7 +2660,11 @@ def supplement_vlm_table_cells_with_ocr(
     Args:
         pdf_info_list: 中间 JSON 的页面列表。
         hybrid_pipeline_model: Hybrid pipeline 模型实例（含 ocr_model）。
+        image_writer: 可选的 FileBasedDataWriter，用于解析图片相对路径。
+            若提供且图片加载失败，会尝试从 image_writer 的根目录读取。
     """
+    import os
+
     import cv2
     from bs4 import BeautifulSoup
     from mineru.backend.utils.para_block_utils import iter_block_spans
@@ -2460,7 +2695,14 @@ def supplement_vlm_table_cells_with_ocr(
                         not cell.get_text().strip()
                         for cell in table.find_all("td")
                     )
-                    if not has_empty:
+                    # 检查是否存在含 <img> 的单元格
+                    #（VLM 无法识别手写/签章文字时将其渲染为图片，
+                    #   即使 get_text() 有标签文字，也需要 OCR 补充值文本）
+                    has_img = any(
+                        cell.find("img") is not None
+                        for cell in table.find_all("td")
+                    )
+                    if not has_empty and not has_img:
                         continue
                 except Exception:
                     continue
@@ -2473,6 +2715,12 @@ def supplement_vlm_table_cells_with_ocr(
 
                 try:
                     table_img = cv2.imread(image_path)
+                    if table_img is None:
+                        # 图片路径可能为相对路径（如仅 hash 文件名），
+                        # 尝试通过 image_writer 的根目录解析完整路径
+                        if image_writer is not None and hasattr(image_writer, '_parent_dir'):
+                            full_path = os.path.join(image_writer._parent_dir, image_path)
+                            table_img = cv2.imread(full_path)
                     if table_img is None:
                         skipped_count += 1
                         continue

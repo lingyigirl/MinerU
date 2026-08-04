@@ -217,7 +217,7 @@ def _select_sample_pages(page_count: int, max_sample_pages: int = 3) -> list[int
 
 def analyze_document_quality(
     pdf_bytes: bytes,
-    dpi: int = 200,  # 质量分析使用 200 DPI，与 DEFAULT_PDF_IMAGE_DPI 对齐
+    dpi: int = DEFAULT_PDF_IMAGE_DPI,  # 质量分析使用 DEFAULT_PDF_IMAGE_DPI，通过环境变量 MINERU_PDF_RENDER_DPI 控制
     max_pages: int = 2,  # 只渲染前 N 页做质量分析，无需全量渲染
     max_sample_pages: int = 2,
     blur_threshold: float = 100.0,
