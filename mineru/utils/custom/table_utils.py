@@ -1047,6 +1047,42 @@ def split_summary_from_data_cell(html: str) -> str:
     return html
 
 
+def _next_row_contains_numeric_data(row: Tag) -> bool:
+    """检查指定行是否包含数值数据（判断是否为数据行而非子表头行）。
+
+    当行中存在 rowspan 单元格时，其下一行可能是：
+    - 子表头行（如"优先股|永续债|其他"）：全部为短文本标签，不含数值
+    - 数据行（如含金额/数量等）：包含数值单元格
+
+    此函数用于在合计标签拆分时区分多行表头表格和普通数据表格，
+    避免将列头中结尾为"合计"的单元格（如"所有者权益合计"）错误拆分。
+
+    Args:
+        row: <tr> Tag。
+
+    Returns:
+        True 表示该行包含数值数据（判定为数据行）。
+    """
+    cells = row.find_all(["td", "th"])
+    if not cells:
+        return False
+
+    numeric_count = 0
+    non_empty_count = 0
+    for cell in cells:
+        text = cell.get_text().strip()
+        if not text:
+            continue
+        non_empty_count += 1
+        if _is_data_value(text):
+            numeric_count += 1
+
+    if non_empty_count == 0:
+        return False
+    # 至少 20% 的非空单元格包含数值 → 判定为数据行
+    return numeric_count / non_empty_count >= 0.2
+
+
 def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
     """在单个 <table> 中查找并拆分混入数据行的合计标签。
 
@@ -1093,7 +1129,6 @@ def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
                 continue
 
             # 嵌入模式：更新原单元格为纯数据标签，然后插入合计行
-            cell.string = data_part
 
             # 检测数据行是否存在 rowspan > 1 的单元格
             # 若存在，需特殊处理以避免 rowspan 溢出到新插入的合计行
@@ -1102,20 +1137,39 @@ def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
             )
 
             if has_rowspan:
-                _handle_summary_split_with_rowspan(
-                    soup, row, cells, matched_keyword, total_columns
-                )
+                # 【自定义】检查下一行是否为数据行（包含数值）。
+                # 多行表头表格（如所有者权益变动表）中，rowspan 行的下一行
+                # 是子表头行（如"优先股|永续债|其他"），不含数值，不应拆分。
+                # 仅当下一行确实包含数值数据时才执行 rowspan 模式拆分。
+                next_row = row.find_next_sibling("tr")
+                if next_row and _next_row_contains_numeric_data(next_row):
+                    cell.string = data_part
+                    _handle_summary_split_with_rowspan(
+                        soup, row, cells, matched_keyword, total_columns
+                    )
+                    logger.debug(
+                        f"合计标签拆分（嵌入模式 +rowspan）："
+                        f"行{row_idx}列{cell_idx}，"
+                        f"关键词={matched_keyword}，数据部分={data_part[:30]}"
+                    )
+                    return  # 每个表格只处理一次
+                else:
+                    logger.debug(
+                        f"合计标签拆分跳过（多行表头结构，下一行不含数值）："
+                        f"行{row_idx}列{cell_idx}，"
+                        f"关键词={matched_keyword}，数据部分={data_part[:30]}"
+                    )
             else:
+                cell.string = data_part
                 _insert_summary_row_after(
                     soup, row, matched_keyword, cells, total_columns
                 )
-
-            logger.debug(
-                f"合计标签拆分（嵌入模式{' +rowspan' if has_rowspan else ''}）："
-                f"行{row_idx}列{cell_idx}，"
-                f"关键词={matched_keyword}，数据部分={data_part[:30]}"
-            )
-            return  # 每个表格只处理一次
+                logger.debug(
+                    f"合计标签拆分（嵌入模式）："
+                    f"行{row_idx}列{cell_idx}，"
+                    f"关键词={matched_keyword}，数据部分={data_part[:30]}"
+                )
+                return  # 每个表格只处理一次
 
     # ---- 第二遍扫描：空值模式 ----
     # 某行中"合计"独占一个单元格且同行其余全空
@@ -1833,6 +1887,33 @@ def split_info_cell_multiline(html: str) -> str:
     return str(soup) if modified else html
 
 
+def _has_significant_rowspan(html: str) -> bool:
+    """检查表格是否使用多层 rowspan 结构（多行表头表格等）。
+
+    当表格存在 rowspan > 1 的单元格时，各行 colspan 总和自然不同
+    （rowspan 覆盖的列不计入后续行），此时不应执行 colspan 规范化，
+    否则会将子表头行的 colspan 值扩大到无意义的范围。
+
+    Args:
+        html: 表格 HTML 字符串。
+
+    Returns:
+        True 表示存在 rowspan > 1 的单元格。
+    """
+    if not html or not isinstance(html, str):
+        return False
+    if "<table" not in html.lower():
+        return False
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return False
+    for table in soup.find_all("table"):
+        if table.find(attrs={"rowspan": True}):
+            return True
+    return False
+
+
 def normalize_invoice_table(html: str) -> str:
     """发票表格专用规范化入口。
 
@@ -1866,8 +1947,12 @@ def normalize_invoice_table(html: str) -> str:
         )
         return html
 
-    # 先执行通用的 colspan 规范化
-    html = normalize_table_colspan(html) if _has_colspan_mismatch(html) else html
+    # 先执行通用的 colspan 规范化（跳过多行表头表格，其 rowspan 导致各行自然不同）
+    html = (
+        normalize_table_colspan(html)
+        if _has_colspan_mismatch(html) and not _has_significant_rowspan(html)
+        else html
+    )
 
     # 重新解析（colspan 规范化可能修改了 HTML）
     try:
