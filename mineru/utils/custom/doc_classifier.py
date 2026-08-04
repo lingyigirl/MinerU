@@ -329,7 +329,7 @@ def _compute_image_coverage_ratio(
 def classify_document(
     pdf_bytes: bytes,
     quality: Optional[DocumentQuality] = None,
-    dpi: int = 200,  # 分类用 200 DPI，与 DEFAULT_PDF_IMAGE_DPI 对齐
+    dpi: int = DEFAULT_PDF_IMAGE_DPI,  # 分类使用 DEFAULT_PDF_IMAGE_DPI，通过环境变量 MINERU_PDF_RENDER_DPI 控制
     max_preview_pages: int = 2,  # 只渲染前 N 页用于分类
 ) -> DocType:
     """对文档进行快速分类，返回推荐的解析路径（S1 阶段）。

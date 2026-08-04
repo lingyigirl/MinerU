@@ -245,9 +245,23 @@ def append_page_model_list_to_middle_json(
     )
 
 
-def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm_ocr_enable):
+def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm_ocr_enable, image_writer=None):
     if not (_vlm_ocr_enable or _ocr_enable):
         _apply_post_ocr(pdf_info_list, hybrid_pipeline_model)
+
+    # [自定义] 使用 Pipeline OCR 补充 VLM 表格缺失的单元格文字
+    # 必须在 build_para_blocks_from_preproc 之前执行，
+    # 否则 para_blocks 不会包含 OCR 补充的文字。
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.table_utils import supplement_vlm_table_cells_with_ocr
+        supplement_vlm_table_cells_with_ocr(
+            pdf_info_list, hybrid_pipeline_model, image_writer=image_writer
+        )
+    except Exception as exc:
+        logger.warning(
+            f"OCR 表格单元格补充执行失败，将使用原始表格 HTML: {exc}"
+        )
 
     build_para_blocks_from_preproc(pdf_info_list)
     merge_para_text_blocks(
@@ -258,18 +272,6 @@ def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm
     table_enable = get_table_enable(os.getenv('MINERU_VLM_TABLE_ENABLE', 'True').lower() == 'true')
     if table_enable:
         cross_page_table_merge(pdf_info_list)
-
-    # [自定义] 使用 Pipeline OCR 补充 VLM 表格缺失的单元格文字
-    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
-    try:
-        from mineru.utils.custom.table_utils import supplement_vlm_table_cells_with_ocr
-        supplement_vlm_table_cells_with_ocr(
-            pdf_info_list, hybrid_pipeline_model
-        )
-    except Exception as exc:
-        logger.warning(
-            f"OCR 表格单元格补充执行失败，将使用原始表格 HTML: {exc}"
-        )
 
     if title_aided_enable:
         llm_aided_title_start_time = time.time()
@@ -308,6 +310,7 @@ def result_to_middle_json(
         hybrid_pipeline_model,
         _ocr_enable,
         _vlm_ocr_enable,
+        image_writer=image_writer,
     )
     close_pdfium_document(pdf_doc)
     return middle_json

@@ -15,7 +15,7 @@ from PIL import Image, ImageOps
 from mineru.data.data_reader_writer import FileBasedDataWriter
 from mineru.utils.check_sys_env import is_windows_environment
 from mineru.utils.bbox_utils import normalize_to_int_bbox
-from mineru.utils.os_env_config import get_load_images_timeout, get_load_images_threads
+from mineru.utils.os_env_config import get_load_images_timeout, get_load_images_threads, get_pdf_render_dpi
 from mineru.utils.pdf_reader import image_to_b64str, image_to_bytes, page_to_image
 from mineru.utils.enum_class import ImageType
 from mineru.utils.hash_utils import str_sha256
@@ -31,8 +31,8 @@ from concurrent.futures import ProcessPoolExecutor, wait, ALL_COMPLETED
 from concurrent.futures.process import BrokenProcessPool
 
 
-DEFAULT_PDF_IMAGE_DPI = 200
-# DEFAULT_PDF_IMAGE_DPI = 144
+DEFAULT_PDF_IMAGE_DPI = get_pdf_render_dpi()
+# 历史默认值: 200 → 144，现在通过环境变量 MINERU_PDF_RENDER_DPI 控制，默认 200
 MAX_PDF_RENDER_PROCESSES = 3
 MIN_PAGES_PER_RENDER_PROCESS = 30
 PDF_RENDER_TERMINATE_GRACE_PERIOD_SECONDS = 0.1
