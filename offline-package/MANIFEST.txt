@@ -1,0 +1,21 @@
+================================================================
+  MinerU 3.4.4 离线部署物料清单
+  生成时间: 2026-08-03 16:21:42
+  镜像 TAG: mineru:3.4.4-upstream
+================================================================
+
+| 文件名                           | 大小      | 用途                        |
+|---------------------------------|-----------|----------------------------|
+| mineru-3.4.4-upstream.tar.gz   | 14G    | Docker 镜像                  |
+| mineru-models-3.4.4.tar.gz     | 3.8G    | Pipeline + VLM 模型         |
+| mineru-prod-template.json       | -         | 运行时配置模板（需修改路径） |
+| compose-prod.yaml               | -         | Docker Compose 启动配置      |
+| check_server_env.sh             | -         | 内网服务器环境检查脚本       |
+| README-internal-deploy.md       | -         | 内网部署操作指南             |
+| MANIFEST.txt                    | -         | 本文件                      |
+
+部署步骤:
+  1. 将整个 offline-package/ 目录传输到内网服务器
+  2. 在内网服务器上阅读 README-internal-deploy.md
+  3. 按步骤部署
+

@@ -1,5 +1,5 @@
 # ============================================================
-# MinerU 4.2.0 Custom — GPU 服务器 FastAPI 部署
+# MinerU 3.4.4 Custom — GPU 服务器 FastAPI 部署
 # 模型打包进镜像，开箱即用
 #
 # 构建: docker build -t mineru:custom .

@@ -11,10 +11,13 @@ from mineru.utils.pdfium_guard import pdfium_guard
 def page_to_image(
     page: PdfPage,
     dpi: int = 200,
-    max_width_or_height: int = 3500,  # changed from 4500 to 3500
+    max_width_or_height: int = None,  # None 时自动按 dpi * 17 计算（约 A3 @ 当前 DPI）
 ) -> (Image.Image, float):
     with pdfium_guard():
         scale = dpi / 72
+
+        if max_width_or_height is None:
+            max_width_or_height = dpi * 17
 
         long_side_length = max(*page.get_size())
         if (long_side_length*scale) > max_width_or_height:

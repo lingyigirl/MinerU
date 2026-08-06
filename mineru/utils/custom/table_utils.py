@@ -10,7 +10,7 @@
 import re
 from typing import Optional
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 from loguru import logger
 
 # 常见发票表头关键词集合（用于识别合并单元格文本中的表头部分）
@@ -75,6 +75,12 @@ def split_merged_table_cells(html: str) -> str:
 
             for row in rows:
                 if not _is_merged_row(row, total_columns):
+                    # 非全行合并 → 尝试拆分部分合并的单元格
+                    # （如 VLM 将末尾 3 列合并为 1 个 td："金额 税率/征收率 税额 1769.91 13% 230.09"）
+                    if _try_split_partial_merge(row, soup, total_columns):
+                        modified = True
+                        # 拆分后重新计算总列数
+                        total_columns = _compute_total_columns(rows)
                     continue
 
                 cell = row.find(["td", "th"])
@@ -140,6 +146,137 @@ def split_merged_table_cells(html: str) -> str:
     if modified:
         return str(soup)
     return html
+
+
+def _try_split_partial_merge(
+    row: Tag,
+    soup: BeautifulSoup,
+    total_columns: int,
+) -> bool:
+    """检测并拆分表格行中部分合并的单元格（非全行合并场景）。
+
+    当一行有多个单元格，但其中某个单元格包含 "表头标签 + 数据值"
+    的拼接文本时（如 VLM 输出 "金额 税率/征收率 税额 1769.91 13% 230.09"），
+    将表头标签替换原单元格位置为新 <th>，数据值移至下一行（数据行）。
+
+    Args:
+        row: BeautifulSoup <tr> Tag。
+        soup: BeautifulSoup 对象，用于创建新标签。
+        total_columns: 当前表格总列数。
+
+    Returns:
+        True 表示有修改（至少拆分了一个单元格）。
+    """
+    cells = row.find_all(["td", "th"])
+    if len(cells) < 2:
+        return False
+
+    modified = False
+
+    for cell_idx, cell in enumerate(cells):
+        text = cell.get_text().strip()
+        if not text:
+            continue
+
+        tokens = text.split()
+        if len(tokens) < 4:
+            continue
+
+        # 用 _classify_tokens 区分表头 token 和数据 token
+        header_labels, data_values = _classify_tokens(tokens)
+        if header_labels is None or data_values is None:
+            continue
+
+        num_header = len(header_labels)
+        num_data = len(data_values)
+
+        # 至少需要 2 个表头 + 2 个数据才认为是有意义的合并
+        if num_header < 2 or num_data < 2:
+            continue
+
+        logger.info(
+            f"部分合并单元格拆分: row={cell_idx}, "
+            f"文本=\"{text[:80]}...\" → "
+            f"{num_header}个表头 + {num_data}个数据"
+        )
+
+        # 将原合并单元格替换为表头 <th> 标签
+        new_header_cells = []
+        for header in header_labels:
+            new_th = soup.new_tag("th")
+            new_th.string = header
+            new_header_cells.append(new_th)
+
+        cell.replace_with(*new_header_cells)
+        modified = True
+
+        # 将数据值移至下一行（数据行）对应列
+        next_row = row.find_next_sibling("tr")
+        if next_row and data_values:
+            _fill_data_row_columns(next_row, cell_idx, data_values, soup)
+
+    return modified
+
+
+def _fill_data_row_columns(
+    data_row: Tag,
+    merge_col_idx: int,
+    data_values: list[str],
+    soup: BeautifulSoup,
+) -> None:
+    """将数据值填入数据行中由合并单元格拆分产生的对应列。
+
+    合并单元格在表头行位置 `merge_col_idx` 被拆分为 N 个 <th>，
+    数据行需在相同列位置填入对应的 N 个数据值。
+
+    算法：
+    1. 计算 data_row 现有列的实际跨度
+    2. 若不足 merge_col_idx 则补空 <td>
+    3. 覆盖 merge_col_idx 处开始的空单元格（若该位置被 colspan 覆盖则追加）
+
+    Args:
+        data_row: 数据行 <tr> Tag。
+        merge_col_idx: 合并单元格在原行中的位置索引。
+        data_values: 数据值列表。
+        soup: BeautifulSoup 对象。
+    """
+    # 获取数据行现有的所有单元格
+    existing_cells = data_row.find_all(["td", "th"])
+
+    # 计算截止 merge_col_idx 之前的列跨度
+    span_before = 0
+    for i, ec in enumerate(existing_cells):
+        cs = int(ec.get("colspan", 1))
+        if span_before + cs > merge_col_idx:
+            # merge_col_idx 落在这个单元格的 colspan 范围内
+            # 需要插入 data_values 到这个位置
+            # 先把当前单元格之后的单元格收集起来
+            after_cells = existing_cells[i + 1:]
+            # 删除当前及之后的所有单元格
+            for ac in existing_cells[i:]:
+                ac.decompose()
+            # 添加 data_values
+            for val in data_values:
+                new_td = soup.new_tag("td")
+                new_td.string = val
+                data_row.append(new_td)
+            # 重新添加之后的单元格
+            for ac in after_cells:
+                data_row.append(ac)
+            return
+        span_before += cs
+
+    # merge_col_idx 在现有所有单元格之后，补空再追加数据
+    while span_before < merge_col_idx:
+        empty_td = soup.new_tag("td")
+        empty_td.string = ""
+        data_row.append(empty_td)
+        span_before += 1
+
+    for val in data_values:
+        new_td = soup.new_tag("td")
+        new_td.string = val
+        data_row.append(new_td)
 
 
 def _compute_total_columns(rows: list[Tag]) -> int:
@@ -410,6 +547,10 @@ def _is_data_value(token: str) -> bool:
         return True
     # 数字
     if re.match(r'^[\d.,]+$', token):
+        return True
+    # 中文表头后缀接数值（如 "金额222875.57"、"税额28973.82"、"数量319620"）
+    # VLM 常将表头标签和数值拼接在同一个 token 中，此处提取尾部数值部分
+    if re.match(r'^[一-鿿]+[¥￥]?\d[\d.,]*$', token):
         return True
     return False
 
@@ -906,6 +1047,42 @@ def split_summary_from_data_cell(html: str) -> str:
     return html
 
 
+def _next_row_contains_numeric_data(row: Tag) -> bool:
+    """检查指定行是否包含数值数据（判断是否为数据行而非子表头行）。
+
+    当行中存在 rowspan 单元格时，其下一行可能是：
+    - 子表头行（如"优先股|永续债|其他"）：全部为短文本标签，不含数值
+    - 数据行（如含金额/数量等）：包含数值单元格
+
+    此函数用于在合计标签拆分时区分多行表头表格和普通数据表格，
+    避免将列头中结尾为"合计"的单元格（如"所有者权益合计"）错误拆分。
+
+    Args:
+        row: <tr> Tag。
+
+    Returns:
+        True 表示该行包含数值数据（判定为数据行）。
+    """
+    cells = row.find_all(["td", "th"])
+    if not cells:
+        return False
+
+    numeric_count = 0
+    non_empty_count = 0
+    for cell in cells:
+        text = cell.get_text().strip()
+        if not text:
+            continue
+        non_empty_count += 1
+        if _is_data_value(text):
+            numeric_count += 1
+
+    if non_empty_count == 0:
+        return False
+    # 至少 20% 的非空单元格包含数值 → 判定为数据行
+    return numeric_count / non_empty_count >= 0.2
+
+
 def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
     """在单个 <table> 中查找并拆分混入数据行的合计标签。
 
@@ -952,18 +1129,47 @@ def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
                 continue
 
             # 嵌入模式：更新原单元格为纯数据标签，然后插入合计行
-            cell.string = data_part
 
-            # 创建合计行：复制当前行各单元格，但第一列改为合计标签
-            _insert_summary_row_after(
-                soup, row, matched_keyword, cells, total_columns
+            # 检测数据行是否存在 rowspan > 1 的单元格
+            # 若存在，需特殊处理以避免 rowspan 溢出到新插入的合计行
+            has_rowspan = any(
+                int(c.get("rowspan", 1)) > 1 for c in cells
             )
 
-            logger.debug(
-                f"合计标签拆分（嵌入模式）：行{row_idx}列{cell_idx}，"
-                f"关键词={matched_keyword}，数据部分={data_part[:30]}"
-            )
-            return  # 每个表格只处理一次
+            if has_rowspan:
+                # 【自定义】检查下一行是否为数据行（包含数值）。
+                # 多行表头表格（如所有者权益变动表）中，rowspan 行的下一行
+                # 是子表头行（如"优先股|永续债|其他"），不含数值，不应拆分。
+                # 仅当下一行确实包含数值数据时才执行 rowspan 模式拆分。
+                next_row = row.find_next_sibling("tr")
+                if next_row and _next_row_contains_numeric_data(next_row):
+                    cell.string = data_part
+                    _handle_summary_split_with_rowspan(
+                        soup, row, cells, matched_keyword, total_columns
+                    )
+                    logger.debug(
+                        f"合计标签拆分（嵌入模式 +rowspan）："
+                        f"行{row_idx}列{cell_idx}，"
+                        f"关键词={matched_keyword}，数据部分={data_part[:30]}"
+                    )
+                    return  # 每个表格只处理一次
+                else:
+                    logger.debug(
+                        f"合计标签拆分跳过（多行表头结构，下一行不含数值）："
+                        f"行{row_idx}列{cell_idx}，"
+                        f"关键词={matched_keyword}，数据部分={data_part[:30]}"
+                    )
+            else:
+                cell.string = data_part
+                _insert_summary_row_after(
+                    soup, row, matched_keyword, cells, total_columns
+                )
+                logger.debug(
+                    f"合计标签拆分（嵌入模式）："
+                    f"行{row_idx}列{cell_idx}，"
+                    f"关键词={matched_keyword}，数据部分={data_part[:30]}"
+                )
+                return  # 每个表格只处理一次
 
     # ---- 第二遍扫描：空值模式 ----
     # 某行中"合计"独占一个单元格且同行其余全空
@@ -1054,17 +1260,18 @@ def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
 def _find_trailing_summary_keyword(text: str) -> Optional[str]:
     """检查文本末尾是否包含合计/小计类摘要关键词。
 
+    支持 VLM 输出中关键词内嵌空格的变体（如 "合 计" 等同于 "合计"）。
+
     Args:
         text: 单元格文本。
 
     Returns:
-        匹配到的关键词字符串，或 None。
+        匹配到的关键词字符串（规范形式，无内嵌空格），或 None。
     """
+    # 规范化：去除文本中所有空白字符以兼容 VLM 内嵌空格变体
+    collapsed = re.sub(r'\s+', '', text)
     for kw in sorted(_SPLIT_SUMMARY_KEYWORDS, key=len, reverse=True):
-        if text.endswith(kw):
-            return kw
-        # 也检查关键词前有空格分隔的情况
-        if f" {kw}" in text:
+        if collapsed.endswith(kw):
             return kw
     return None
 
@@ -1072,22 +1279,21 @@ def _find_trailing_summary_keyword(text: str) -> Optional[str]:
 def _strip_summary_keyword(text: str, keyword: str) -> str:
     """从文本中移除末尾的摘要关键词。
 
+    支持 VLM 输出中关键词内嵌空格的变体（如 "合 计" 等同于 "合计"）。
+
     Args:
         text: 原始文本。
-        keyword: 要移除的关键词。
+        keyword: 要移除的关键词（规范形式，无内嵌空格）。
 
     Returns:
         剥离后的文本。
     """
-    # 精确末尾匹配
-    if text.endswith(keyword):
-        result = text[:-len(keyword)].rstrip()
-        return result
-    # 关键词前有空格
-    idx = text.rfind(f" {keyword}")
-    if idx >= 0:
-        result = text[:idx].rstrip()
-        return result
+    # 构建正则：关键词各字符之间允许零或多个空白（如 "合 计"、"合  计"）
+    spaced_pattern = r'\s*'.join(list(keyword)) + r'\s*$'
+    m = re.search(spaced_pattern, text)
+    if m:
+        return text[:m.start()].rstrip()
+    return text
     return text
 
 
@@ -1136,6 +1342,131 @@ def _insert_summary_row_after(
         summary_tr.append(td)
 
     data_row.insert_after(summary_tr)
+
+
+def _handle_summary_split_with_rowspan(
+    soup: BeautifulSoup,
+    data_row: Tag,
+    data_cells: list[Tag],
+    summary_label: str,
+    total_columns: int,
+) -> None:
+    """处理带 rowspan 的合计行拆分。
+
+    当数据行包含 rowspan>1 的单元格时（如增值税发票中"货物名称"、
+    "规格型号"等列跨两行，"金额"和"税额"列不跨行），
+    分析列结构后将表头标签提取为独立的 <th> 行，将 ¥ 值合并到数据行。
+
+    策略：
+    1. 分析各列 rowspan 状态，找出非 rowspan 列（¥ 值所在列）
+    2. 减少 rowspan
+    3. 提取表头标签 + 清理数据单元格 + 插入 <th> 表头行
+    4. 合并 ¥ 行值到数据行 + 删除 ¥ 行
+    5. 创建合计行
+
+    Args:
+        soup: BeautifulSoup 对象。
+        data_row: 当前数据行 <tr>。
+        data_cells: 数据行的单元格列表。
+        summary_label: 摘要标签（如"合计"）。
+        total_columns: 表格总列数。
+    """
+    # 1. 分析各列的 rowspan 状态
+    non_rowspan_cols: list[tuple[int, int]] = []  # [(cell_index, effective_start_col)]
+    current_col = 0
+    for i, cell in enumerate(data_cells):
+        colspan = int(cell.get("colspan", 1))
+        rowspan = int(cell.get("rowspan", 1))
+        if rowspan <= 1:
+            non_rowspan_cols.append((i, current_col))
+        current_col += colspan
+
+    # 2. 减少 rowspan
+    for cell in data_cells:
+        rs = int(cell.get("rowspan", 1))
+        if rs > 1:
+            if rs == 2:
+                del cell["rowspan"]
+            else:
+                cell["rowspan"] = str(rs - 1)
+
+    # 3. 提取表头标签 + 清理数据 + 插入 <th> 表头行
+    #    VLM 输出如 "单位kw.h"、"金额222875.57" 是表头+值拼接，
+    #    利用 _strip_header_prefix 和 _INVOICE_HEADER_KEYWORDS 做分离
+    header_labels: list[tuple[int, str, int]] = []  # [(col_idx, label, colspan)]
+    for i, cell in enumerate(data_cells):
+        text = cell.get_text().strip()
+        colspan = int(cell.get("colspan", 1))
+        if not text:
+            continue
+
+        # 情况 A：纯表头关键词（如"规格型号"）→ 数据行该列清空
+        if text in _INVOICE_HEADER_KEYWORDS:
+            header_labels.append((i, text, colspan))
+            cell.string = ""
+        # 情况 B：表头+值拼接（如"单位kw.h"）→ 分离后保留纯数据值
+        elif (stripped := _strip_header_prefix(text)):
+            header_labels.append((i, stripped["header"], colspan))
+            cell.string = stripped["data"]
+        # 情况 C：无法拆分 → 保持原样
+
+    if header_labels:
+        header_tr = soup.new_tag("tr")
+        for _col_idx, label, cs in header_labels:
+            th = soup.new_tag("th")
+            th.string = label
+            if cs > 1:
+                th["colspan"] = str(cs)
+            header_tr.append(th)
+        data_row.insert_before(header_tr)
+        logger.debug(
+            f"表头行提取：{len(header_labels)} 个标签"
+        )
+
+    # 4. 合并 ¥ 行值到数据行 + 删除 ¥ 行
+    #    ¥ 行原有的 ¥222875.57 / ¥28973.82 合并到数据行对应列
+    #    消除数据行中 "金额222875.57" 和 ¥ 行 "¥222875.57" 的重复
+    next_row = data_row.find_next_sibling("tr")
+    next_cells = next_row.find_all(["td", "th"]) if next_row else []
+
+    for idx, (cell_idx, _eff_col) in enumerate(non_rowspan_cols):
+        if idx < len(next_cells) and cell_idx < len(data_cells):
+            data_cells[cell_idx].string = next_cells[idx].get_text().strip()
+
+    if next_row:
+        next_row.decompose()
+
+    # 5. 创建合计行——从合并后的数据行取值
+    summary_tr = soup.new_tag("tr")
+    non_rowspan_col_set = {col for _, col in non_rowspan_cols}
+
+    for col_idx in range(total_columns):
+        td = soup.new_tag("td")
+        if col_idx == 0:
+            td.string = summary_label
+        elif col_idx in non_rowspan_col_set:
+            match_idx = None
+            for j, (_, eff_col) in enumerate(non_rowspan_cols):
+                if eff_col == col_idx:
+                    match_idx = j
+                    break
+            if match_idx is not None and match_idx < len(non_rowspan_cols):
+                cell_idx = non_rowspan_cols[match_idx][0]
+                if cell_idx < len(data_cells):
+                    val = data_cells[cell_idx].get_text().strip()
+                    td.string = val if _is_data_value(val) else ""
+            else:
+                td.string = ""
+        else:
+            td.string = ""
+        summary_tr.append(td)
+
+    data_row.insert_after(summary_tr)
+
+    logger.debug(
+        f"合计标签拆分（rowspan模式）：非rowspan列={non_rowspan_cols}，"
+        f"¥行已合并删除"
+    )
 
 
 def _find_isolated_summary_cell(cells: list[Tag]) -> Optional[int]:
@@ -1475,6 +1806,114 @@ def _infer_missing_values_in_table(
             )
 
 
+# -- 购买方/销售方信息行内多行拆分 --
+
+# 信息单元格中可识别为行分隔点的字段标签正则
+# 在"名称:"之后出现的这些标签前插入 <br/> 实现多行拆分
+# (统一社会信用代码/)?纳税人识别号 兼容有无"统一社会信用代码/"前缀的两种情况
+_INFO_LINE_BREAK_RE = re.compile(
+    r'(?<=.)(?:(统一社会信用代码/)?纳税人识别号:|地址、电话:|开户行及账号:)'
+)
+
+
+def split_info_cell_multiline(html: str) -> str:
+    """将发票购买方/销售方信息单元格在字段边界处拆分为多行。
+
+    检测被拼接在一行的形式如：
+        "名称:xxx纳税人识别号:yyy地址、电话:zzz开户行及账号:www"
+    在各字段标签前插入 <br/> 拆分为：
+        名称:xxx
+        纳税人识别号:yyy
+        地址、电话:zzz
+        开户行及账号:www
+
+    兼容两种税号标签格式：
+    - 统一社会信用代码/纳税人识别号:（含前缀）
+    - 纳税人识别号:（无前缀）
+
+    使用 re.sub 在各字段标签前插入 <br/>，完整保留所有字段内容。
+
+    Args:
+        html: 表格 HTML 字符串。
+
+    Returns:
+        处理后的 HTML 字符串；若无匹配则返回原始 HTML。
+    """
+    if not html or not isinstance(html, str):
+        return html
+    if "<table" not in html.lower():
+        return html
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        logger.warning("BeautifulSoup 解析 HTML 失败，跳过信息多行拆分")
+        return html
+
+    modified = False
+
+    for td in soup.find_all("td"):
+        text = td.get_text().strip()
+        if not text:
+            continue
+
+        # 跳过已包含 <br/> 的单元格（已拆分过）
+        if td.find("br"):
+            continue
+
+        # 必须包含"名称:"才可能是发票信息单元格
+        if not text.startswith("名称:"):
+            continue
+
+        # 在字段标签前插入 <br/> 实现分行的同时保留所有字段内容
+        new_text = _INFO_LINE_BREAK_RE.sub(r'<br/>\g<0>', text)
+        if new_text == text:
+            # 没有匹配到任何可分行的字段标签
+            continue
+
+        td.clear()
+        # 将 <br/> 替换为实际的 BeautifulSoup <br> 标签
+        parts = new_text.split("<br/>")
+        for i, part in enumerate(parts):
+            if i > 0:
+                td.append(soup.new_tag("br"))
+            td.append(NavigableString(part))
+
+        modified = True
+        logger.info(
+            f"购买方/销售方信息多行拆分：{len(parts)} 个字段"
+        )
+
+    return str(soup) if modified else html
+
+
+def _has_significant_rowspan(html: str) -> bool:
+    """检查表格是否使用多层 rowspan 结构（多行表头表格等）。
+
+    当表格存在 rowspan > 1 的单元格时，各行 colspan 总和自然不同
+    （rowspan 覆盖的列不计入后续行），此时不应执行 colspan 规范化，
+    否则会将子表头行的 colspan 值扩大到无意义的范围。
+
+    Args:
+        html: 表格 HTML 字符串。
+
+    Returns:
+        True 表示存在 rowspan > 1 的单元格。
+    """
+    if not html or not isinstance(html, str):
+        return False
+    if "<table" not in html.lower():
+        return False
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return False
+    for table in soup.find_all("table"):
+        if table.find(attrs={"rowspan": True}):
+            return True
+    return False
+
+
 def normalize_invoice_table(html: str) -> str:
     """发票表格专用规范化入口。
 
@@ -1508,8 +1947,12 @@ def normalize_invoice_table(html: str) -> str:
         )
         return html
 
-    # 先执行通用的 colspan 规范化
-    html = normalize_table_colspan(html) if _has_colspan_mismatch(html) else html
+    # 先执行通用的 colspan 规范化（跳过多行表头表格，其 rowspan 导致各行自然不同）
+    html = (
+        normalize_table_colspan(html)
+        if _has_colspan_mismatch(html) and not _has_significant_rowspan(html)
+        else html
+    )
 
     # 重新解析（colspan 规范化可能修改了 HTML）
     try:
@@ -1774,17 +2217,249 @@ def _build_ocr_text_grid(
     return grid
 
 
+def _append_text_to_cell(cell_tag: Tag, text: str) -> None:
+    """向表格单元格追加文本，保留已有内容（如图片标签）。
+
+    使用 Tag.append() 在单元格末尾添加文本节点，
+    避免 cell_tag.string 赋值会清除 <img> 等子元素的问题。
+
+    Args:
+        cell_tag: BeautifulSoup Tag（<td> 或 <th>）。
+        text: 要追加的文本。
+    """
+    existing = cell_tag.get_text().strip()
+    prefix = " " if existing else ""
+    cell_tag.append(NavigableString(f"{prefix}{text}"))
+
+
+def _parse_vlm_table_structure(rows: list[Tag]) -> tuple[list[list[str]], list[list[Tag]]]:
+    """解析 VLM 表格结构，展开 colspan 生成等宽网格。
+
+    Args:
+        rows: <tr> 标签列表。
+
+    Returns:
+        (vlm_data, vlm_cells): 文本网格和对应的 Tag 网格。
+        colspan 单元格被重复展开为等宽表示。
+    """
+    vlm_data = []
+    vlm_cells = []
+    for row in rows:
+        row_cells = row.find_all(["td", "th"])
+        if not row_cells:
+            continue
+        row_texts = []
+        row_tags = []
+        for cell in row_cells:
+            colspan = int(cell.get("colspan", 1))
+            text = cell.get_text().strip()
+            for _ in range(colspan):
+                row_texts.append(text)
+                row_tags.append(cell)
+        vlm_data.append(row_texts)
+        vlm_cells.append(row_tags)
+    return vlm_data, vlm_cells
+
+
+def _detect_data_row_start(rows: list[Tag], vlm_data: list[list[str]]) -> int:
+    """检测数据行起始位置。
+
+    规则：
+    1. 含 <th> 的行视为表头。
+    2. 含 <img> 的行视为数据行（含手写/签章图片），不参与表头扩展。
+    3. 全短标签行（<15 字且非数据值）视为类表头。
+
+    Args:
+        rows: <tr> 标签列表。
+        vlm_data: 展开后的文本网格。
+
+    Returns:
+        第一个数据行的索引。
+    """
+    data_row_start = 0
+    for i, row in enumerate(rows):
+        if row.find("th"):
+            data_row_start = i + 1
+        elif row.find("img"):
+            # 含图片的行是数据行，终止表头扩展
+            break
+        else:
+            cells = row.find_all("td")
+            texts = [c.get_text().strip() for c in cells]
+            if texts and all(
+                len(t) < 15 and not _is_data_value(t)
+                for t in texts if t
+            ):
+                data_row_start = i + 1
+    return data_row_start
+
+
+def _normalize_for_matching(text: str) -> str:
+    """规范化文本用于模糊匹配。
+
+    将 OCR 输出中常见的全角标点转换为半角，
+    解决 VLM（半角）与 OCR（全角）之间的字符编码差异。
+
+    Args:
+        text: 待规范化的文本。
+
+    Returns:
+        规范化后的文本。
+    """
+    full_to_half = {
+        "（": "(", "）": ")", "：": ":", "，": ",",
+        "。": ".", "！": "!", "？": "?", "；": ";",
+        "“": '"', "”": '"', "【": "[", "】": "]",
+        "《": "<", "》": ">", "％": "%", "＋": "+",
+        "－": "-", "＝": "=", "０": "0", "１": "1",
+        "２": "2", "３": "3", "４": "4", "５": "5",
+        "６": "6", "７": "7", "８": "8", "９": "9",
+        " ": " ", "　": " ",
+    }
+    result = text
+    for full, half in full_to_half.items():
+        result = result.replace(full, half)
+    return result
+
+
+def _align_ocr_to_vlm_rows(
+    ocr_grid: list[list[str]],
+    vlm_data: list[list[str]],
+    data_row_start: int,
+) -> dict[int, list[str]]:
+    """使用标签锚点将 OCR 网格行对齐到 VLM 数据行。
+
+    OCR 网格（由 _build_ocr_text_grid 按 y 坐标聚类生成）的行数通常
+    多于 VLM 表格的行数。此函数通过标签子串匹配将 OCR 行分配到对应的
+    VLM 数据行，形成每个 VLM 行的 OCR 文本池。
+
+    匹配规则：
+    - 若 OCR 行中含某 VLM 数据行的标签文本（规范化后子串匹配）→ 锚定到该 VLM 行
+    - 若无标签匹配 → 向前看一行：若下一行是标签 → 使用下一行的 VLM 行
+    - 否则 → 跟随上一个锚定的 VLM 行
+
+    Args:
+        ocr_grid: OCR 识别的文字网格。
+        vlm_data: 展开后的 VLM 文本网格。
+        data_row_start: 数据行起始索引。
+
+    Returns:
+        {vlm_row_idx: [ocr_text, ...]} 映射。
+    """
+    vlm_nrows = len(vlm_data)
+    ocr_pool: dict[int, list[str]] = {
+        vi: [] for vi in range(data_row_start, vlm_nrows)
+    }
+    if not ocr_pool:
+        return ocr_pool
+
+    # 预先规范化 VLM 数据行文本
+    vlm_norm: list[list[str]] = [
+        [_normalize_for_matching(t) for t in row] for row in vlm_data
+    ]
+
+    current_vlm_row = data_row_start
+
+    for oi, ocr_row in enumerate(ocr_grid):
+        # 查找该 OCR 行最匹配的 VLM 数据行
+        best_row = None
+        best_score = 0
+        for vi in range(data_row_start, vlm_nrows):
+            score = 0
+            for ot in ocr_row:
+                if not ot:
+                    continue
+                ot_norm = _normalize_for_matching(ot)
+                for vt_norm in vlm_norm[vi]:
+                    if vt_norm and (ot_norm in vt_norm or vt_norm in ot_norm):
+                        # 匹配长度加权：越长匹配越可靠
+                        score += min(len(ot_norm), len(vt_norm))
+            if score > best_score:
+                best_score = score
+                best_row = vi
+
+        if best_row is not None:
+            current_vlm_row = best_row
+        elif oi + 1 < len(ocr_grid):
+            # 向前看一行：OCR 识别中值文本常出现在标签文本上方（存单/票据模式）
+            # 守卫条件：仅当当前行是"稀疏文本行"（≤2项，全部为 text 类型）时才 peek-ahead
+            # 防止发票场景中将纯数值行（¥226.42, ¥29.43）错误前推到合计行
+            curr_non_empty = [t for t in ocr_row if t]
+            curr_types = [_classify_ocr_item_type(t) for t in curr_non_empty]
+            is_sparse_text = (
+                len(curr_non_empty) <= 2
+                and all(t == "text" for t in curr_types)
+            ) if curr_types else False
+
+            if is_sparse_text:
+                # 若下一行有标签匹配，则当前值归属于下一行所属的 VLM 行
+                next_row = ocr_grid[oi + 1]
+                next_best = None
+                next_score = 0
+                for vi in range(data_row_start, vlm_nrows):
+                    score = 0
+                    for ot in next_row:
+                        if not ot:
+                            continue
+                        ot_norm = _normalize_for_matching(ot)
+                        for vt_norm in vlm_norm[vi]:
+                            if vt_norm and (ot_norm in vt_norm or vt_norm in ot_norm):
+                                score += min(len(ot_norm), len(vt_norm))
+                    if score > next_score:
+                        next_score = score
+                        next_best = vi
+                if next_best is not None:
+                    current_vlm_row = next_best
+
+        if current_vlm_row in ocr_pool:
+            ocr_pool[current_vlm_row].extend([t for t in ocr_row if t])
+
+    return ocr_pool
+
+
+def _get_fillable_columns(
+    vlm_row: list[str],
+    vlm_tag_row: list[Tag],
+    header_types: dict[int, str],
+) -> list[tuple[int, str, str]]:
+    """找出 VLM 行中可填充的列。
+
+    Args:
+        vlm_row: 展开后的文本行。
+        vlm_tag_row: 展开后的 Tag 行。
+        header_types: 列类型映射。
+
+    Returns:
+        [(col_idx, column_type, mode), ...] 列表。
+        mode: "append"（含图片的单元格，追加值）或 "empty"（完全空的单元格）。
+    """
+    fillable = []
+    for vc in range(len(vlm_row)):
+        text = vlm_row[vc].strip()
+        cell_tag = vlm_tag_row[vc]
+        has_img = cell_tag.find("img") is not None
+        col_type = header_types.get(vc, "text")
+
+        if has_img:
+            # 含图片的单元格 → 追加 OCR 识别的值文本
+            fillable.append((vc, col_type, "append"))
+        elif not text:
+            # 纯空单元格 → 可直接填充
+            fillable.append((vc, col_type, "empty"))
+    return fillable
+
+
 def _fill_empty_cells_from_ocr_grid(
     soup: BeautifulSoup,
     table: Tag,
     ocr_grid: list[list[str]],
 ) -> bool:
-    """将 OCR 网格中的文字填充到表格中的空单元格。
+    """将 OCR 网格中的文字填充到表格中的空单元格和含图片单元格。
 
-    匹配策略：
-    1. 遍历 VLM 表格所有行，收集每个 <td> 的文本
-    2. 识别哪一行/列对应 OCR 网格的哪一行/列
-    3. 对于每个空单元格，尝试从 OCR 网格对应位置取文字填充
+    修复了三个关键问题：
+    1. 含 <img> 的行不再被误判为表头（Bug 1）
+    2. 使用标签锚点对齐 OCR 行与 VLM 行，而非简单索引映射（Bug 2）
+    3. 使用 Tag.append() 追加文本，保留已有 <img> 子元素（Bug 3）
 
     Args:
         soup: BeautifulSoup 对象。
@@ -1798,108 +2473,106 @@ def _fill_empty_cells_from_ocr_grid(
     if not rows:
         return False
 
-    # 解析 VLM 表格：收集每行的单元格文本和行列信息
-    vlm_data = []  # list[list[str]]  每行每列的文本
-    vlm_cells = []  # list[list[Tag]]  对应的 BeautifulSoup Tag
-
-    for row in rows:
-        row_cells = row.find_all(["td", "th"])
-        if not row_cells:
-            continue
-
-        row_texts = []
-        row_tags = []
-        for cell in row_cells:
-            colspan = int(cell.get("colspan", 1))
-            text = cell.get_text().strip()
-            # colspan > 1 的单元格展开（重复填入多次以对齐网格）
-            for _ in range(colspan):
-                row_texts.append(text)
-                row_tags.append(cell)
-        vlm_data.append(row_texts)
-        vlm_cells.append(row_tags)
-
-    if not vlm_data:
-        return False
-
-    # 确定 VLM 表格的列数（取最大行宽）
-
-    # 计算 OCR 网格的维度（取最大列数）
     ocr_nrows = len(ocr_grid)
     if ocr_nrows == 0:
         return False
 
-    # 跳过表头行（第一行 + 任何包含 <th> 的行）
-    data_row_start = 0
-    for i, row in enumerate(rows):
-        if row.find("th"):
-            data_row_start = i + 1
-        else:
-            # 检查第一个非表头的全文本行（类表头）
-            cells = row.find_all("td")
-            texts = [c.get_text().strip() for c in cells]
-            if texts and all(
-                len(t) < 15 and not _is_data_value(t)
-                for t in texts if t
-            ):
-                data_row_start = i + 1
+    # 1. 解析 VLM 表格结构
+    vlm_data, vlm_cells = _parse_vlm_table_structure(rows)
+    if not vlm_data:
+        return False
 
-    # 匹配：从表头推断列类型，按类型匹配 OCR 文字到空列
-    modified = False
+    # 2. 检测数据行起始（含 <img> 的行终止表头扩展）
+    data_row_start = _detect_data_row_start(rows, vlm_data)
 
-    # 第一步：从表头行推断每列的预期数据类型
-    # ['项目名称'(text), '规格型号'(text), '单位'(text), '数量'(num), '单价'(num), '金额'(num), '税率/征收率'(rate), '税额'(num)]
+    # 3. 使用标签锚点将 OCR 行对齐到 VLM 数据行
+    ocr_pool = _align_ocr_to_vlm_rows(ocr_grid, vlm_data, data_row_start)
+
+    # 4. 推断列类型
     header_types = _infer_column_types_from_header(vlm_data, vlm_cells)
+
+    # 5. 按行填充
+    modified = False
+    filled_cell_ids = set()  # 记录已填充的 Tag id，处理 colspan 重复引用
 
     for vlm_row_idx in range(data_row_start, len(vlm_data)):
         vlm_row = vlm_data[vlm_row_idx]
         vlm_tag_row = vlm_cells[vlm_row_idx]
 
-        # 映射到 OCR 网格行
-        ocr_row_idx = vlm_row_idx - data_row_start
-        if ocr_row_idx >= ocr_nrows:
-            break
-        ocr_row = ocr_grid[ocr_row_idx]
+        # 收集该 VLM 行对应的 OCR 文本（过滤已在 VLM 中存在的标签）
+        ocr_texts = ocr_pool.get(vlm_row_idx, [])
+        ocr_new: list[tuple[str, str]] = []
+        for ot in ocr_texts:
+            # 跳过已在 VLM 行中精确匹配的值
+            if any(ot == vt for vt in vlm_row if vt):
+                continue
+            item_type = _classify_ocr_item_type(ot)
+            ocr_new.append((ot, item_type))
 
-        # 找出 VLM 行中的空列及其预期类型
-        empty_columns = []  # [(col_idx, header_type)]
-        for vc in range(len(vlm_row)):
-            if not vlm_row[vc].strip():
-                col_type = header_types.get(vc, "text")
-                empty_columns.append((vc, col_type))
-
-        if not empty_columns:
+        if not ocr_new:
             continue
 
-        # 将 OCR 项分类（跳过 VLM 已存在的值）
-        ocr_new_items = []  # [(text, item_type)]
-        for ocr_text in ocr_row:
-            if not ocr_text:
-                continue
-            # 跳过已在 VLM 行中存在的值
-            if any(ocr_text == vlm_row[vc] for vc in range(len(vlm_row))):
-                continue
-            item_type = _classify_ocr_item_type(ocr_text)
-            ocr_new_items.append((ocr_text, item_type))
-
-        if not ocr_new_items:
+        # 找出可填充的列
+        fillable = _get_fillable_columns(vlm_row, vlm_tag_row, header_types)
+        if not fillable:
             continue
 
-        # 按类型匹配：OCR 项 → 同类型空列
-        for ocr_text, item_type in ocr_new_items:
-            # 找到第一个匹配类型的空列
-            for ec_idx, (vc, col_type) in enumerate(empty_columns):
-                if item_type == col_type:
+        # 匹配填充：优先将 OCR 文本填到含图片的单元格（append），再填纯空单元格
+        # 文本类 OCR 优先填 append 单元格（如姓名），数字类 OCR 可填任意匹配类型
+        # 注意：filled_cell_ids 仅对 "empty" 模式生效（防止重复填充空单元格），
+        # "append" 模式允许同一 Tag 多次追加（单 colspan 行含多个 <img> 场景）
+        for ocr_text, ocr_type in ocr_new:
+            placed = False
+            # 第一轮：文本类型 → append 模式单元格
+            if ocr_type == "text":
+                for fi, (vc, ct, mode) in enumerate(fillable):
                     cell_tag = vlm_tag_row[vc]
-                    if cell_tag.name == "th":
+                    if mode != "append":
                         continue
-                    cell_tag.string = ocr_text
+                    _append_text_to_cell(cell_tag, ocr_text)
                     modified = True
                     logger.debug(
-                        f"OCR 填充({item_type}): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
+                        f"OCR 填充(append): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
                     )
-                    empty_columns.pop(ec_idx)
+                    fillable.pop(fi)
+                    placed = True
                     break
+            if placed:
+                continue
+
+            # 第二轮：任意类型 → 同类型可填充列（优先 empty 模式）
+            for fi, (vc, ct, mode) in enumerate(fillable):
+                cell_tag = vlm_tag_row[vc]
+                if mode == "empty" and id(cell_tag) in filled_cell_ids:
+                    continue
+                if ocr_type == ct or mode == "empty":
+                    _append_text_to_cell(cell_tag, ocr_text)
+                    if mode == "empty":
+                        filled_cell_ids.add(id(cell_tag))
+                    modified = True
+                    logger.debug(
+                        f"OCR 填充({mode}): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
+                    )
+                    fillable.pop(fi)
+                    placed = True
+                    break
+            if placed:
+                continue
+
+            # 第三轮：兜底 → 任意剩余可填充列
+            for fi, (vc, ct, mode) in enumerate(fillable):
+                cell_tag = vlm_tag_row[vc]
+                if mode == "empty" and id(cell_tag) in filled_cell_ids:
+                    continue
+                _append_text_to_cell(cell_tag, ocr_text)
+                if mode == "empty":
+                    filled_cell_ids.add(id(cell_tag))
+                modified = True
+                logger.debug(
+                    f"OCR 填充(fallback): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
+                )
+                fillable.pop(fi)
+                break
 
     return modified
 
@@ -1971,6 +2644,7 @@ def _classify_ocr_item_type(text: str) -> str:
 def supplement_vlm_table_cells_with_ocr(
     pdf_info_list: list,
     hybrid_pipeline_model,
+    image_writer=None,
 ) -> None:
     """使用 Pipeline OCR 识别结果补充 VLM 表格 HTML 中的空单元格。
 
@@ -1986,7 +2660,11 @@ def supplement_vlm_table_cells_with_ocr(
     Args:
         pdf_info_list: 中间 JSON 的页面列表。
         hybrid_pipeline_model: Hybrid pipeline 模型实例（含 ocr_model）。
+        image_writer: 可选的 FileBasedDataWriter，用于解析图片相对路径。
+            若提供且图片加载失败，会尝试从 image_writer 的根目录读取。
     """
+    import os
+
     import cv2
     from bs4 import BeautifulSoup
     from mineru.backend.utils.para_block_utils import iter_block_spans
@@ -2017,7 +2695,14 @@ def supplement_vlm_table_cells_with_ocr(
                         not cell.get_text().strip()
                         for cell in table.find_all("td")
                     )
-                    if not has_empty:
+                    # 检查是否存在含 <img> 的单元格
+                    #（VLM 无法识别手写/签章文字时将其渲染为图片，
+                    #   即使 get_text() 有标签文字，也需要 OCR 补充值文本）
+                    has_img = any(
+                        cell.find("img") is not None
+                        for cell in table.find_all("td")
+                    )
+                    if not has_empty and not has_img:
                         continue
                 except Exception:
                     continue
@@ -2030,6 +2715,12 @@ def supplement_vlm_table_cells_with_ocr(
 
                 try:
                     table_img = cv2.imread(image_path)
+                    if table_img is None:
+                        # 图片路径可能为相对路径（如仅 hash 文件名），
+                        # 尝试通过 image_writer 的根目录解析完整路径
+                        if image_writer is not None and hasattr(image_writer, '_parent_dir'):
+                            full_path = os.path.join(image_writer._parent_dir, image_path)
+                            table_img = cv2.imread(full_path)
                     if table_img is None:
                         skipped_count += 1
                         continue

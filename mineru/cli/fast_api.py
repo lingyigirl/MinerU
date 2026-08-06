@@ -66,13 +66,12 @@ from mineru.utils.config_reader import (
     get_processing_window_size,
 )
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
+from mineru.utils.log_utils import init_root_logger
 from mineru.utils.pdf_image_tools import shutdown_pdf_render_executor
 from mineru.version import __version__
 
 os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
-log_level = os.getenv("MINERU_LOG_LEVEL", "INFO").upper()
-logger.remove()
-logger.add(sys.stderr, level=log_level)
+init_root_logger("mineru_api")
 
 TASK_PENDING = "pending"
 TASK_PROCESSING = "processing"
@@ -162,6 +161,11 @@ class AsyncParseTask:
     end_page_id: int
     upload_names: list[str]
     uploads: list[str]
+    # [自定义] 多引擎路由参数
+    doc_type: str = "auto"
+    kvp_engine: str = "qwen-vl-max"
+    kvp_server_url: Optional[str] = None
+    kvp_verify_engine: Optional[str] = None
     submit_order: int = 0
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -453,8 +457,13 @@ def build_result_dict(
             logger.warning(f"Unknown backend type: {backend}, skipping {pdf_name}")
             continue
 
+        # [自定义] KVP Pipeline 回退：当标准目录不存在时，检查 kvp/ 目录
         if not os.path.exists(parse_dir):
-            continue
+            kvp_fallback = os.path.join(output_dir, pdf_name, "kvp")
+            if os.path.exists(kvp_fallback):
+                parse_dir = kvp_fallback
+            else:
+                continue
 
         if return_md:
             data["md_content"] = get_infer_result(".md", pdf_name, parse_dir)
@@ -510,7 +519,12 @@ def create_result_zip(
                 continue
 
             if not os.path.exists(parse_dir):
-                continue
+                # [自定义] KVP Pipeline 回退
+                kvp_fallback = os.path.join(output_dir, pdf_name, "kvp")
+                if os.path.exists(kvp_fallback):
+                    parse_dir = kvp_fallback
+                else:
+                    continue
 
             if return_md:
                 path = os.path.join(parse_dir, f"{pdf_name}.md")
@@ -568,6 +582,18 @@ def create_result_zip(
                             pdf_name,
                             parse_dir,
                             f"{pdf_name}_content_list_v2.json",
+                        ),
+                    )
+
+                # [自定义] content_list 兼容格式（v1 扁平 + v2 增强字段）
+                path = os.path.join(parse_dir, f"{pdf_name}_content_list_compatibility.json")
+                if os.path.exists(path):
+                    zf.write(
+                        path,
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            f"{pdf_name}_content_list_compatibility.json",
                         ),
                     )
 
@@ -850,6 +876,11 @@ async def run_parse_job(
         f_dump_content_list=request_options.return_content_list,
         start_page_id=request_options.start_page_id,
         end_page_id=request_options.end_page_id,
+        # [自定义] 多引擎路由参数
+        doc_type=getattr(request_options, "doc_type", "auto"),
+        kvp_engine=getattr(request_options, "kvp_engine", "qwen-vl-max"),
+        kvp_server_url=getattr(request_options, "kvp_server_url", None),
+        kvp_verify_engine=getattr(request_options, "kvp_verify_engine", None),
         **config,
     )
 
@@ -901,6 +932,11 @@ async def create_async_parse_task(
             return_original_file=request_options.return_original_file,
             start_page_id=request_options.start_page_id,
             end_page_id=request_options.end_page_id,
+            # [自定义] 多引擎路由参数
+            doc_type=request_options.doc_type,
+            kvp_engine=request_options.kvp_engine,
+            kvp_server_url=request_options.kvp_server_url,
+            kvp_verify_engine=request_options.kvp_verify_engine,
             upload_names=[upload.original_name for upload in uploads],
             uploads=[upload.path for upload in uploads],
         )

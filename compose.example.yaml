@@ -58,8 +58,15 @@ services:
       MINERU_PROCESSING_WINDOW_SIZE: "64"
       # API 输出目录（可选，默认为临时目录）
       # MINERU_API_OUTPUT_ROOT: /opt/mineru/output
-      # 日志级别（可选，默认 INFO）
+      # ---- 日志配置 ----
+      # 日志级别，可选: TRACE | DEBUG | INFO | SUCCESS | WARNING | ERROR | CRITICAL（默认 INFO）
       # MINERU_LOG_LEVEL: INFO
+      # 日志文件存放目录（默认 ~/mineru），文件日志默认开启
+      # MINERU_LOG_DIR: /opt/mineru
+      # 关闭文件日志，仅保留 stderr 输出（Docker 部署推荐 false，通过 docker compose logs 查看）
+      MINERU_LOG_FILE_ENABLE: "false"
+      # 分模块日志级别，格式: 包名=级别,...（可选，噪声包默认已屏蔽为 WARNING）
+      # MINERU_LOG_LEVELS: urllib3=ERROR,httpx=WARNING
       # 限制可见 GPU（可选，等价于 nvidia 运行时环境变量）
       # CUDA_VISIBLE_DEVICES: "0"
 

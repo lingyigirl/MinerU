@@ -51,6 +51,7 @@ def regenerate_client_side_outputs(
     markdown_path = parse_dir / f"{doc_stem}.md"
     content_list_path = parse_dir / f"{doc_stem}_content_list.json"
     content_list_v2_path = parse_dir / f"{doc_stem}_content_list_v2.json"
+    content_list_compat_path = parse_dir / f"{doc_stem}_content_list_compatibility.json"
 
     if not middle_json_path.exists():
         raise FileNotFoundError(f"Missing middle json file: {middle_json_path}")
@@ -86,6 +87,11 @@ def regenerate_client_side_outputs(
         content_list_v2_path,
         make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir),
     )
+    # [自定义] 兼容格式：v1 扁平结构（含 page_idx）+ v2 增强字段
+    _write_json(
+        content_list_compat_path,
+        make_func(pdf_info, MakeMode.CONTENT_LIST_COMPATIBILITY, image_dir),
+    )
     if backend in PDF_BACKENDS:
         _write_json(middle_json_path, middle_json)
 
@@ -94,4 +100,5 @@ def regenerate_client_side_outputs(
         markdown_path,
         content_list_path,
         content_list_v2_path,
+        content_list_compat_path,
     )

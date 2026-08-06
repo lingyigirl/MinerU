@@ -35,6 +35,11 @@ class ParseRequestOptions:
     return_original_file: bool
     start_page_id: int
     end_page_id: int
+    # [自定义] 多引擎路由参数
+    doc_type: str
+    kvp_engine: Optional[str]
+    kvp_server_url: Optional[str]
+    kvp_verify_engine: Optional[str]
 
 
 def validate_parse_method(parse_method: str) -> str:
@@ -163,6 +168,44 @@ async def parse_request_form(
         int,
         Form(description="The ending page for PDF parsing, beginning from 0"),
     ] = 99999,
+    # [自定义] 多引擎路由参数 -- 合并上游时注意保留
+    doc_type: Annotated[
+        str,
+        Form(
+            description="""Document classification mode:
+- auto: Run S0/S1 quality analysis and classification (logs only, same result as general)
+- general: Force MinerU general-purpose parsing via hybrid-auto-engine (default, fastest)
+- form_kvp: Force KVP pipeline for receipt/certificate KVP extraction""",
+        ),
+    ] = "general",
+    kvp_engine: Annotated[
+        Optional[str],
+        Form(
+            description="""KVP extraction engine (only used when doc_type=form_kvp):
+- pp-structure (default): Local OCR + rule-based KVP pairing, offline-ready
+- qwen-vl-max: Alibaba DashScope API, highest accuracy, cloud
+- qwen-vl-plus: Alibaba DashScope API, faster, cloud
+- qwen-vl-local: Local vLLM Qwen2.5-VL-7B
+- internvl-local: Local LMDeploy InternVL2.5-8B
+Leave empty to use KVP_ENGINE env var or default.""",
+        ),
+    ] = None,
+    kvp_server_url: Annotated[
+        Optional[str],
+        Form(
+            description="Custom KVP engine API endpoint. "
+            "Overrides the default URL for local deployments. "
+            "e.g., http://localhost:30001/v1",
+        ),
+    ] = None,
+    kvp_verify_engine: Annotated[
+        Optional[str],
+        Form(
+            description="Optional VLM engine to verify high-value KVP fields. "
+            "Only used when kvp_engine=pp-structure. "
+            "e.g., qwen-vl-max for amount/name verification.",
+        ),
+    ] = None,
 ) -> ParseRequestOptions:
     """解析 API/Router 共用的 multipart 表单，并保持 Swagger 参数同源。"""
     validate_public_http_client_request(
@@ -194,4 +237,9 @@ async def parse_request_form(
         return_original_file=effective_return_original_file,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
+        # [自定义] 多引擎路由参数
+        doc_type=doc_type,
+        kvp_engine=kvp_engine,
+        kvp_server_url=kvp_server_url,
+        kvp_verify_engine=kvp_verify_engine,
     )

@@ -21,6 +21,7 @@ from mineru.utils.config_reader import (
     get_max_concurrent_requests as read_max_concurrent_requests,
 )
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
+from mineru.utils.log_utils import init_root_logger
 from mineru.utils.pdf_page_id import get_end_page_id
 from mineru.utils.pdfium_guard import (
     close_pdfium_document,
@@ -45,7 +46,6 @@ from mineru.cli.visualization import (
 )
 
 os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
-log_level = os.getenv("MINERU_LOG_LEVEL", "INFO").upper()
 
 @dataclass(frozen=True)
 class InputDocument:
@@ -255,8 +255,7 @@ def create_live_task_status_renderer(
 
 
 _stderr_sink = LiveAwareStderrSink(sys.stderr)
-logger.remove()
-logger.add(_stderr_sink, level=log_level)
+init_root_logger("mineru_cli", console_sink=_stderr_sink)
 
 
 def build_http_timeout() -> httpx.Timeout:
