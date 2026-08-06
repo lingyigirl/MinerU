@@ -120,6 +120,22 @@ curl http://localhost:8011/health                 # 健康检查
 
 **Docker 开发工作流**：`compose.yaml` 将 `mineru/` 源码以卷方式覆盖安装包，因此代码修改只需 `docker compose restart`（无需重新构建）。仅当 `pyproject.toml` 依赖变更时才需重新构建（`bash build-docker.sh && docker compose up -d`）。
 
+### 部署
+
+`deploy/` 目录包含生产部署相关物料：
+
+```bash
+deploy/
+├── docker-image-upgrade-guide.md               # Docker 镜像升级实战指南（含坑点速查表）
+├── mineru-3.4.4-offline-deployment-guide.md    # 离线环境从零到一部署完整指南
+├── compose-prod.yaml                            # 生产环境 Docker Compose 模板（零挂载）
+├── check_server_env.sh                          # 服务器环境一键检查脚本
+├── build-offline-package.sh                     # 离线物料一键打包脚本（镜像+模型+配置）
+└── README-internal-deploy.md                    # 内网运维人员操作卡（7步部署）
+```
+
+此外还有 `offline-package/` 目录（`build-offline-package.sh` 产出），包含 Docker 镜像 tar、模型 tar 和配置文件模板，用于内网离线部署。
+
 compose.yaml 关键路径：
 
 - 容器名：`mineru-zhangbo`，端口 `8011:8000`
@@ -373,7 +389,27 @@ fi
 
 ## Git 工作流
 
-- `develop` — 团队工作分支（在上游基础上叠加自定义修改）
-- `master` — 上游跟踪分支（`opendatalab/MinerU`）
-- 合并：`upstream/master` → `develop`（冲突时以团队修改为准）
+### 分支定义
+
+| 分支 | 职责 | 直接提交？ |
+|---|---|---|
+| `master` | 上游 `opendatalab/MinerU` 镜像，仅从 upstream 拉取 | ❌ |
+| `develop` | 团队主干，所有功能开发最终合入目标 | ✅ |
+| `feature/*` | 功能开发分支，从 `develop` 切出，合回 `develop` | ✅ |
+| `release*` | 发布快照，从 `develop` 切出后冻结 | 仅部署物料 |
+
+### release 分支规范
+
+1. **release 分支是 develop 的快照**：当 develop 达到可发布状态时切出
+2. **release 分支只做打包，不写功能代码**：
+   - 允许：版本号冻结、部署物料（`deploy/`、`offline-package/`）、构建脚本调整
+   - 禁止：源码修改、pyproject.toml 依赖变更、Dockerfile 逻辑改动
+3. **release 上的必要改动必须回合到 develop**：如果在 release 分支上发现了必须修复的问题，修复后必须 cherry-pick 回合 `develop`，保持 `develop` 为唯一真实来源
+4. **部署物料应存在于 develop**：`deploy/` 目录在 develop 上维护，release 分支继承即可，不应只在 release 分支存在
+
+### 日常操作
+
+- 新功能：`develop` → `feature/xxx` → `develop`
+- 合并上游：`upstream/master` → `develop`（冲突时以团队修改为准）
+- 发布：`develop` → `releaseX.Y.Z`（打包）→ 打 tag → 部署
 - Fork 版本号：`mineru/version.py` → `__version__ = "3.4.4"`
