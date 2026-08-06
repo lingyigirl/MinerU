@@ -63,3 +63,4 @@ agents_logs/
 compose.yaml
 mineru.json
 data/*
+.claude/
