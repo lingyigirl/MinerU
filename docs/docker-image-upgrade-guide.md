@@ -147,7 +147,7 @@ curl -X POST http://localhost:8011/file_parse \
 
 ```bash
 # 改回旧镜像版本
-# compose.yaml: image: mineru:5.0.0 → image: mineru:4.2.0
+# compose.yaml: image: mineru:5.0.0 → image: mineru:3.4.4
 docker compose down && docker compose up -d
 ```
 

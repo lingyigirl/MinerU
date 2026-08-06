@@ -9,6 +9,7 @@
 ## 常用命令
 
 ### 安装
+
 ```bash
 pip install -e ".[core]"    # 核心：vlm + pipeline + gradio
 pip install -e ".[all]"     # 全部后端（含平台相关：vllm/linux, lmdeploy/windows, mlx/macOS）
@@ -22,6 +23,7 @@ pip install -e ".[gradio]"  # 仅 Gradio Web UI
 ```
 
 ### 运行 MinerU
+
 ```bash
 # CLI（未指定 --api-url 时自动启动本地 API 子进程）
 mineru -p input.pdf -o output_dir                    # -p/--path（必填），-o/--output（必填）
@@ -63,9 +65,13 @@ mineru-models-download -s huggingface -m all    # -s: huggingface|modelscope, -m
 ```
 
 ### 测试
+
 ```bash
 pytest tests/unittest/test_e2e.py                    # E2E 测试（需要 tests/unittest/pdfs/ 下的测试 PDF）
 pytest tests/                                         # 全部测试（含根目录 test_*.py 文件）
+pytest tests/ -x                                      # 遇错即停
+pytest tests/ -k "test_table"                         # 按名称模式筛选
+pytest tests/test_table_methods.py::test_func_name    # 运行单个测试函数
 pytest tests/test_make_blocks_to_content_list_2.py    # content_list_v2 专项测试
 pytest tests/test_table_methods.py                    # 表格提取测试
 pytest --cov=mineru --cov-report html                 # 带覆盖率（pyproject.toml 中已默认配置）
@@ -79,6 +85,7 @@ python -c "from mineru.utils.custom import *; print('import ok')"
 测试 PDF 素材：`tests/unittest/pdfs/test.pdf`。
 
 ### 代码检查 / 类型检查
+
 ```bash
 # CI 中未配置正式 linter。遵循 .claudecode-rules.md 规范：
 # - Google 风格 docstring + 类型标注
@@ -87,6 +94,7 @@ python -c "from mineru.utils.custom import *; print('import ok')"
 ```
 
 ### CI（GitHub Actions）
+
 - `cli.yml` — 在 master/dev 分支 push 时运行 `coverage run`（`mineru[test]`，超时 240 分钟）
 - `python-package.yml` — tag 推送时构建 wheel，发布到 PyPI + GitHub Releases（Python 3.10-3.13 矩阵）
 - `cla.yml` — PR 时强制 CLA 签署
@@ -95,6 +103,7 @@ python -c "from mineru.utils.custom import *; print('import ok')"
 - 未配置 pre-commit hooks
 
 ### Docker
+
 ```bash
 bash build-docker.sh                              # 构建镜像（mineru:custom），依赖变更时需重新构建
 docker compose up -d                              # 启动服务（参见 compose.yaml）
@@ -112,6 +121,7 @@ curl http://localhost:8011/health                 # 健康检查
 **Docker 开发工作流**：`compose.yaml` 将 `mineru/` 源码以卷方式覆盖安装包，因此代码修改只需 `docker compose restart`（无需重新构建）。仅当 `pyproject.toml` 依赖变更时才需重新构建（`bash build-docker.sh && docker compose up -d`）。
 
 compose.yaml 关键路径：
+
 - 容器名：`mineru-zhangbo`，端口 `8011:8000`
 - 源码挂载：`/zhangbo/MinerU/mineru` → `/usr/local/lib/python3.12/dist-packages/mineru`
 - 配置挂载：`/zhangbo/MinerU/mineru.json` → `/root/mineru.json`
@@ -125,15 +135,16 @@ compose.yaml 关键路径：
 
 MinerU 拥有**三种本地后端**和两种对应的 HTTP 客户端后端，通过 `-b` / `--backend` 选择：
 
-| 后端 | 说明 |
-|---|---|
-| `pipeline` | 传统 CV/OCR 管线：布局检测 → OCR → 公式/表格识别。需要 `mineru[pipeline]`（torch）。速度快，显存占用低。 |
-| `vlm-engine` | 视觉语言模型（MinerU2.5-Pro）直接解析页面。需要 `mineru[vlm]`。复杂版面精度最高。 |
-| `hybrid-engine` | **默认。** 组合 pipeline + VLM：VLM 做语义布局，pipeline 精炼 OCR/公式/表格，精度更高。 |
-| `vlm-http-client` | 轻量客户端，连接远程 `mineru-api`（VLM 模式）。无需本地 torch。 |
-| `hybrid-http-client` | 轻量客户端，连接远程 `mineru-api`（hybrid 模式）。 |
+| 后端                   | 说明                                                                                                        |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `pipeline`           | 传统 CV/OCR 管线：布局检测 → OCR → 公式/表格识别。需要`mineru[pipeline]`（torch）。速度快，显存占用低。 |
+| `vlm-engine`         | 视觉语言模型（MinerU2.5-Pro）直接解析页面。需要`mineru[vlm]`。复杂版面精度最高。                          |
+| `hybrid-engine`      | **默认。** 组合 pipeline + VLM：VLM 做语义布局，pipeline 精炼 OCR/公式/表格，精度更高。               |
+| `vlm-http-client`    | 轻量客户端，连接远程`mineru-api`（VLM 模式）。无需本地 torch。                                            |
+| `hybrid-http-client` | 轻量客户端，连接远程`mineru-api`（hybrid 模式）。                                                         |
 
 VLM 推理可由以下三种后端之一提供服务（自动检测或手动配置）：
+
 - **vLLM**（Linux，默认）—— NVIDIA GPU 最高吞吐量
 - **LMDeploy**（Windows）—— 替代推理引擎
 - **MLX-VLM**（macOS/Apple Silicon）—— 通过 `mineru[mlx]`
@@ -168,13 +179,14 @@ PDF 字节流
 
 三种运行模式：
 
-| 模式 | engine 参数 | 说明 |
-|---|---|---|
-| 纯本地 | `pp-structure` | PaddleOCR + 空间距离配对 + 标签词典，**离线可用** |
-| 本地 + VLM 纠错 | `pp-structure` + `verify_engine` | 本地提取为主，VLM 二次验证金额/姓名/日期等高价值字段 |
-| 纯 VLM | `qwen-vl-max` / `qwen-vl-plus` | 远程 VLM API（需外网），精度最高 |
+| 模式            | engine 参数                          | 说明                                                    |
+| --------------- | ------------------------------------ | ------------------------------------------------------- |
+| 纯本地          | `pp-structure`                     | PaddleOCR + 空间距离配对 + 标签词典，**离线可用** |
+| 本地 + VLM 纠错 | `pp-structure` + `verify_engine` | 本地提取为主，VLM 二次验证金额/姓名/日期等高价值字段    |
+| 纯 VLM          | `qwen-vl-max` / `qwen-vl-plus`   | 远程 VLM API（需外网），精度最高                        |
 
 本地引擎（`kvp_local_engine.py`）支持 5 种文档布局：
+
 - **A**：冒号分隔（"标签：值"）
 - **B**：无分隔符拼接（正则拆分，如 "客户号10198594700"）
 - **C**：网格布局（表头行 → 数据行，含 C0 预拆分阶段）
@@ -184,6 +196,7 @@ PDF 字节流
 标签词典（`labels/`）按文档类型自动匹配：`deposit_slip`（存单）、`invoice`（发票）、`generic`（通用）。
 
 关键环境变量：
+
 - `KVP_ENGINE`：默认 KVP 引擎（默认 `pp-structure`）
 - `KVP_SERVER_URL`：自定义 VLM API 地址
 - `KVP_VERIFY_ENGINE`：VLM 纠错引擎（如 `qwen-vl-max`）
@@ -258,6 +271,7 @@ PDF/图片/DOCX/PPTX/XLSX
 ### 中央分发（`mineru/cli/common.py`）
 
 `do_parse()` / `aio_do_parse()` 是中央路由函数，分发到正确的后端：
+
 1. Office 文件（docx/pptx/xlsx）→ `office_*_analyze` 直接处理（无需 PDF 转换）
 2. `pipeline` 后端 → `PipelineMagicModel`（本地）
 3. `vlm-*` 后端 → `VlmMagicModel`（本地）或 VLM HTTP 客户端（远程）
@@ -277,17 +291,18 @@ PDF/图片/DOCX/PPTX/XLSX
 3. 保持 hook 小巧且隔离；所有逻辑位于 custom 模块中
 
 当前自定义模块：
-| 模块 | 用途 |
-|---|---|
-| `mineru/utils/custom/pdf_utils.py` | `generate_rotation_corrected_pdf()` — PDF 旋转修正 |
-| `mineru/utils/custom/content_list_utils.py` | `enrich_list_items_with_bbox()` — content_list_v2 中每个 list_item 独立 bbox |
-| `mineru/utils/custom/table_utils.py` | `split_merged_table_cells()`、`split_summary_from_data_cell()`、`normalize_table_colspan()`、`normalize_invoice_table()` — VLM 表格后处理全套管道 |
-| `mineru/utils/custom/doc_quality.py` | `DocumentQuality`、`analyze_document_quality()` — S0 文档质量分析（DPI/模糊/印章/旋转检测） |
-| `mineru/utils/custom/doc_classifier.py` | `DocType`、`classify_document()` — S1 文档分类器（"信号灯"三路路由：通用/表格/KVP 表单） |
-| `mineru/utils/custom/engine_factory.py` | `EngineRoute`、`select_engine_route()` — 引擎工厂 + 策略选择器（自动选择最优解析引擎） |
-| `mineru/utils/custom/kvp_extractor.py` | `extract_kvp_from_form()` — KVP Pipeline 主入口（本地 OCR + VLM + 混合纠错） |
-| `mineru/utils/custom/kvp_local_engine.py` | `extract_kvp_local()` — 本地 KVP 提取引擎（PaddleOCR + 空间距离配对 + 可插拔标签词典） |
-| `mineru/utils/custom/labels/` | KVP 标签词典注册表（`deposit_slip.py`、`invoice.py`、`generic.py`），按文档类型自动匹配 |
+
+| 模块                                          | 用途                                                                                                                                                       |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mineru/utils/custom/pdf_utils.py`          | `generate_rotation_corrected_pdf()` — PDF 旋转修正                                                                                                      |
+| `mineru/utils/custom/content_list_utils.py` | `enrich_list_items_with_bbox()` — content_list_v2 中每个 list_item 独立 bbox                                                                            |
+| `mineru/utils/custom/table_utils.py`        | `split_merged_table_cells()`、`split_summary_from_data_cell()`、`normalize_table_colspan()`、`normalize_invoice_table()` — VLM 表格后处理全套管道 |
+| `mineru/utils/custom/doc_quality.py`        | `DocumentQuality`、`analyze_document_quality()` — S0 文档质量分析（DPI/模糊/印章/旋转检测）                                                           |
+| `mineru/utils/custom/doc_classifier.py`     | `DocType`、`classify_document()` — S1 文档分类器（"信号灯"三路路由：通用/表格/KVP 表单）                                                              |
+| `mineru/utils/custom/engine_factory.py`     | `EngineRoute`、`select_engine_route()` — 引擎工厂 + 策略选择器（自动选择最优解析引擎）                                                                |
+| `mineru/utils/custom/kvp_extractor.py`      | `extract_kvp_from_form()` — KVP Pipeline 主入口（本地 OCR + VLM + 混合纠错）                                                                            |
+| `mineru/utils/custom/kvp_local_engine.py`   | `extract_kvp_local()` — 本地 KVP 提取引擎（PaddleOCR + 空间距离配对 + 可插拔标签词典）                                                                  |
+| `mineru/utils/custom/labels/`               | KVP 标签词典注册表（`deposit_slip.py`、`invoice.py`、`generic.py`），按文档类型自动匹配                                                              |
 
 将上游 master 合并到 `develop` 时，冲突主要局限于这些标注的 hook 点。
 
@@ -295,59 +310,44 @@ PDF/图片/DOCX/PPTX/XLSX
 
 以下文件包含 `[自定义]` hook 点。上游合并时，**以 hook 代码为准**解决冲突：
 
-| 文件 | 大致行号 | Hook 用途 |
-|---|---|---|
-| `mineru/cli/common.py` | ~260 | 输出时生成旋转修正后的 PDF |
-| `mineru/cli/common.py` | ~641, ~1035 | S0 → S1 智能路由系统（`_try_smart_routing` / `do_parse`） |
-| `mineru/cli/fast_api.py` | ~164, ~867 | 多引擎路由参数（`AsyncParseTask` / `run_parse_job`） |
-| `mineru/cli/fast_api.py` | ~460, ~522 | KVP Pipeline 回退（标准目录不存在时检查 kvp/ 目录） |
-| `mineru/cli/fast_api.py` | ~607 | ZIP 下载中包含 `_rotated.pdf` |
-| `mineru/cli/api_request.py` | ~38, ~171, ~240 | KVP 多引擎路由参数（`doc_type` / `kvp_engine` / `kvp_verify_engine`） |
-| `mineru/backend/vlm/vlm_middle_json_mkcontent.py` | ~59 | VLM 表格 HTML 后处理：拆分合并单元格 + 合计标签分离 + 发票表格 colspan 规范化与缺失值推断 |
-| `mineru/backend/vlm/vlm_middle_json_mkcontent.py` | ~915 | content_list_v2 中为 list_items 注入独立 bbox |
-| `mineru/backend/hybrid/hybrid_model_output_to_middle_json.py` | ~262 | Hybrid 模式使用 Pipeline OCR 补充 VLM 表格空单元格 |
-| `mineru/backend/hybrid/hybrid_model_output_to_middle_json.py` | ~275 | Hybrid 模式 Image 块 OCR 回退（VLM 误判为 image 的区域做 OCR 兜底） |
-| `mineru/utils/pdf_image_tools.py` | ~601 | 旋转检测使用 `PaddleOrientationClsModel`（上游更换了模型类） |
-| `mineru/backend/hybrid/hybrid_analyze.py` | ~737, ~886 | 解析入口处对 PDF 做整体旋转修正后再打开（同步/异步路径） |
-| `mineru/backend/vlm/vlm_analyze.py` | ~442, ~542 | 解析入口处对 PDF 做整体旋转修正后再打开（同步/异步路径） |
+| 文件                                                            | 大致行号        | Hook 用途                                                                                 |
+| --------------------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------- |
+| `mineru/cli/common.py`                                        | ~260            | 输出时生成旋转修正后的 PDF                                                                |
+| `mineru/cli/common.py`                                        | ~641, ~1035     | S0 → S1 智能路由系统（`_try_smart_routing` / `do_parse`）                            |
+| `mineru/cli/fast_api.py`                                      | ~164, ~867      | 多引擎路由参数（`AsyncParseTask` / `run_parse_job`）                                  |
+| `mineru/cli/fast_api.py`                                      | ~460, ~522      | KVP Pipeline 回退（标准目录不存在时检查 kvp/ 目录）                                       |
+| `mineru/cli/fast_api.py`                                      | ~607            | ZIP 下载中包含`_rotated.pdf`                                                            |
+| `mineru/cli/api_request.py`                                   | ~38, ~171, ~240 | KVP 多引擎路由参数（`doc_type` / `kvp_engine` / `kvp_verify_engine`）               |
+| `mineru/backend/vlm/vlm_middle_json_mkcontent.py`             | ~59             | VLM 表格 HTML 后处理：拆分合并单元格 + 合计标签分离 + 发票表格 colspan 规范化与缺失值推断 |
+| `mineru/backend/vlm/vlm_middle_json_mkcontent.py`             | ~915            | content_list_v2 中为 list_items 注入独立 bbox                                             |
+| `mineru/backend/hybrid/hybrid_model_output_to_middle_json.py` | ~262            | Hybrid 模式使用 Pipeline OCR 补充 VLM 表格空单元格                                        |
+| `mineru/backend/hybrid/hybrid_model_output_to_middle_json.py` | ~275            | Hybrid 模式 Image 块 OCR 回退（VLM 误判为 image 的区域做 OCR 兜底）                       |
+| `mineru/utils/pdf_image_tools.py`                             | ~601            | 旋转检测使用`PaddleOrientationClsModel`（上游更换了模型类）                             |
+| `mineru/backend/hybrid/hybrid_analyze.py`                     | ~737, ~886      | 解析入口处对 PDF 做整体旋转修正后再打开（同步/异步路径）                                  |
+| `mineru/backend/vlm/vlm_analyze.py`                           | ~442, ~542      | 解析入口处对 PDF 做整体旋转修正后再打开（同步/异步路径）                                  |
 
 ## Plan 归档机制
 
 每次使用计划模式（`EnterPlanMode` → `ExitPlanMode`）后，**必须在对话结束前**将产生的 plan 文件归档到项目目录。
 
-**执行时机**：`ExitPlanMode` 获得用户批准后，或对话即将结束时。
+详细归档流程（目录结构、命名规则、元数据模板）见 `.claudecode-rules.md` §12.7。
 
-**归档操作**：
+**快速归档命令**：
+
 ```bash
-# 按日期建立子目录，同一天的 plan 文件放在同一目录下
 date_dir=$(date +%Y-%m-%d)
 mkdir -p agents_logs/plans/${date_dir}
-# 命名规则：日期_描述性名称.md（如 2026-07-29_kvp-独立span-bbox.md）
-# 描述需简洁反映 plan 的核心内容，不使用 Claude 内部随机名
 latest=$(ls -t /root/.claude/plans/*.md 2>/dev/null | head -1)
 if [ -n "$latest" ]; then
-    # 取描述性名称 — 由执行者根据 plan 内容手动命名
     desc_name="<核心描述>.md"
     cp "$latest" "agents_logs/plans/${date_dir}/${date_dir}_${desc_name}"
     echo "已归档: agents_logs/plans/${date_dir}/${date_dir}_${desc_name}"
 fi
 ```
 
-**元数据要求**：归档后使用 Edit 工具在文件**头部插入**以下可见的元数据节：
+归档后使用 Edit 工具在文件头部插入元数据节（模板见 `.claudecode-rules.md` §12.7）。
 
-```markdown
-> **归档时间**: YYYY-MM-DD HH:MM
-> **来源文件**: <原始 Claude plan 文件名>
-> **项目版本**: 4.2.0
-> **Git 分支**: <当前分支>
-> **原因**: <一句话说明为什么要做这个 plan>
-> **背景**: <问题背景，2-3 句话>
-> **结论**: <plan 达成的决策或实施方案概要>
-
----
-```
-
-**再次强调**：此操作必须在每次对话结束前完成。归档文件缺乏元数据或有遗漏时，应在下次对话中补全。
+> 此操作必须在每次对话结束前完成。归档文件缺乏元数据或有遗漏时，应在下次对话中补全。
 
 ## `.claudecode-rules.md` 关键规则摘要
 
@@ -365,6 +365,7 @@ fi
 ## 开发者文档
 
 `docs/zh/dev/` 下的中文架构文档：
+
 - `项目架构全览.md` — 架构总览
 - `架构说明.md` — 架构说明
 - `接口说明.md` — API/接口文档
@@ -375,4 +376,4 @@ fi
 - `develop` — 团队工作分支（在上游基础上叠加自定义修改）
 - `master` — 上游跟踪分支（`opendatalab/MinerU`）
 - 合并：`upstream/master` → `develop`（冲突时以团队修改为准）
-- Fork 版本号：`mineru/version.py` → `__version__ = "4.2.0"`（与上游 3.4.0 区分）
+- Fork 版本号：`mineru/version.py` → `__version__ = "3.4.4"`
