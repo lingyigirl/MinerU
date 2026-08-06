@@ -3,27 +3,78 @@
 > **适用版本**: MinerU 3.4.4
 > **部署方式**: Docker + Docker Compose（离线环境）
 > **适用场景**: 无法访问互联网的生产服务器
-> **预计耗时**: 30-60 分钟（含镜像构建）
 > **前置条件**: 一台有网络的构建机 + 一台生产服务器
 
 ---
 
-## 零、部署前必读
+## 选择你的部署路径
 
-### 0.1 文档导航
+本指南提供两种打包路径，根据你的情况选择：
 
-本指南覆盖从零到一的完整部署流程。如果你已经完成了某个步骤，可直接跳到对应章节：
+| 路径 | 适用场景 | 预计耗时 | 跳转到 |
+|------|---------|---------|--------|
+| **A: 一键打包** | 你**已经有**一台能访问外网的 MinerU 服务器（已装好 Docker、下载好模型），想快速打包传到内网 | 15-20 分钟 | [场景 A](#场景-a从已有服务器一键打包推荐) |
+| **B: 从零构建** | 你**没有**现成的 MinerU 服务器，需要从零下载源码、构建镜像、下载模型 | 30-60 分钟 | [场景 B](#场景-b从零构建) |
 
-| 步骤 | 内容 | 在哪里执行 |
-|------|------|----------|
-| 第一步 | 服务器环境检查 | 生产服务器 |
+> **推荐**：如果你当前就在 `/zhangbo/MinerU` 目录下且已部署过 MinerU，直接走场景 A。
+
+---
+
+## 场景 A：从已有服务器一键打包（推荐）
+
+> **适用条件**：当前服务器已有 Docker、MinerU 源码（release3.4.4 分支）、模型已下载。
+
+### A.1 一键打包
+
+```bash
+cd /zhangbo/MinerU
+git checkout release3.4.4
+bash deploy/build-offline-package.sh
+```
+
+脚本会自动完成：
+1. 构建 Docker 镜像（如源文件无变化则复用已有）
+2. 导出 `mineru-3.4.4-upstream.tar.gz`
+3. 打包 `mineru-models-3.4.4.tar.gz`
+4. 汇总 compose + config + 检查脚本
+
+产物在 `offline-package/` 目录。
+
+### A.2 传输到内网服务器
+
+```bash
+# 整个目录传过去
+scp -r offline-package/ root@内网服务器IP:/data/
+```
+
+### A.3 在内网服务器上操作
+
+后续步骤与场景 B 的第四至十章完全相同。只需按照 `offline-package/README-internal-deploy.md` 操作即可，共 7 步、约 15 分钟。
+
+> `offline-package/` 目录中的 `README-internal-deploy.md` 是一份**面向内网运维的简化操作卡**，可直接给内网同事使用。
+
+---
+
+## 场景 B：从零构建
+
+> **适用条件**：没有现成的 MinerU 环境，需要从头下载源码和模型。
+
+### B.0 部署前必读
+
+#### 文档导航
+
+场景 B 覆盖从零到一的完整部署流程：
+
+| 步骤   | 内容                            | 在哪里执行       |
+| ------ | ------------------------------- | ---------------- |
+| 第一步 | 服务器环境检查                  | 生产服务器       |
 | 第二步 | 物料准备（构建镜像 + 下载模型） | 构建机（有网络） |
-| 第三步 | 传输物料到服务器 | 任意 |
-| 第四步 | 生产服务器部署 | 生产服务器 |
-| 第五步 | 验证和测试 | 生产服务器 |
-| 第六步 | 运维管理 | 生产服务器 |
+| 第三步 | 传输物料到服务器                | 任意             |
+| 第四步 | 生产服务器部署                  | 生产服务器       |
+| 第五步 | 验证和测试                      | 生产服务器       |
+| 第六步 | 运维管理                        | 生产服务器       |
 
-### 0.2 MinerU 运行原理速览
+#### MinerU 运行原理速览
 
 理解下面这张图，有助于理解部署中每个文件和路径的作用：
 
@@ -50,7 +101,7 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 0.3 关键路径说明（是否固定？）
+#### 关键路径说明（是否固定？）
 
 这是新手最容易困惑的问题，先解释清楚：
 
@@ -87,14 +138,14 @@ export MINERU_TOOLS_CONFIG_JSON=/custom/path/my-config.json
 
 > **结论**：生产部署时，模型可以放在任意位置，只要 `mineru.json` 的 `models-dir` 指向正确路径即可。
 
-### 0.4 本指南使用的路径约定
+#### 本指南使用的路径约定
 
-| 用途 | 宿主机路径 | 容器内路径 | 是否必须 |
-|------|-----------|-----------|---------|
-| MinerU 配置 | `/root/mineru_8011.json` | `/root/mineru.json` | 可自定义 |
-| Pipeline 模型 | `/data/mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0` | `/data/mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0` | 可自定义，与 mineru.json 一致即可 |
-| VLM 模型 | `/data/mineru_models/hub/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B` | 同左 | 可自定义，与 mineru.json 一致即可 |
-| 输出目录 | `/data/mineru_output_8011` | `/vllm-workspace/output` | 可自定义 |
+| 用途          | 宿主机路径                                                                 | 容器内路径                                                           | 是否必须                          |
+| ------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------- | --------------------------------- |
+| MinerU 配置   | `/root/mineru_8011.json`                                                 | `/root/mineru.json`                                                | 可自定义                          |
+| Pipeline 模型 | `/data/mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0`       | `/data/mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0` | 可自定义，与 mineru.json 一致即可 |
+| VLM 模型      | `/data/mineru_models/hub/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B` | 同左                                                                 | 可自定义，与 mineru.json 一致即可 |
+| 输出目录      | `/data/mineru_output_8011`                                               | `/vllm-workspace/output`                                           | 可自定义                          |
 
 ---
 
@@ -108,6 +159,7 @@ bash deploy/check_server_env.sh
 ```
 
 脚本会自动检测：
+
 - CPU（核心数、架构、AVX2 指令集）
 - GPU（每张卡的型号、显存、计算能力、已用量）
 - 内存（总量、可用量）
@@ -119,23 +171,23 @@ bash deploy/check_server_env.sh
 
 ### 1.2 硬件最低要求速查
 
-| 后端 | 最低显存 | 最低内存 | 推荐配置 |
-|------|---------|---------|---------|
-| `hybrid-auto-engine`（默认） | 10GB | 16GB | 32GB+ 内存 + RTX 3090+ |
-| `pipeline` | 6GB | 16GB | 32GB+ 内存 + RTX 2060+ |
-| `vlm-auto-engine` | 8GB | 16GB | 32GB+ 内存 + RTX 3090+ |
+| 后端                           | 最低显存 | 最低内存 | 推荐配置               |
+| ------------------------------ | -------- | -------- | ---------------------- |
+| `hybrid-auto-engine`（默认） | 10GB     | 16GB     | 32GB+ 内存 + RTX 3090+ |
+| `pipeline`                   | 6GB      | 16GB     | 32GB+ 内存 + RTX 2060+ |
+| `vlm-auto-engine`            | 8GB      | 16GB     | 32GB+ 内存 + RTX 3090+ |
 
 **本指南默认使用 `hybrid-auto-engine`**（精度最高，需要 GPU）。
 
 ### 1.3 软件要求
 
-| 软件 | 最低版本 | 本指南版本 |
-|------|---------|----------|
-| Docker | 20.10+ | 28.1.1 |
-| Docker Compose | v2.0+ | v2.35.1 |
-| NVIDIA 驱动 | 支持 CUDA 12.0+ | 驱动 580.105.08 (CUDA 13.0) |
-| NVIDIA Container Toolkit | 1.13+ | 运行 `nvidia-smi` 验证 |
-| 操作系统 | Linux 2019+（Ubuntu 20.04+ / CentOS 8+） | 任意 |
+| 软件                     | 最低版本                                 | 本指南版本                  |
+| ------------------------ | ---------------------------------------- | --------------------------- |
+| Docker                   | 20.10+                                   | 28.1.1                      |
+| Docker Compose           | v2.0+                                    | v2.35.1                     |
+| NVIDIA 驱动              | 支持 CUDA 12.0+                          | 驱动 580.105.08 (CUDA 13.0) |
+| NVIDIA Container Toolkit | 1.13+                                    | 运行`nvidia-smi` 验证     |
+| 操作系统                 | Linux 2019+（Ubuntu 20.04+ / CentOS 8+） | 任意                        |
 
 ---
 
@@ -173,6 +225,7 @@ IMAGE_NAME=mineru:3.4.4 bash build-docker.sh
 ```
 
 **构建过程说明**：
+
 - 基础镜像：`vllm/vllm-openai:v0.11.2`（约 8GB，首次需下载）
 - 安装 `mineru[core]` + `mineru-vl-utils>=1.0.0` + `pdftext<0.7.0`
 - 构建时间：约 10-15 分钟（取决于网络和 CPU）
@@ -180,11 +233,11 @@ IMAGE_NAME=mineru:3.4.4 bash build-docker.sh
 
 **常见构建问题**：
 
-| 错误 | 原因 | 解决 |
-|------|------|------|
-| `ModuleNotFoundError: No module named 'mineru'` | Dockerfile COPY 顺序错误 | 确保 `COPY mineru/` 在 `pip install` 之前 |
-| `unexpected keyword argument 'enable_table_formula_eq_wrap'` | mineru-vl-utils 版本过低 | 检查 >=1.0.0 |
-| 网络超时 | pip 下载慢 | 使用国内镜像：`pip install -i https://mirrors.aliyun.com/pypi/simple` |
+| 错误                                                           | 原因                     | 解决                                                                    |
+| -------------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------- |
+| `ModuleNotFoundError: No module named 'mineru'`              | Dockerfile COPY 顺序错误 | 确保`COPY mineru/` 在 `pip install` 之前                            |
+| `unexpected keyword argument 'enable_table_formula_eq_wrap'` | mineru-vl-utils 版本过低 | 检查 >=1.0.0                                                            |
+| 网络超时                                                       | pip 下载慢               | 使用国内镜像：`pip install -i https://mirrors.aliyun.com/pypi/simple` |
 
 ### 2.4 下载模型文件
 
@@ -324,6 +377,7 @@ EOF
 ```
 
 > **关键配置项说明**：
+>
 > - `models-dir.pipeline`：Pipeline 模型的实际解压路径，**必须与实际路径一致**
 > - `models-dir.vlm`：VLM 模型的实际解压路径，**必须与实际路径一致**
 > - `llm-aided-config`：LLM 辅助标题分类（可选，默认关闭）
@@ -633,14 +687,14 @@ docker run -d --name mineru-api \
 
 ## 七、常见部署方案选择指南
 
-| 场景 | 推荐方案 | 理由 |
-|------|---------|------|
-| 单 GPU 开发/测试 | 单实例 mineru-api | 最简单 |
-| 单 GPU 生产 | 单实例 mineru-api + 调优 | 足够应对中低负载 |
-| 多 GPU 高吞吐 | 多实例（每 GPU 一个）+ Router | 水平扩展 |
+| 场景              | 推荐方案                      | 理由                 |
+| ----------------- | ----------------------------- | -------------------- |
+| 单 GPU 开发/测试  | 单实例 mineru-api             | 最简单               |
+| 单 GPU 生产       | 单实例 mineru-api + 调优      | 足够应对中低负载     |
+| 多 GPU 高吞吐     | 多实例（每 GPU 一个）+ Router | 水平扩展             |
 | GPU + 多 CPU 节点 | C/S 分离：GPU 推理 + CPU 业务 | 资源解耦，灵活扩缩容 |
-| 纯 CPU 环境 | mineru-api -b pipeline | 无 GPU 可用时 |
-| KVP 票据/表单 | mineru-api + KVP 引擎 | custom 模块 |
+| 纯 CPU 环境       | mineru-api -b pipeline        | 无 GPU 可用时        |
+| KVP 票据/表单     | mineru-api + KVP 引擎         | custom 模块          |
 
 ---
 
@@ -670,12 +724,12 @@ docker exec -it mineru-api-8011 bash
 
 ### 8.2 性能调优
 
-| 参数 | 默认值 | 调整建议 |
-|------|--------|---------|
-| `--gpu-memory-utilization` | 0.9 (vllm) | 单 GPU 跑多服务时降低到 0.4-0.5 |
-| `MINERU_PROCESSING_WINDOW_SIZE` | 64 | 内存充裕可上调到 128；显存紧张下调到 32 |
-| `MINERU_API_MAX_CONCURRENT_REQUESTS` | 3 | 高并发场景上调，注意显存消耗 |
-| `--data-parallel-size` | 1 | 多 GPU 时增加并行度 |
+| 参数                                   | 默认值     | 调整建议                                |
+| -------------------------------------- | ---------- | --------------------------------------- |
+| `--gpu-memory-utilization`           | 0.9 (vllm) | 单 GPU 跑多服务时降低到 0.4-0.5         |
+| `MINERU_PROCESSING_WINDOW_SIZE`      | 64         | 内存充裕可上调到 128；显存紧张下调到 32 |
+| `MINERU_API_MAX_CONCURRENT_REQUESTS` | 3          | 高并发场景上调，注意显存消耗            |
+| `--data-parallel-size`               | 1          | 多 GPU 时增加并行度                     |
 
 ### 8.3 日志管理
 
@@ -749,38 +803,38 @@ tar czf mineru-backup-$(date +%Y%m%d).tar.gz \
 
 ### 9.1 启动失败
 
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| `Error: No such image` | 镜像未导入或 tag 不匹配 | `docker images` 检查，确认 image tag |
-| `could not select device driver "nvidia"` | NVIDIA Container Toolkit 未安装 | `apt install nvidia-container-toolkit` |
-| `ValueError: Free memory on device is less than desired` | GPU 显存不足 | 降低 `--gpu-memory-utilization` 或清理占用进程 |
-| `Permission denied` | 文件权限不足 | `chmod 644 /root/mineru-8011.json` |
-| 端口被占用 | 其他进程占用 8011 | `lsof -i :8011`，换端口或停掉占用进程 |
+| 现象                                                       | 原因                            | 解决                                            |
+| ---------------------------------------------------------- | ------------------------------- | ----------------------------------------------- |
+| `Error: No such image`                                   | 镜像未导入或 tag 不匹配         | `docker images` 检查，确认 image tag          |
+| `could not select device driver "nvidia"`                | NVIDIA Container Toolkit 未安装 | `apt install nvidia-container-toolkit`        |
+| `ValueError: Free memory on device is less than desired` | GPU 显存不足                    | 降低`--gpu-memory-utilization` 或清理占用进程 |
+| `Permission denied`                                      | 文件权限不足                    | `chmod 644 /root/mineru-8011.json`            |
+| 端口被占用                                                 | 其他进程占用 8011               | `lsof -i :8011`，换端口或停掉占用进程         |
 
 ### 9.2 模型加载失败
 
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| `HFValidationError` | MINERU_MODEL_SOURCE=local 但模型不存在 | 检查 mineru.json 路径与实际解压位置一致 |
-| `Can't load the configuration of...` | VLM 模型版本不匹配 | 确认模型目录完整，版本与 mineru 匹配 |
-| `FileNotFoundError: ...paddleocr_torch/xxx.pth` | Pipeline 模型未挂载 | 检查 models-dir.pipeline 路径和挂载 |
+| 现象                                              | 原因                                   | 解决                                    |
+| ------------------------------------------------- | -------------------------------------- | --------------------------------------- |
+| `HFValidationError`                             | MINERU_MODEL_SOURCE=local 但模型不存在 | 检查 mineru.json 路径与实际解压位置一致 |
+| `Can't load the configuration of...`            | VLM 模型版本不匹配                     | 确认模型目录完整，版本与 mineru 匹配    |
+| `FileNotFoundError: ...paddleocr_torch/xxx.pth` | Pipeline 模型未挂载                    | 检查 models-dir.pipeline 路径和挂载     |
 
 ### 9.3 解析结果异常
 
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| 解析结果为空 | PDF 损坏或加密 | 尝试其他 PDF 测试 |
-| 表格解析不正确 | 复杂表格超出能力 | 尝试其他后端或降级到 VLM 模式 |
-| 中文识别错误 | OCR 语言设置 | 添加 `-l zh` 参数或 `lang: zh` |
-| 输出文件过大 | 图片分辨率高 | 调整 DPI 设置 |
+| 现象           | 原因             | 解决                              |
+| -------------- | ---------------- | --------------------------------- |
+| 解析结果为空   | PDF 损坏或加密   | 尝试其他 PDF 测试                 |
+| 表格解析不正确 | 复杂表格超出能力 | 尝试其他后端或降级到 VLM 模式     |
+| 中文识别错误   | OCR 语言设置     | 添加`-l zh` 参数或 `lang: zh` |
+| 输出文件过大   | 图片分辨率高     | 调整 DPI 设置                     |
 
 ### 9.4 性能问题
 
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| 解析速度慢 | 正常现象（VLM 推理每次都需要时间） | 调整 processing_window_size |
-| 内存持续增长 | 内存泄漏或并发过高 | 降低并发，添加定期重启 |
-| 显存持续占满 | gpu-memory-utilization 过高 | 降低到 0.3-0.4 |
+| 现象         | 原因                               | 解决                        |
+| ------------ | ---------------------------------- | --------------------------- |
+| 解析速度慢   | 正常现象（VLM 推理每次都需要时间） | 调整 processing_window_size |
+| 内存持续增长 | 内存泄漏或并发过高                 | 降低并发，添加定期重启      |
+| 显存持续占满 | gpu-memory-utilization 过高        | 降低到 0.3-0.4              |
 
 ---
 
@@ -788,33 +842,33 @@ tar czf mineru-backup-$(date +%Y%m%d).tar.gz \
 
 ### 10.1 完整环境变量速查
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `MINERU_MODEL_SOURCE` | `huggingface` | 模型来源: local/modelscope/huggingface |
-| `MINERU_DEVICE_MODE` | 自动检测 | 计算设备: cuda/cpu/npu/mps |
-| `MINERU_BACKEND` | `hybrid-auto-engine` | 后端: pipeline/vlm-auto-engine/hybrid-auto-engine |
-| `MINERU_TOOLS_CONFIG_JSON` | `mineru.json` | 配置文件路径 |
-| `MINERU_VLM_FORMULA_ENABLE` | `true` | 公式识别开关 |
-| `MINERU_VLM_TABLE_ENABLE` | `true` | 表格识别开关 |
-| `MINERU_TABLE_MERGE_ENABLE` | `true` | 跨页表格合并 |
-| `MINERU_PROCESSING_WINDOW_SIZE` | `64` | 滑窗处理页数 |
-| `MINERU_API_MAX_CONCURRENT_REQUESTS` | `3` | 最大并发请求 |
-| `MINERU_API_OUTPUT_ROOT` | 临时目录 | 输出根目录 |
-| `MINERU_LOG_LEVEL` | `INFO` | 日志级别 |
-| `MINERU_LOG_FILE_ENABLE` | `true` | 文件日志开关 |
-| `MINERU_PDF_RENDER_TIMEOUT` | `300` | PDF 渲染超时（秒） |
+| 变量                                   | 默认值                 | 说明                                              |
+| -------------------------------------- | ---------------------- | ------------------------------------------------- |
+| `MINERU_MODEL_SOURCE`                | `huggingface`        | 模型来源: local/modelscope/huggingface            |
+| `MINERU_DEVICE_MODE`                 | 自动检测               | 计算设备: cuda/cpu/npu/mps                        |
+| `MINERU_BACKEND`                     | `hybrid-auto-engine` | 后端: pipeline/vlm-auto-engine/hybrid-auto-engine |
+| `MINERU_TOOLS_CONFIG_JSON`           | `mineru.json`        | 配置文件路径                                      |
+| `MINERU_VLM_FORMULA_ENABLE`          | `true`               | 公式识别开关                                      |
+| `MINERU_VLM_TABLE_ENABLE`            | `true`               | 表格识别开关                                      |
+| `MINERU_TABLE_MERGE_ENABLE`          | `true`               | 跨页表格合并                                      |
+| `MINERU_PROCESSING_WINDOW_SIZE`      | `64`                 | 滑窗处理页数                                      |
+| `MINERU_API_MAX_CONCURRENT_REQUESTS` | `3`                  | 最大并发请求                                      |
+| `MINERU_API_OUTPUT_ROOT`             | 临时目录               | 输出根目录                                        |
+| `MINERU_LOG_LEVEL`                   | `INFO`               | 日志级别                                          |
+| `MINERU_LOG_FILE_ENABLE`             | `true`               | 文件日志开关                                      |
+| `MINERU_PDF_RENDER_TIMEOUT`          | `300`                | PDF 渲染超时（秒）                                |
 
 ### 10.2 mineru-api 命令行参数速查
 
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `--host` | 监听地址 | `--host 0.0.0.0` |
-| `--port` | 监听端口 | `--port 8000` |
-| `--backend` | 后端引擎 | `--backend hybrid-auto-engine` |
-| `--gpu-memory-utilization` | vllm KV 缓存占比 | `--gpu-memory-utilization 0.5` |
-| `--data-parallel-size` | 多 GPU 并行数 | `--data-parallel-size 2` |
-| `--api-url` | VLM HTTP 客户端 URL | `--api-url http://remote:30000` |
-| `--lang` | OCR 语言提示 | `--lang zh` |
+| 参数                         | 说明                | 示例                              |
+| ---------------------------- | ------------------- | --------------------------------- |
+| `--host`                   | 监听地址            | `--host 0.0.0.0`                |
+| `--port`                   | 监听端口            | `--port 8000`                   |
+| `--backend`                | 后端引擎            | `--backend hybrid-auto-engine`  |
+| `--gpu-memory-utilization` | vllm KV 缓存占比    | `--gpu-memory-utilization 0.5`  |
+| `--data-parallel-size`     | 多 GPU 并行数       | `--data-parallel-size 2`        |
+| `--api-url`                | VLM HTTP 客户端 URL | `--api-url http://remote:30000` |
+| `--lang`                   | OCR 语言提示        | `--lang zh`                     |
 
 ### 10.3 mineru.json 完整配置参考
 
@@ -846,10 +900,10 @@ tar czf mineru-backup-$(date +%Y%m%d).tar.gz \
 
 ### 10.4 相关文档链接
 
-| 文档 | 路径 |
-|------|------|
-| 升级指南 | `agents_logs/edits/2026-08-03_mineru-3.2.0-to-3.4.4-upgrade-guide.md` |
-| Docker 升级实战 | `docs/docker-image-upgrade-guide.md` |
-| 架构说明 | `docs/zh/dev/架构说明.md` |
-| API 接口说明 | `docs/zh/dev/接口说明.md` |
-| 服务器检查脚本 | `deploy/check_server_env.sh` |
+| 文档            | 路径                                                                    |
+| --------------- | ----------------------------------------------------------------------- |
+| 升级指南        | `agents_logs/edits/2026-08-03_mineru-3.2.0-to-3.4.4-upgrade-guide.md` |
+| Docker 升级实战 | `docs/docker-image-upgrade-guide.md`                                  |
+| 架构说明        | `docs/zh/dev/架构说明.md`                                             |
+| API 接口说明    | `docs/zh/dev/接口说明.md`                                             |
+| 服务器检查脚本  | `deploy/check_server_env.sh`                                          |
