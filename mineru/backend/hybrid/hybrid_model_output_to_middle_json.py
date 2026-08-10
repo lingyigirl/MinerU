@@ -249,6 +249,19 @@ def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm
     if not (_vlm_ocr_enable or _ocr_enable):
         _apply_post_ocr(pdf_info_list, hybrid_pipeline_model)
 
+    # [自定义] 使用 Pipeline 印章 OCR 补充/修正 VLM image_analysis 的印章文字
+    # 必须在表格 OCR 补充之前执行，且在 build_para_blocks_from_preproc 之前。
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.seal_utils import supplement_vlm_seal_with_ocr
+        supplement_vlm_seal_with_ocr(
+            pdf_info_list, hybrid_pipeline_model, image_writer=image_writer
+        )
+    except Exception as exc:
+        logger.warning(
+            f"印章 OCR 补充执行失败，将使用 VLM image_analysis 结果: {exc}"
+        )
+
     # [自定义] 使用 Pipeline OCR 补充 VLM 表格缺失的单元格文字
     # 必须在 build_para_blocks_from_preproc 之前执行，
     # 否则 para_blocks 不会包含 OCR 补充的文字。

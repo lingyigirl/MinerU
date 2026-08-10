@@ -312,7 +312,8 @@ PDF/图片/DOCX/PPTX/XLSX
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `mineru/utils/custom/pdf_utils.py`          | `generate_rotation_corrected_pdf()` — PDF 旋转修正                                                                                                      |
 | `mineru/utils/custom/content_list_utils.py` | `enrich_list_items_with_bbox()` — content_list_v2 中每个 list_item 独立 bbox                                                                            |
-| `mineru/utils/custom/table_utils.py`        | `split_merged_table_cells()`、`split_summary_from_data_cell()`、`normalize_table_colspan()`、`normalize_invoice_table()` — VLM 表格后处理全套管道 |
+| `mineru/utils/custom/table_utils.py`        | `split_merged_table_cells()`、`split_summary_from_data_cell()`、`normalize_table_colspan()`、`normalize_invoice_table()`、`supplement_vlm_table_cells_with_ocr()` — VLM 表格后处理全套管道 |
+| `mineru/utils/custom/seal_utils.py`         | `supplement_vlm_seal_with_ocr()` — Hybrid 模式印章 OCR 补充（Pipeline 印章 OCR 修正 VLM 结果）                                                             |
 | `mineru/utils/custom/doc_quality.py`        | `DocumentQuality`、`analyze_document_quality()` — S0 文档质量分析（DPI/模糊/印章/旋转检测）                                                           |
 | `mineru/utils/custom/doc_classifier.py`     | `DocType`、`classify_document()` — S1 文档分类器（"信号灯"三路路由：通用/表格/KVP 表单）                                                              |
 | `mineru/utils/custom/engine_factory.py`     | `EngineRoute`、`select_engine_route()` — 引擎工厂 + 策略选择器（自动选择最优解析引擎）                                                                |
@@ -336,8 +337,9 @@ PDF/图片/DOCX/PPTX/XLSX
 | `mineru/cli/api_request.py`                                   | ~38, ~171, ~240 | KVP 多引擎路由参数（`doc_type` / `kvp_engine` / `kvp_verify_engine`）               |
 | `mineru/backend/vlm/vlm_middle_json_mkcontent.py`             | ~59             | VLM 表格 HTML 后处理：拆分合并单元格 + 合计标签分离 + 发票表格 colspan 规范化与缺失值推断 |
 | `mineru/backend/vlm/vlm_middle_json_mkcontent.py`             | ~915            | content_list_v2 中为 list_items 注入独立 bbox                                             |
-| `mineru/backend/hybrid/hybrid_model_output_to_middle_json.py` | ~262            | Hybrid 模式使用 Pipeline OCR 补充 VLM 表格空单元格                                        |
-| `mineru/backend/hybrid/hybrid_model_output_to_middle_json.py` | ~275            | Hybrid 模式 Image 块 OCR 回退（VLM 误判为 image 的区域做 OCR 兜底）                       |
+| `mineru/backend/hybrid/hybrid_model_output_to_middle_json.py` | ~252            | Hybrid 模式使用 Pipeline 印章 OCR 修正 VLM image_analysis 印章文字                        |
+| `mineru/backend/hybrid/hybrid_model_output_to_middle_json.py` | ~266            | Hybrid 模式使用 Pipeline OCR 补充 VLM 表格空单元格                                        |
+| `mineru/backend/hybrid/hybrid_model_output_to_middle_json.py` | ~279            | Hybrid 模式 Image 块 OCR 回退（VLM 误判为 image 的区域做 OCR 兜底）                       |
 | `mineru/utils/pdf_image_tools.py`                             | ~601            | 旋转检测使用`PaddleOrientationClsModel`（上游更换了模型类）                             |
 | `mineru/backend/hybrid/hybrid_analyze.py`                     | ~737, ~886      | 解析入口处对 PDF 做整体旋转修正后再打开（同步/异步路径）                                  |
 | `mineru/backend/vlm/vlm_analyze.py`                           | ~442, ~542      | 解析入口处对 PDF 做整体旋转修正后再打开（同步/异步路径）                                  |
