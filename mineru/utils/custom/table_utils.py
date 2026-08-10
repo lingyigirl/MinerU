@@ -2449,6 +2449,338 @@ def _get_fillable_columns(
     return fillable
 
 
+def _count_ocr_data_rows(ocr_grid: list[list[str]]) -> int:
+    """统计 OCR 网格中包含数据值的行数。
+
+    数据值判定：至少含一个 _is_data_value 返回 True 的单元格。
+
+    Args:
+        ocr_grid: OCR 识别文字网格。
+
+    Returns:
+        数据行数量。
+    """
+    return sum(
+        1 for row in ocr_grid
+        if any(_is_data_value(cell) for cell in row)
+    )
+
+
+# 发票明细列关键词（仅数据行，不含购买方/销售方等摘要标签）
+_INVOICE_DATA_COLUMN_KEYWORDS = {
+    "项目名称", "货物或应税劳务、服务名称", "规格型号", "单位",
+    "数量", "单价", "金额", "税率", "税额", "税率/征收率",
+}
+
+
+def _has_concatenated_data_cells(vlm_data: list[list[str]]) -> bool:
+    """检测 VLM 表格行中是否存在值拼接的单元格。
+
+    对每一行，检查是否有 ≥2 个单元格满足：
+    1. 以发票明细列关键词开头
+    2. 含 ≥2 个显著数值（位数≥2）
+
+    这比单纯的 OCR 行数比较更可靠，因为不依赖
+    _detect_data_row_start（其可能在发票场景返回 0）。
+
+    Args:
+        vlm_data: 展开后的 VLM 文本网格。
+
+    Returns:
+        True 表示至少有一行存在拼接。
+    """
+    import re
+
+    for row_texts in vlm_data:
+        concat_cells = 0
+        for text in row_texts:
+            if not text or not text.strip():
+                continue
+            norm_t = _normalize_for_matching(text).replace(" ", "")
+            starts_with_keyword = any(
+                norm_t.startswith(_normalize_for_matching(kw).replace(" ", ""))
+                for kw in _INVOICE_DATA_COLUMN_KEYWORDS
+            )
+            if not starts_with_keyword:
+                continue
+            nums = [n for n in re.findall(r'\d+\.?\d*', text) if len(n) >= 2]
+            if len(nums) >= 2:
+                concat_cells += 1
+        if concat_cells >= 2:
+            return True
+    return False
+
+
+def _find_ocr_header_row(ocr_grid: list[list[str]]) -> int:
+    """在 OCR 网格中定位表头行。
+
+    返回第一个匹配 ≥2 个发票特征关键词的行的索引。
+    若未找到，返回 0（视第一行为表头）。
+
+    Args:
+        ocr_grid: OCR 识别文字网格。
+
+    Returns:
+        表头行索引。
+    """
+    for i, row in enumerate(ocr_grid):
+        matches = sum(
+            1 for cell in row
+            if cell.strip() in _INVOICE_HEADER_KEYWORDS
+        )
+        if matches >= 2:
+            return i
+
+    # 回退：若全文含"价税合计"，取它之前的行
+    for i, row in enumerate(ocr_grid):
+        all_text = " ".join(row)
+        if "价税合计" in all_text:
+            return max(0, i - 2)
+    return 0
+
+
+def _map_ocr_cols_to_vlm_cols(
+    ocr_header: list[str],
+    vlm_data_row: list[str],
+) -> dict:
+    """将 OCR 表头列映射到 VLM 数据行的对应列。
+
+    通过去空格 + 全角转半角后的文本子串匹配建立映射。
+    仅映射在 _INVOICE_HEADER_KEYWORDS 中的 OCR 表头。
+
+    Args:
+        ocr_header: OCR 表头行的单元格文本列表。
+        vlm_data_row: VLM 拼接数据行的单元格文本列表。
+
+    Returns:
+        {ocr_col_idx: vlm_col_idx} 映射字典。
+    """
+    def _norm(text: str) -> str:
+        """去空格 + 全角转半角规范化。"""
+        return _normalize_for_matching(text).replace(" ", "")
+
+    mapping: dict[int, int] = {}
+    used_vlm: set[int] = set()
+
+    for oc, ocr_hdr in enumerate(ocr_header):
+        if not ocr_hdr or ocr_hdr not in _INVOICE_HEADER_KEYWORDS:
+            continue
+        ocr_norm = _norm(ocr_hdr)
+        if not ocr_norm:
+            continue
+        for vc, vlm_text in enumerate(vlm_data_row):
+            if vc in used_vlm:
+                continue
+            vlm_norm = _norm(vlm_text)
+            if ocr_norm in vlm_norm or vlm_norm in ocr_norm:
+                mapping[oc] = vc
+                used_vlm.add(vc)
+                break
+
+    return mapping
+
+
+def _rebuild_merged_rows_from_ocr(
+    soup: BeautifulSoup,
+    table: Tag,
+    ocr_grid: list[list[str]],
+    vlm_data: list[list[str]],
+    vlm_cells: list[list[Tag]],
+    data_row_start: int,
+) -> bool:
+    """用 OCR 网格重建被 VLM 合并的数据行。
+
+    当 VLM 将多行数据合并为单个 <tr> 时，此函数使用 OCR 网格
+    （由 PaddleOCR 按视觉 y 坐标聚类生成）作为真实行结构来重建。
+
+    算法：
+    1. 在 OCR 网格中定位表头行和数据行
+    2. 建立 OCR 列到 VLM 列的映射
+    3. 为每个 OCR 数据行创建独立的 <tr>
+    4. 替换原 VLM 拼接行
+
+    Args:
+        soup: BeautifulSoup 对象。
+        table: <table> Tag。
+        ocr_grid: OCR 识别文字网格。
+        vlm_data: 展开后的 VLM 文本网格。
+        vlm_cells: 展开后的 VLM Tag 网格。
+        data_row_start: VLM 数据行起始索引。
+
+    Returns:
+        True 表示重建成功。
+    """
+    rows = table.find_all("tr")
+    if data_row_start >= len(rows):
+        return False
+
+    # 1. 定位 OCR 表头和数据行
+    header_row_idx = _find_ocr_header_row(ocr_grid)
+    if header_row_idx >= len(ocr_grid) - 1:
+        logger.debug(
+            f"OCR 网格中未找到有效的表头行（header_row_idx={header_row_idx}, "
+            f"ocr_grid_len={len(ocr_grid)}），跳过重建"
+        )
+        return False
+
+    # 数据行：表头之后到"价税合计"/"合计"之前
+    ocr_data_rows: list[list[str]] = []
+    for i in range(header_row_idx + 1, len(ocr_grid)):
+        row_text = " ".join(ocr_grid[i])
+        if "价税合计" in row_text or (
+            len(ocr_data_rows) > 0 and "合计" in row_text
+            and not any(_is_data_value(c) for c in ocr_grid[i] if c != "合计")
+        ):
+            break
+        ocr_data_rows.append(ocr_grid[i])
+
+    if not ocr_data_rows:
+        logger.debug(f"OCR 网格中未找到数据行（header_row_idx={header_row_idx}, ocr_grid_len={len(ocr_grid)}），跳过重建")
+        return False
+
+    # 2. 建立 OCR 列 → VLM 列映射
+    ocr_header = ocr_grid[header_row_idx]
+    # 使用拼接行的原始单元格文本（不展开 colspan）做列匹配
+    concat_row_cells = rows[data_row_start].find_all(["td", "th"])
+    # 如果 data_row_start 未指向拼接行，则查找真正的拼接行
+    for vi in range(max(0, data_row_start), len(rows)):
+        row_texts_raw = [c.get_text().strip() for c in rows[vi].find_all(["td", "th"])]
+        concat_count = 0
+        for t in row_texts_raw:
+            if not t:
+                continue
+            norm_t = _normalize_for_matching(t).replace(" ", "")
+            if any(norm_t.startswith(_normalize_for_matching(kw).replace(" ", ""))
+                   for kw in _INVOICE_DATA_COLUMN_KEYWORDS):
+                nums = [n for n in re.findall(r'\d+\.?\d*', t) if len(n) >= 2]
+                if len(nums) >= 2:
+                    concat_count += 1
+        if concat_count >= 2:
+            concat_row_cells = rows[vi].find_all(["td", "th"])
+            break
+    vlm_row_texts = [c.get_text().strip() for c in concat_row_cells]
+    col_map = _map_ocr_cols_to_vlm_cols(ocr_header, vlm_row_texts)
+
+    if len(col_map) < 3:
+        logger.debug(
+            f"OCR 列映射不足（{len(col_map)} 列），跳过重建。"
+            f"OCR表头={ocr_header[:8]}，VLM行文本={[t[:30] for t in vlm_data_row[:8]]}"
+        )
+        return False
+
+    # 3. 获取拼接行的单元格模板（保留 colspan/rowspan）
+    template_cells = concat_row_cells
+    if not template_cells:
+        return False
+
+    # 4. 为每个 OCR 数据行创建新 <tr>
+    # OCR 网格行列数不均（空列被压缩），不依赖 col_map 索引，
+    # 而是逐 OCR 单元格与 VLM 模板列做文本/类型匹配
+    new_rows: list[Tag] = []
+    for ocr_row in ocr_data_rows:
+        new_tr = soup.new_tag("tr")
+        # 记录已使用的 OCR 单元格（避免重复分配到多列）
+        used_ocr: set[int] = set()
+
+        for vc in range(len(template_cells)):
+            new_td = soup.new_tag("td")
+            orig = template_cells[vc]
+            for attr in ("colspan", "rowspan"):
+                if orig.get(attr):
+                    new_td[attr] = orig[attr]
+
+            cell_text = ""
+            vlm_tpl_text = orig.get_text().strip()
+            vlm_tpl_norm = _normalize_for_matching(vlm_tpl_text).replace(" ", "")
+            vlm_is_num_col = _is_data_value(vlm_tpl_text)
+
+            # 找最佳匹配的 OCR 单元格
+            best_oc = -1
+            for oc, ocr_cell in enumerate(ocr_row):
+                if oc in used_ocr:
+                    continue
+                ocr_cell = ocr_cell.strip()
+                if not ocr_cell:
+                    continue
+                ocr_norm = _normalize_for_matching(ocr_cell).replace(" ", "")
+
+                # 精准匹配：OCR 文本在 VLM 模板文本中（或反过来）
+                if ocr_norm and (ocr_norm in vlm_tpl_norm or vlm_tpl_norm in ocr_norm):
+                    best_oc = oc
+                    break
+
+            # 若文本未匹配，用类型匹配：数值 OCR → 数值 VLM 列
+            if best_oc < 0 and vlm_is_num_col:
+                for oc, ocr_cell in enumerate(ocr_row):
+                    if oc in used_ocr:
+                        continue
+                    if _is_data_value(ocr_cell.strip()):
+                        best_oc = oc
+                        break
+
+            if best_oc >= 0:
+                cell_text = ocr_row[best_oc].strip()
+                used_ocr.add(best_oc)
+
+            new_td.string = cell_text
+            new_tr.append(new_td)
+        new_rows.append(new_tr)
+
+    # 5. 替换原 VLM 拼接行
+    # 找出被拼接的行（含多个以发票明细列关键词开头且含≥2个数值的单元格）
+    concat_row_idx = None
+    for vi in range(max(0, data_row_start), len(rows)):
+        row_texts = vlm_data[vi] if vi < len(vlm_data) else []
+        concat_count = 0
+        for t in row_texts:
+            if not t:
+                continue
+            norm_t = _normalize_for_matching(t).replace(" ", "")
+            starts_with_kw = any(
+                norm_t.startswith(_normalize_for_matching(kw).replace(" ", ""))
+                for kw in _INVOICE_DATA_COLUMN_KEYWORDS
+            )
+            if starts_with_kw:
+                nums = [n for n in re.findall(r'\d+\.?\d*', t) if len(n) >= 2]
+                if len(nums) >= 2:
+                    concat_count += 1
+        if concat_count >= 2:
+            concat_row_idx = vi
+            break
+
+    if concat_row_idx is None:
+        concat_row_idx = data_row_start  # 回退
+
+    # 保存插入点（拼接行之前的那一行）
+    insertion_point = rows[concat_row_idx - 1] if concat_row_idx > 0 else None
+
+    # 删除拼接行
+    rows[concat_row_idx].decompose()
+
+    # 在插入点之后插入新行
+    if insertion_point is not None:
+        target = insertion_point
+        for new_tr in reversed(new_rows):
+            target.insert_after(new_tr)
+    else:
+        # 没有前一行（表格第一行），插入到表格开头
+        table_tag = table
+        first = table_tag.find("tr")
+        if first:
+            for new_tr in reversed(new_rows):
+                first.insert_before(new_tr)
+        else:
+            for new_tr in new_rows:
+                table_tag.append(new_tr)
+
+    logger.info(
+        f"OCR 网格重建表格行：将 {len(rows) - data_row_start} 行 VLM 数据行 "
+        f"替换为 {len(new_rows)} 行 OCR 数据行 "
+        f"（OCR 表头行={header_row_idx}，列映射={len(col_map)}）"
+    )
+    return True
+
+
 def _fill_empty_cells_from_ocr_grid(
     soup: BeautifulSoup,
     table: Tag,
@@ -2484,6 +2816,25 @@ def _fill_empty_cells_from_ocr_grid(
 
     # 2. 检测数据行起始（含 <img> 的行终止表头扩展）
     data_row_start = _detect_data_row_start(rows, vlm_data)
+
+    # [自定义] 检测 VLM 行合并并用 OCR 网格重建
+    # 仅对发票表格执行，避免影响其他类型表格
+    # 合并上游时注意：此 hook 只依赖本模块内部函数
+    try:
+        if _is_invoice_table(table) and _has_concatenated_data_cells(vlm_data):
+            logger.info(
+                f"检测到 VLM 行合并：OCR 数据行={_count_ocr_data_rows(ocr_grid)}, "
+                f"VLM 数据行={len(vlm_data) - data_row_start}，"
+                f"尝试用 OCR 网格重建"
+            )
+            if _rebuild_merged_rows_from_ocr(
+                soup, table, ocr_grid, vlm_data, vlm_cells, data_row_start
+            ):
+                return True  # 重建成功，跳过空单元格填充
+    except Exception:
+        logger.exception(
+            "OCR 网格重建失败，回退到空单元格填充逻辑"
+        )
 
     # 3. 使用标签锚点将 OCR 行对齐到 VLM 数据行
     ocr_pool = _align_ocr_to_vlm_rows(ocr_grid, vlm_data, data_row_start)
@@ -2702,7 +3053,10 @@ def supplement_vlm_table_cells_with_ocr(
                         cell.find("img") is not None
                         for cell in table.find_all("td")
                     )
-                    if not has_empty and not has_img:
+                    # 发票表格即使无空单元格也需 OCR，
+                    # 用于检测和纠正 VLM 的多行拼接问题
+                    is_invoice = _is_invoice_table(table)
+                    if not has_empty and not has_img and not is_invoice:
                         continue
                 except Exception:
                     continue
