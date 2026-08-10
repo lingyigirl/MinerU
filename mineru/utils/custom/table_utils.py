@@ -1811,8 +1811,10 @@ def _infer_missing_values_in_table(
 # 信息单元格中可识别为行分隔点的字段标签正则
 # 在"名称:"之后出现的这些标签前插入 <br/> 实现多行拆分
 # (统一社会信用代码/)?纳税人识别号 兼容有无"统一社会信用代码/"前缀的两种情况
+# (纳税人)?识别号: 兼容 VLM 将"纳税人"遗漏的缩写情况
+# (地)?址、电话: 兼容 VLM 将"地"遗漏的缩写情况
 _INFO_LINE_BREAK_RE = re.compile(
-    r'(?<=.)(?:(统一社会信用代码/)?纳税人识别号:|地址、电话:|开户行及账号:)'
+    r'(?<=.)(?:(统一社会信用代码/)?(纳税人)?识别号:|(地)?址、电话:|开户行及账号:)'
 )
 
 
@@ -1861,8 +1863,9 @@ def split_info_cell_multiline(html: str) -> str:
         if td.find("br"):
             continue
 
-        # 必须包含"名称:"才可能是发票信息单元格
-        if not text.startswith("名称:"):
+        # 必须包含购买方/销售方信息标签才可能是发票信息单元格
+        # 兼容 VLM 输出缩写的 "称:"（缺"名"字）的情况
+        if not (text.startswith("名称:") or text.startswith("称:")):
             continue
 
         # 在字段标签前插入 <br/> 实现分行的同时保留所有字段内容
@@ -2473,12 +2476,57 @@ _INVOICE_DATA_COLUMN_KEYWORDS = {
 }
 
 
+def _try_split_concatenated_numbers(text: str, num_parts: int = 2) -> list[str]:
+    """尝试拆分 OCR 中因间距过近而合并的连续数值。
+
+    VLM/OCR 将相邻列的两个数值合并为一个字符串（如 "5203.001.40776667307"
+    实际是数量 "5203.00" + 单价 "1.40776667307"）。
+
+    策略：利用小数位数启发式——第一个数值通常有 0-2 位小数
+    （数量/金额），第二个数值可以有多位小数（单价/税率）。
+
+    Args:
+        text: 合并的数值字符串。
+        num_parts: 期望拆分的份数。
+
+    Returns:
+        拆分后的数值列表；若无法拆分则返回 [text]。
+    """
+    if not text or num_parts < 2:
+        return [text] if text else []
+
+    # 尝试不同小数位数：2位 → 1位 → 0位
+    for frac_digits in (2, 1, 0):
+        pat = re.compile(
+            rf'(\d+(?:\.\d{{{frac_digits}}})?)(\d+\.\d+.*)'
+            if frac_digits > 0
+            else r'(\d+)(\d+\.\d+.*)'
+        )
+        m = pat.match(text.strip())
+        if m:
+            first = m.group(1)
+            rest = m.group(2)
+            # 验证：第一部分和第二部分都应像数值
+            if _is_data_value(first) and _is_data_value(rest):
+                parts = [first]
+                for i in range(num_parts - 2):
+                    sub = _try_split_concatenated_numbers(rest, num_parts - 1)
+                    if len(sub) > 1:
+                        parts.extend(sub[:-1])
+                        rest = sub[-1]
+                        break
+                parts.append(rest)
+                return parts
+
+    return [text]
+
+
 def _has_concatenated_data_cells(vlm_data: list[list[str]]) -> bool:
     """检测 VLM 表格行中是否存在值拼接的单元格。
 
-    对每一行，检查是否有 ≥2 个单元格满足：
-    1. 以发票明细列关键词开头
-    2. 含 ≥2 个显著数值（位数≥2）
+    对每一行，检查是否有 ≥2 个单元格满足任一条件：
+    1. 以发票明细列关键词开头 + 含 ≥2 个显著数值（位数≥2）
+    2. 以发票明细列关键词开头 + 含 "合计" （如 "货物...合计"）
 
     这比单纯的 OCR 行数比较更可靠，因为不依赖
     _detect_data_row_start（其可能在发票场景返回 0）。
@@ -2503,8 +2551,13 @@ def _has_concatenated_data_cells(vlm_data: list[list[str]]) -> bool:
             )
             if not starts_with_keyword:
                 continue
+            # 条件1：含 ≥2 个显著数值
             nums = [n for n in re.findall(r'\d+\.?\d*', text) if len(n) >= 2]
             if len(nums) >= 2:
+                concat_cells += 1
+                continue
+            # 条件2：含 "合计"（VLM 将明细行与合计行拼接）
+            if "合计" in text:
                 concat_cells += 1
         if concat_cells >= 2:
             return True
@@ -2681,6 +2734,8 @@ def _rebuild_merged_rows_from_ocr(
         new_tr = soup.new_tag("tr")
         # 记录已使用的 OCR 单元格（避免重复分配到多列）
         used_ocr: set[int] = set()
+        # 预拆分队列：(ocr_cell_index, split_part_index, value) — 用于直接填充后续列
+        pending_splits: list[tuple[int, int, str]] = []
 
         for vc in range(len(template_cells)):
             new_td = soup.new_tag("td")
@@ -2694,39 +2749,99 @@ def _rebuild_merged_rows_from_ocr(
             vlm_tpl_norm = _normalize_for_matching(vlm_tpl_text).replace(" ", "")
             vlm_is_num_col = _is_data_value(vlm_tpl_text)
 
-            # 找最佳匹配的 OCR 单元格
-            best_oc = -1
-            for oc, ocr_cell in enumerate(ocr_row):
-                if oc in used_ocr:
-                    continue
-                ocr_cell = ocr_cell.strip()
-                if not ocr_cell:
-                    continue
-                ocr_norm = _normalize_for_matching(ocr_cell).replace(" ", "")
-
-                # 精准匹配：OCR 文本在 VLM 模板文本中（或反过来）
-                if ocr_norm and (ocr_norm in vlm_tpl_norm or vlm_tpl_norm in ocr_norm):
-                    best_oc = oc
-                    break
-
-            # 若文本未匹配，用类型匹配：数值 OCR → 数值 VLM 列
-            if best_oc < 0 and vlm_is_num_col:
+            # 优先使用预拆分的值（上一列拆分出的后续值）
+            if pending_splits:
+                _, _, split_val = pending_splits.pop(0)
+                cell_text = split_val
+            else:
+                # 找最佳匹配的 OCR 单元格
+                best_oc = -1
                 for oc, ocr_cell in enumerate(ocr_row):
                     if oc in used_ocr:
                         continue
-                    if _is_data_value(ocr_cell.strip()):
+                    ocr_cell = ocr_cell.strip()
+                    if not ocr_cell:
+                        continue
+                    ocr_norm = _normalize_for_matching(ocr_cell).replace(" ", "")
+
+                    # 精准匹配：OCR 文本在 VLM 模板文本中（或反过来）
+                    if ocr_norm and (ocr_norm in vlm_tpl_norm or vlm_tpl_norm in ocr_norm):
                         best_oc = oc
                         break
 
-            if best_oc >= 0:
-                cell_text = ocr_row[best_oc].strip()
-                used_ocr.add(best_oc)
+                # 若文本未匹配，用类型匹配：数值 OCR → 数值 VLM 列
+                if best_oc < 0 and vlm_is_num_col:
+                    for oc, ocr_cell in enumerate(ocr_row):
+                        if oc in used_ocr:
+                            continue
+                        if _is_data_value(ocr_cell.strip()):
+                            best_oc = oc
+                            break
+
+                if best_oc >= 0:
+                    cell_text = ocr_row[best_oc].strip()
+                    used_ocr.add(best_oc)
+                    # 若该 OCR 文本含多个拼接数值且匹配的 VLM 列是数值列，
+                    # 尝试拆分并预填后续列
+                    if vlm_is_num_col:
+                        nums_in_text = [n for n in re.findall(r'\d+\.?\d*', cell_text) if len(n) >= 2]
+                        # 统计后续连续数值列数
+                        next_num_cols = 0
+                        for nvc in range(vc + 1, len(template_cells)):
+                            nvl_text = template_cells[nvc].get_text().strip()
+                            if _is_data_value(nvl_text):
+                                next_num_cols += 1
+                            else:
+                                break
+                        if len(nums_in_text) >= 2 and next_num_cols >= 1:
+                            parts = _try_split_concatenated_numbers(cell_text, min(1 + next_num_cols, len(nums_in_text)))
+                            if len(parts) > 1:
+                                cell_text = parts[0]
+                                for pi in range(1, len(parts)):
+                                    pending_splits.append((best_oc, pi, parts[pi]))
 
             new_td.string = cell_text
             new_tr.append(new_td)
         new_rows.append(new_tr)
 
-    # 5. 替换原 VLM 拼接行
+    # 5. 在 VLM 拼接行之前插入 OCR 表头行
+    # OCR 表头来自 ocr_grid[header_row_idx] 中在 _INVOICE_HEADER_KEYWORDS 里的标签
+    ocr_header_labels = [
+        h for h in ocr_header
+        if h.strip() in _INVOICE_HEADER_KEYWORDS
+    ]
+    if ocr_header_labels and len(ocr_header_labels) >= 3:
+        # 用 col_map 将 OCR 表头标签映射到 VLM 列位置
+        header_tr = soup.new_tag("tr")
+        for vc in range(len(template_cells)):
+            th = soup.new_tag("th")
+            orig = template_cells[vc]
+            for attr in ("colspan", "rowspan"):
+                if orig.get(attr):
+                    th[attr] = orig[attr]
+            # 查找映射到此 VLM 列的 OCR 表头标签
+            label = ""
+            vlm_tpl_text = orig.get_text().strip()
+            vlm_tpl_norm = _normalize_for_matching(vlm_tpl_text).replace(" ", "")
+            for oc_hdr in ocr_header_labels:
+                hdr_norm = _normalize_for_matching(oc_hdr).replace(" ", "")
+                if hdr_norm and vlm_tpl_norm and (hdr_norm in vlm_tpl_norm or vlm_tpl_norm in hdr_norm):
+                    label = oc_hdr
+                    break
+            # 若未匹配，用 col_map 索引
+            if not label:
+                for oc, mapped_vc in col_map.items():
+                    if mapped_vc == vc and oc < len(ocr_header):
+                        candidate = ocr_header[oc].strip()
+                        if candidate in _INVOICE_HEADER_KEYWORDS:
+                            label = candidate
+                            break
+            th.string = label
+            header_tr.append(th)
+        new_rows.insert(0, header_tr)
+        logger.debug(f"已插入 OCR 表头行：{len(ocr_header_labels)} 个标签")
+
+    # 6. 替换原 VLM 拼接行
     # 找出被拼接的行（含多个以发票明细列关键词开头且含≥2个数值的单元格）
     concat_row_idx = None
     for vi in range(max(0, data_row_start), len(rows)):
