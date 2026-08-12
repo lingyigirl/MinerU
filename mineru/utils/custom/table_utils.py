@@ -2109,6 +2109,73 @@ def extract_column_header_prefixes(html: str) -> str:
                                     td.string = rest
                                 break
 
+                # 从数据行单元格中提取 ¥/￥ 金额值并移至合计行
+                # 避免 ¥ 值在数据行和合计行重复出现
+                yen_map: dict[int, str] = {}  # {expanded_col_index: yen_value}
+                all_rows = table.find_all("tr")
+                for row in all_rows:
+                    if row.find("th"):
+                        continue  # 跳过 TH 行
+                    # 跳过价税合计/大写行和合计行本身
+                    row_texts = [c.get_text() for c in row.find_all("td")]
+                    if any("价税合计" in t or "大写" in t for t in row_texts):
+                        continue
+                    if row_texts and row_texts[0] == "合计":
+                        continue  # 跳过合计行自身，避免从其中重复提取 ¥
+                    cells = row.find_all("td")
+                    expanded_idx = 0  # 按 colspan 展开后的列索引
+                    for ci, td in enumerate(cells):
+                        text = td.get_text().strip()
+                        colspan = int(td.get("colspan", 1))
+                        yen_match = re.search(r'[¥￥][\d.,]+', text) if text else None
+                        if yen_match:
+                            yen_val = yen_match.group()
+                            # 从单元格中移除 ¥ 值
+                            cleaned = (text[:yen_match.start()] + text[yen_match.end():]).strip()
+                            td.string = cleaned if cleaned else ""
+                            # 记录 ¥ 值及其展开后的列索引
+                            yen_map[expanded_idx] = yen_val
+                        expanded_idx += colspan
+
+                if yen_map:
+                    # 查找或创建合计行
+                    summary_row = None
+                    for row in all_rows:
+                        cells_text = [c.get_text().strip() for c in row.find_all("td")]
+                        if cells_text and cells_text[0] == "合计":
+                            summary_row = row
+                            break
+
+                    if summary_row is None:
+                        summary_row = soup.new_tag("tr")
+                        # 插入到数据行之后（TH 行是倒数第二个之前）
+                        data_rows = [r for r in all_rows if not r.find("th")]
+                        if len(data_rows) >= 2:
+                            data_rows[0].insert_after(summary_row)
+                        elif data_rows:
+                            data_rows[0].insert_after(summary_row)
+
+                    # 用 TH 行的结构重建合计行（确保 colspan 对齐）
+                    summary_row.clear()
+                    ref_cells = header_tr.find_all("th")
+                    for th in ref_cells:
+                        new_td = soup.new_tag("td")
+                        colspan = th.get("colspan")
+                        if colspan:
+                            new_td["colspan"] = colspan
+                        summary_row.append(new_td)
+
+                    # 在合计行第一列放"合计"标签，按展开列索引放 ¥ 值
+                    summary_cells = summary_row.find_all("td")
+                    # 先全部清空
+                    for sc in summary_cells:
+                        sc.string = ""
+                    if summary_cells:
+                        summary_cells[0].string = "合计"
+                    for expanded_ci, yen_val in yen_map.items():
+                        if expanded_ci < len(summary_cells):
+                            summary_cells[expanded_ci].string = yen_val
+
         except Exception:
             logger.exception("extract_column_header_prefixes 处理单个表格时出错，跳过")
             continue
