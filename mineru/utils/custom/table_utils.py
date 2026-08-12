@@ -2318,6 +2318,7 @@ def _normalize_for_matching(text: str) -> str:
         "２": "2", "３": "3", "４": "4", "５": "5",
         "６": "6", "７": "7", "８": "8", "９": "9",
         " ": " ", "　": " ",
+        "￥": "¥",   # OCR 全角人民币符号 → VLM 半角
     }
     result = text
     for full, half in full_to_half.items():
@@ -2526,10 +2527,11 @@ def _has_concatenated_data_cells(vlm_data: list[list[str]]) -> bool:
 
     对每一行，检查是否有 ≥2 个单元格满足任一条件：
     1. 以发票明细列关键词开头 + 含 ≥2 个显著数值（位数≥2）
-    2. 以发票明细列关键词开头 + 含 "合计" （如 "货物...合计"）
+    2. 以发票明细列关键词开头 + 数字总位数 ≥8
+       （如 "1810518105"→10位，正常单值"18105"→5位，拼接信号）
 
-    这比单纯的 OCR 行数比较更可靠，因为不依赖
-    _detect_data_row_start（其可能在发票场景返回 0）。
+    不使用"合计"关键词检测——"合计"嵌入在货物名称末尾是正常场景，
+    应由 split_summary_from_data_cell 处理，而非触发 OCR 行重建。
 
     Args:
         vlm_data: 展开后的 VLM 文本网格。
@@ -2551,13 +2553,15 @@ def _has_concatenated_data_cells(vlm_data: list[list[str]]) -> bool:
             )
             if not starts_with_keyword:
                 continue
-            # 条件1：含 ≥2 个显著数值
+            # 条件1：含 ≥2 个显著数值（位数≥2）
             nums = [n for n in re.findall(r'\d+\.?\d*', text) if len(n) >= 2]
             if len(nums) >= 2:
                 concat_cells += 1
                 continue
-            # 条件2：含 "合计"（VLM 将明细行与合计行拼接）
-            if "合计" in text:
+            # 条件2：单元格中数值总位数 ≥8
+            # （如 "1810518105"=10位，正常单值"18105"=5位，"5203.0030088.00"=15位）
+            all_digits = re.sub(r'[^\d]', '', text)
+            if len(all_digits) >= 8:
                 concat_cells += 1
         if concat_cells >= 2:
             return True
@@ -2717,7 +2721,7 @@ def _rebuild_merged_rows_from_ocr(
     if len(col_map) < 3:
         logger.debug(
             f"OCR 列映射不足（{len(col_map)} 列），跳过重建。"
-            f"OCR表头={ocr_header[:8]}，VLM行文本={[t[:30] for t in vlm_data_row[:8]]}"
+            f"OCR表头={ocr_header[:8]}，VLM行文本={[t[:30] for t in vlm_row_texts[:8]]}"
         )
         return False
 
@@ -2770,13 +2774,19 @@ def _rebuild_merged_rows_from_ocr(
                         break
 
                 # 若文本未匹配，用类型匹配：数值 OCR → 数值 VLM 列
+                # ¥ 前缀值（如 "￥71006.01"）仅通过文本匹配分配，
+                # 不通过类型匹配，以避免被先遍历到的数值列抢先占用
                 if best_oc < 0 and vlm_is_num_col:
                     for oc, ocr_cell in enumerate(ocr_row):
                         if oc in used_ocr:
                             continue
-                        if _is_data_value(ocr_cell.strip()):
-                            best_oc = oc
-                            break
+                        ocr_stripped = ocr_cell.strip()
+                        if not _is_data_value(ocr_stripped):
+                            continue
+                        if ocr_stripped.startswith('￥') or ocr_stripped.startswith('¥'):
+                            continue
+                        best_oc = oc
+                        break
 
                 if best_oc >= 0:
                     cell_text = ocr_row[best_oc].strip()
