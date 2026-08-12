@@ -1983,6 +1983,94 @@ def normalize_invoice_table(html: str) -> str:
     return str(soup)
 
 
+def strip_column_header_prefixes(html: str) -> str:
+    """剥离发票表格数据单元格中内嵌的列标题前缀。
+
+    处理 VLM 输出中列标题与数据值无空格拼接的场景：
+    - "单位吨" → "吨"
+    - "数量5203" → "5203"
+    - "金额4942.85¥4942.85" → "4942.85¥4942.85"
+    - "税率免税" → "免税"
+    - "税额***" → "***"
+
+    仅剥离已在表头 <th> 行中存在的 _INVOICE_DATA_COLUMN_KEYWORDS，
+    避免误剥离购买方/销售方信息行中的 "名称" 等标签。
+
+    仅处理数据行（不含 <th> 的行），表头行不受影响。
+
+    [自定义] 此函数由 _format_embedded_html 管道调用。
+    上游合并时此模块仅需保留，无需修改。
+
+    Args:
+        html: 表格 HTML 字符串。
+
+    Returns:
+        清理后的 HTML 字符串。
+    """
+    if not html or not isinstance(html, str):
+        return html
+    if "<table" not in html.lower():
+        return html
+
+    from bs4 import BeautifulSoup
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        logger.warning("BeautifulSoup 解析表格 HTML 失败，跳过列标题剥离")
+        return html
+
+    for table in soup.find_all("table"):
+        try:
+            # 收集表头行的列关键词，若无 <th> 则直接使用发票明细列关键词
+            header_keywords: set[str] = set()
+            for row in table.find_all("tr"):
+                th_cells = row.find_all("th")
+                if th_cells:
+                    for th in th_cells:
+                        text = th.get_text().strip()
+                        if text in _INVOICE_DATA_COLUMN_KEYWORDS:
+                            header_keywords.add(text)
+                # 也收集独立的纯关键词 <td>（如 "规格型号"、"单位" 等）
+                td_cells = row.find_all("td")
+                if td_cells:
+                    for td in td_cells:
+                        text = td.get_text().strip()
+                        if text in _INVOICE_DATA_COLUMN_KEYWORDS:
+                            header_keywords.add(text)
+
+            # 若表头关键词不足，回退到直接使用 _INVOICE_DATA_COLUMN_KEYWORDS
+            if len(header_keywords) < 2:
+                header_keywords = _INVOICE_DATA_COLUMN_KEYWORDS.copy()
+
+            if not header_keywords:
+                continue
+
+            # 清理数据行（跳过含 <th> 的表头行）
+            for row in table.find_all("tr"):
+                if row.find("th"):
+                    continue
+
+                for td in row.find_all("td"):
+                    text = td.get_text().strip()
+                    if not text:
+                        continue
+
+                    # 用表头关键词尝试剥离前缀
+                    for kw in sorted(header_keywords, key=len, reverse=True):
+                        if text.startswith(kw) and len(text) > len(kw):
+                            rest = text[len(kw):].strip()
+                            if rest:
+                                td.string = rest
+                            break
+
+        except Exception:
+            logger.exception("strip_column_header_prefixes 处理单个表格时出错，跳过")
+            continue
+
+    return str(soup)
+
+
 # -- 增值税发票检测关键词 --
 _INVOICE_DETECTION_KEYWORDS = {
     "项目名称", "规格型号", "单位", "数量", "单价",

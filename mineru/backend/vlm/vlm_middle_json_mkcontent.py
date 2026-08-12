@@ -79,6 +79,16 @@ def _format_embedded_html(html, img_buket_path):
             f"split_summary_from_data_cell 执行失败，将使用先前结果: {exc}"
         )
 
+    # [自定义] VLM 表格 HTML 后处理：剥离数据单元格中内嵌的列标题前缀
+    # 将 "单位吨"→"吨"、"数量5203"→"5203" 等无空格拼接拆分
+    try:
+        from mineru.utils.custom.table_utils import strip_column_header_prefixes
+        formatted = strip_column_header_prefixes(formatted)
+    except Exception as exc:
+        logger.warning(
+            f"strip_column_header_prefixes 执行失败，将使用先前结果: {exc}"
+        )
+
     # [自定义] VLM 表格 HTML 后处理：发票表格 colspan 规范化、缺失值推断
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
