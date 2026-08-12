@@ -1333,11 +1333,12 @@ def _insert_summary_row_after(
         if col_idx == 0:
             # 第一列放置摘要标签
             td.string = summary_label
-        elif _is_data_value(cell_val):
-            # 数值列复制数据值
-            td.string = cell_val
+        elif "¥" in cell_val or "￥" in cell_val:
+            # 从单元格中提取所有 ¥/￥ 前缀的金额值
+            yen_values = re.findall(r'[¥￥][\d.,]+', cell_val)
+            td.string = " ".join(yen_values) if yen_values else ""
         else:
-            # 非数值列留空
+            # 其余列留空
             td.string = ""
         summary_tr.append(td)
 
