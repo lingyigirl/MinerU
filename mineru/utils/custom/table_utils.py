@@ -2076,7 +2076,6 @@ def extract_column_header_prefixes(html: str) -> str:
                 # 按 colspan 展开：每个物理列一个 header_label（用于对齐）
                 for _ in range(colspan):
                     header_labels.append(label if _ == 0 else "")
-                    # 仅第 0 个 span 置 label，避免重复提取
                 if colspan > 1 and label:
                     label = ""  # 清空避免后续重复使用
                 td.string = data
@@ -2094,6 +2093,20 @@ def extract_column_header_prefixes(html: str) -> str:
                     f"提取列标题前缀到 TH 行：{len(valid_labels)} 个标签，"
                     f"标签={valid_labels[:4]}..."
                 )
+
+                # 清理其余所有行中残留的列标题前缀
+                # （如 split_summary_from_data_cell 创建的合计行复制了原始拼接文本）
+                for row in table.find_all("tr"):
+                    for td in row.find_all("td"):
+                        text = td.get_text().strip()
+                        if not text:
+                            continue
+                        for kw in sorted(_INVOICE_DATA_COLUMN_KEYWORDS, key=len, reverse=True):
+                            if text.startswith(kw) and len(text) > len(kw):
+                                rest = text[len(kw):].strip()
+                                if rest and _is_data_value(rest):
+                                    td.string = rest
+                                break
 
         except Exception:
             logger.exception("extract_column_header_prefixes 处理单个表格时出错，跳过")
