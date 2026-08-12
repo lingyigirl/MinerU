@@ -1983,20 +1983,17 @@ def normalize_invoice_table(html: str) -> str:
     return str(soup)
 
 
-def strip_column_header_prefixes(html: str) -> str:
-    """剥离发票表格数据单元格中内嵌的列标题前缀。
+def extract_column_header_prefixes(html: str) -> str:
+    """提取发票表格数据单元格中内嵌的列标题前缀到 <th> 表头行。
 
     处理 VLM 输出中列标题与数据值无空格拼接的场景：
-    - "单位吨" → "吨"
-    - "数量5203" → "5203"
-    - "金额4942.85¥4942.85" → "4942.85¥4942.85"
-    - "税率免税" → "免税"
-    - "税额***" → "***"
+    - "单位吨" → 提取 "单位" 到 <th>，数据行保留 "吨"
+    - "数量5203" → 提取 "数量" 到 <th>，数据行保留 "5203"
+    - "金额4942.85¥4942.85" → 提取 "金额" 到 <th>，数据行保留 "4942.85¥4942.85"
 
-    仅剥离已在表头 <th> 行中存在的 _INVOICE_DATA_COLUMN_KEYWORDS，
-    避免误剥离购买方/销售方信息行中的 "名称" 等标签。
+    与 strip_column_header_prefixes（删除前缀）不同，此函数保留全部识别内容。
 
-    仅处理数据行（不含 <th> 的行），表头行不受影响。
+    已有 <th> 行的表格（如 OCR 重建的表）跳过不处理。
 
     [自定义] 此函数由 _format_embedded_html 管道调用。
     上游合并时此模块仅需保留，无需修改。
@@ -2005,7 +2002,7 @@ def strip_column_header_prefixes(html: str) -> str:
         html: 表格 HTML 字符串。
 
     Returns:
-        清理后的 HTML 字符串。
+        处理后的 HTML 字符串。
     """
     if not html or not isinstance(html, str):
         return html
@@ -2017,55 +2014,89 @@ def strip_column_header_prefixes(html: str) -> str:
     try:
         soup = BeautifulSoup(html, "html.parser")
     except Exception:
-        logger.warning("BeautifulSoup 解析表格 HTML 失败，跳过列标题剥离")
+        logger.warning("BeautifulSoup 解析表格 HTML 失败，跳过列标题提取")
         return html
 
     for table in soup.find_all("table"):
         try:
-            # 收集表头行的列关键词，若无 <th> 则直接使用发票明细列关键词
-            header_keywords: set[str] = set()
-            for row in table.find_all("tr"):
-                th_cells = row.find_all("th")
-                if th_cells:
-                    for th in th_cells:
-                        text = th.get_text().strip()
-                        if text in _INVOICE_DATA_COLUMN_KEYWORDS:
-                            header_keywords.add(text)
-                # 也收集独立的纯关键词 <td>（如 "规格型号"、"单位" 等）
-                td_cells = row.find_all("td")
-                if td_cells:
-                    for td in td_cells:
-                        text = td.get_text().strip()
-                        if text in _INVOICE_DATA_COLUMN_KEYWORDS:
-                            header_keywords.add(text)
-
-            # 若表头关键词不足，回退到直接使用 _INVOICE_DATA_COLUMN_KEYWORDS
-            if len(header_keywords) < 2:
-                header_keywords = _INVOICE_DATA_COLUMN_KEYWORDS.copy()
-
-            if not header_keywords:
+            # 已有 <th> 的表跳过（OCR 重建或已处理过）
+            if table.find("th"):
                 continue
 
-            # 清理数据行（跳过含 <th> 的表头行）
-            for row in table.find_all("tr"):
-                if row.find("th"):
-                    continue
+            rows = table.find_all("tr")
+            if len(rows) < 2:
+                continue
 
-                for td in row.find_all("td"):
+            # 用 _INVOICE_DATA_COLUMN_KEYWORDS 检测拼接行
+            # 跳过首行（购买方/销售方信息行），从第2行开始找
+            data_row = None
+            for row in rows:
+                cells = row.find_all("td")
+                if len(cells) < 3:
+                    continue
+                # 检测是否有 ≥2 个单元格以列关键词开头且有后缀数据
+                concat_cells = 0
+                for td in cells:
                     text = td.get_text().strip()
                     if not text:
                         continue
-
-                    # 用表头关键词尝试剥离前缀
-                    for kw in sorted(header_keywords, key=len, reverse=True):
+                    for kw in sorted(_INVOICE_DATA_COLUMN_KEYWORDS, key=len, reverse=True):
                         if text.startswith(kw) and len(text) > len(kw):
                             rest = text[len(kw):].strip()
                             if rest:
-                                td.string = rest
+                                concat_cells += 1
                             break
+                if concat_cells >= 2:
+                    data_row = row
+                    break
+
+            if data_row is None:
+                continue
+
+            # 提取标题前缀构建 TH 行，剥离数据行前缀
+            cells = data_row.find_all("td")
+            header_labels: list[str] = []
+            for td in cells:
+                text = td.get_text().strip()
+                colspan = int(td.get("colspan", 1))
+                label = ""
+                data = text
+                for kw in sorted(_INVOICE_DATA_COLUMN_KEYWORDS, key=len, reverse=True):
+                    if text.startswith(kw) and len(text) > len(kw):
+                        rest = text[len(kw):].strip()
+                        if rest:
+                            label = kw
+                            data = rest
+                        break
+                    # 纯关键词单元格（如独立的 "规格型号"）→ 提取为表头
+                    if text == kw:
+                        label = kw
+                        data = ""
+                        break
+                # 按 colspan 展开：每个物理列一个 header_label（用于对齐）
+                for _ in range(colspan):
+                    header_labels.append(label if _ == 0 else "")
+                    # 仅第 0 个 span 置 label，避免重复提取
+                if colspan > 1 and label:
+                    label = ""  # 清空避免后续重复使用
+                td.string = data
+
+            # 插入 TH 行（仅当有 ≥2 个有效标签时）
+            valid_labels = [l for l in header_labels if l]
+            if len(valid_labels) >= 2:
+                header_tr = soup.new_tag("tr")
+                for label in header_labels:
+                    th = soup.new_tag("th")
+                    th.string = label
+                    header_tr.append(th)
+                data_row.insert_before(header_tr)
+                logger.debug(
+                    f"提取列标题前缀到 TH 行：{len(valid_labels)} 个标签，"
+                    f"标签={valid_labels[:4]}..."
+                )
 
         except Exception:
-            logger.exception("strip_column_header_prefixes 处理单个表格时出错，跳过")
+            logger.exception("extract_column_header_prefixes 处理单个表格时出错，跳过")
             continue
 
     return str(soup)

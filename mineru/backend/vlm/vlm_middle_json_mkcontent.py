@@ -79,14 +79,14 @@ def _format_embedded_html(html, img_buket_path):
             f"split_summary_from_data_cell 执行失败，将使用先前结果: {exc}"
         )
 
-    # [自定义] VLM 表格 HTML 后处理：剥离数据单元格中内嵌的列标题前缀
-    # 将 "单位吨"→"吨"、"数量5203"→"5203" 等无空格拼接拆分
+    # [自定义] VLM 表格 HTML 后处理：提取数据单元格中内嵌的列标题到 TH 行
+    # 将 "单位吨"→<th>单位</th>+<td>吨</td>，保留全部识别内容
     try:
-        from mineru.utils.custom.table_utils import strip_column_header_prefixes
-        formatted = strip_column_header_prefixes(formatted)
+        from mineru.utils.custom.table_utils import extract_column_header_prefixes
+        formatted = extract_column_header_prefixes(formatted)
     except Exception as exc:
         logger.warning(
-            f"strip_column_header_prefixes 执行失败，将使用先前结果: {exc}"
+            f"extract_column_header_prefixes 执行失败，将使用先前结果: {exc}"
         )
 
     # [自定义] VLM 表格 HTML 后处理：发票表格 colspan 规范化、缺失值推断
