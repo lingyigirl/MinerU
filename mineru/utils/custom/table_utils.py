@@ -448,9 +448,11 @@ def _classify_tokens(
             in_data_section = True
             data_tokens.append(token)
         else:
-            # 无法分类的不明 token，跳过
-            logger.debug(f"无法分类的 token: {token}，跳过")
-            continue
+            # 无法明确分类的 token（非表头关键词、也非数值），
+            # 可能是发票中的非数值数据（如"免税"、"***"等），作为数据保留
+            in_data_section = True
+            data_tokens.append(token)
+            logger.debug(f"无法明确分类的 token: '{token}'，作为数据保留")
 
     if not header_tokens:
         return [], None
@@ -486,7 +488,9 @@ def _strip_leading_punctuation(token: str) -> str:
     Returns:
         去除开头标点后的 token。
     """
-    return re.sub(r'^[.,;:!?。，、；：！？·•\-–—]+', '', token).strip() or token
+    # 仅去除表格竖线误识别的残留符号（单个 "."），保留有意义的标点
+    cleaned = re.sub(r'^\.(?=[^.\d])', '', token).strip()
+    return cleaned or token
 
 
 def _merge_split_keywords(tokens: list[str]) -> list[str]:
@@ -668,9 +672,9 @@ def _fix_embedded_summary(
     else:
         values[0] = "合计"
 
-    # 清空"合计"原位置和中间的空列
-    for i in range(1, n_cols):
-        if i not in target_slots:
+    # 清空已被移动到目标列的数值的原位置（仅清空被移动过的数值，保留其余内容）
+    for i in range(total_idx, n_cols):
+        if i not in target_slots and values[i] in summary_numbers:
             values[i] = ""
 
     return values
@@ -1184,6 +1188,14 @@ def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
         if summary_cell_idx is None:
             continue
 
+        # 合计已在第一列（标准位置），跳过空值模式
+        # VLM 多行格式输出的干净合计行（合计在列0），结构已正确，
+        # 不需要重组。合计行缺少的 ¥ 值由后续 fix_summary_row_yen_position 负责填充。
+        # 仅当 summary_cell_idx != 0 时才需要空值模式的列位置调整
+        # （如 OCR 重建从 VLM 拼接格中拆分出的合计）。
+        if summary_cell_idx == 0:
+            continue
+
         # 查找前一行是否有数值数据
         if row_idx == 0:
             continue
@@ -1294,7 +1306,6 @@ def _strip_summary_keyword(text: str, keyword: str) -> str:
     if m:
         return text[:m.start()].rstrip()
     return text
-    return text
 
 
 def _insert_summary_row_after(
@@ -1337,6 +1348,10 @@ def _insert_summary_row_after(
             # 从单元格中提取所有 ¥/￥ 前缀的金额值
             yen_values = re.findall(r'[¥￥][\d.,]+', cell_val)
             td.string = " ".join(yen_values) if yen_values else ""
+            # 注意：此处不清理源数据行中的 ¥ 值。
+            # ¥ 值的完整移动（从数据行提取 → 按 colspan 展开列索引
+            # 放置到合计行）由下游 extract_column_header_prefixes() 统一处理，
+            # 该函数拥有正确的 colspan 展开逻辑。
         else:
             # 其余列留空
             td.string = ""
@@ -1430,11 +1445,20 @@ def _handle_summary_split_with_rowspan(
     next_row = data_row.find_next_sibling("tr")
     next_cells = next_row.find_all(["td", "th"]) if next_row else []
 
+    copied_count = 0
     for idx, (cell_idx, _eff_col) in enumerate(non_rowspan_cols):
         if idx < len(next_cells) and cell_idx < len(data_cells):
             data_cells[cell_idx].string = next_cells[idx].get_text().strip()
+            copied_count += 1
 
     if next_row:
+        # 验证所有非空 next_cells 值都已被复制，未复制的记录日志
+        total_next_vals = len([c for c in next_cells if c.get_text().strip()])
+        if copied_count < total_next_vals:
+            logger.warning(
+                f"¥行删除前：{total_next_vals} 个非空值中仅复制了 {copied_count} 个，"
+                f"可能存在内容丢失"
+            )
         next_row.decompose()
 
     # 5. 创建合计行——从合并后的数据行取值
@@ -1715,6 +1739,8 @@ def _infer_missing_values_in_table(
         soup: BeautifulSoup 对象。
         table: <table> Tag。
     """
+    import os
+
     rows = table.find_all("tr")
     if len(rows) < 2:
         return
@@ -1791,8 +1817,12 @@ def _infer_missing_values_in_table(
             continue
 
         # 计算税率并填充
+        # [自定义] 环境变量 MINERU_INFER_MISSING_TABLE_VALUES 控制是否启用推断填充
+        # 默认关闭——推断值不是识别结果，违反"输出不多不少"原则
+        if not os.getenv("MINERU_INFER_MISSING_TABLE_VALUES", "").lower() in ("1", "true", "yes"):
+            continue
         computed_rate = round(tax_val / amount_val * 100)
-        # 仅当税率在合理范围内（0-20% 或精确匹配如 13/9/6/3）才填充
+        # 仅当税率在合理范围内（2~20%）才填充
         if 2 <= computed_rate <= 20:
             rate_str = f"{computed_rate}%"
             if rate_col < len(cells):
@@ -1984,6 +2014,174 @@ def normalize_invoice_table(html: str) -> str:
     return str(soup)
 
 
+def fix_summary_row_yen_position(html: str) -> str:
+    """修正所有发票表格中合计行的 ¥/￥ 值列位置。
+
+    VLM 输出或 normalize_invoice_table 处理后，合计行中的 ¥/￥ 值
+    可能被放在错误的展开列位置。此函数用 TH 行的 colspan 结构
+    重建合计行，将 ¥ 值按顺序对齐到“金额”和“税额”列。
+
+    此函数应在 normalize_invoice_table 之后调用，
+    因为 normalize_invoice_table 会调整 colspan 结构。
+
+    Args:
+        html: 表格 HTML 字符串。
+
+    Returns:
+        处理后的 HTML 字符串。
+    """
+    if not html or not isinstance(html, str):
+        return html
+    if "<table" not in html.lower():
+        return html
+
+    from bs4 import BeautifulSoup
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        logger.warning("BeautifulSoup 解析表格 HTML 失败，跳过 ¥ 位置修正")
+        return html
+
+    for table in soup.find_all("table"):
+        try:
+            _fix_summary_row_yen_for_th_table(table, soup)
+        except Exception:
+            logger.exception("fix_summary_row_yen_position 处理单个表格时出错，跳过")
+            continue
+
+    return str(soup)
+
+
+def _fix_summary_row_yen_for_th_table(
+    table: Tag,
+    soup: BeautifulSoup,
+) -> None:
+    """修正已有 <th> 行的发票表格中合计行的 ¥ 值列位置。
+
+    VLM 直接输出的发票表格可能已有完整的 <th> 表头行，
+    但合计行中的 ¥ 值可能被放在错误的展开列位置
+    （如 colspan=5 的"合计"后 ¥ 值堆在隨后的物理列，而非"金额"列）。
+
+    此函數用 TH 行的 colspan 结构重建合计行，
+    将 ¥ 值按顺序对齐到"金额"和"税额"列。
+
+    Args:
+        table: BeautifulSoup 的 <table> 标签。
+        soup: BeautifulSoup 对象。
+    """
+    rows = table.find_all("tr")
+
+    # 1. 找到 TH 行并构建展开列标签
+    header_tr = None
+    for row in rows:
+        if row.find("th"):
+            header_tr = row
+            break
+    if header_tr is None:
+        return
+
+    th_cells = header_tr.find_all("th")
+    if len(th_cells) < 3:
+        return
+
+    # 构建展开后的列标签列表
+    expanded_headers: list[str] = []
+    for th in th_cells:
+        colspan = int(th.get("colspan", 1))
+        label = th.get_text().strip()
+        for _ in range(colspan):
+            expanded_headers.append(label)
+
+    # 找到"金额"和"税额"列的展开索引
+    amount_cols = [i for i, h in enumerate(expanded_headers) if h == "金额"]
+    tax_cols = [i for i, h in enumerate(expanded_headers) if h == "税额"]
+
+    if not amount_cols and not tax_cols:
+        # 非发票表格（无金额/税额列），跳过
+        return
+
+    # 2. 找到合计行
+    summary_row = None
+    for row in rows:
+        cells = row.find_all("td")
+        if not cells:
+            continue
+        first_text = cells[0].get_text().strip()
+        if first_text in ("合计", "合"):
+            summary_row = row
+            break
+    if summary_row is None:
+        return
+
+    # 3. 提取合计行中的 ¥/￥ 值（保持原始顺序）
+    yen_values: list[str] = []
+    for td in summary_row.find_all("td"):
+        text = td.get_text().strip()
+        for m in re.finditer(r'[¥￥][\d.,]+', text):
+            yen_values.append(m.group())
+
+    if not yen_values:
+        return
+
+    # 4. 用 TH 行的 colspan 结构重建合计行
+    summary_row.clear()
+    for th in th_cells:
+        new_td = soup.new_tag("td")
+        colspan = th.get("colspan")
+        if colspan:
+            new_td["colspan"] = colspan
+        summary_row.append(new_td)
+
+    rebuilt_cells = summary_row.find_all("td")
+    # 全部清空
+    for td in rebuilt_cells:
+        td.string = ""
+
+    # 第一列放"合计"
+    if rebuilt_cells:
+        rebuilt_cells[0].string = "合计"
+
+    # 5. 将 ¥ 值放置到正确列
+    # ¥ 值按顺序：[金额¥, 税额¥] 或 [金额¥] 或 [金额¥, 税额¥, 金额¥2, ...]
+    # 先建立目标列列表（交替：先金额后税额）
+    target_pairs = []
+    max_len = max(len(amount_cols), len(tax_cols))
+    for i in range(max_len):
+        if i < len(amount_cols):
+            target_pairs.append(amount_cols[i])
+        if i < len(tax_cols):
+            target_pairs.append(tax_cols[i])
+
+    for yi, yen_val in enumerate(yen_values):
+        if yi >= len(target_pairs):
+            logger.warning(
+                f"合计行 ¥ 值数量({len(yen_values)})超过目标列数({len(target_pairs)})，"
+                f"第 {yi+1} 个 ¥ 值 {yen_val} 无法放置"
+            )
+            break
+        target_expanded = target_pairs[yi]
+
+        # 展开列索引 → 物理列索引
+        phys_idx = 0
+        expanded_so_far = 0
+        for ci, td in enumerate(rebuilt_cells):
+            cs = int(td.get("colspan", 1))
+            if expanded_so_far + cs > target_expanded:
+                phys_idx = ci
+                break
+            expanded_so_far += cs
+
+        if phys_idx < len(rebuilt_cells):
+            rebuilt_cells[phys_idx].string = yen_val
+
+    logger.info(
+        f"合计行¥位置修复(已有TH): ¥值={yen_values}, "
+        f"金额列展开={amount_cols}, 税额列展开={tax_cols}, "
+        f"目标={target_pairs[:len(yen_values)]}"
+    )
+
+
 def extract_column_header_prefixes(html: str) -> str:
     """提取发票表格数据单元格中内嵌的列标题前缀到 <th> 表头行。
 
@@ -1994,7 +2192,8 @@ def extract_column_header_prefixes(html: str) -> str:
 
     与 strip_column_header_prefixes（删除前缀）不同，此函数保留全部识别内容。
 
-    已有 <th> 行的表格（如 OCR 重建的表）跳过不处理。
+    已有 <th> 行的表格（如 VLM 直接输出的发票表），跳过前缀提取，
+    但会修复合计行中 ¥ 值的列位置（VLM 可能将 ¥ 值放在错误的展开列）。
 
     [自定义] 此函数由 _format_embedded_html 管道调用。
     上游合并时此模块仅需保留，无需修改。
@@ -2020,8 +2219,9 @@ def extract_column_header_prefixes(html: str) -> str:
 
     for table in soup.find_all("table"):
         try:
-            # 已有 <th> 的表跳过（OCR 重建或已处理过）
+            # 已有 <th> 的表：跳过后面的前缀提取，但需修复合计行 ¥ 值列位置
             if table.find("th"):
+                _fix_summary_row_yen_for_th_table(table, soup)
                 continue
 
             rows = table.find_all("tr")
@@ -2796,6 +2996,53 @@ def _find_ocr_header_row(ocr_grid: list[list[str]]) -> int:
     return 0
 
 
+def _merge_split_header_chars(ocr_header: list[str]) -> list[str]:
+    """合并 OCR 表头中被拆分的单个中文字符。
+
+    PaddleOCR 在小图片上可能将多字符标签（如"金额"、"税额"、"单价"）
+    检测为独立的单个字符。此函数尝试合并相邻的单个中文字符，
+    仅当合并结果在 _INVOICE_HEADER_KEYWORDS 中时才会合并。
+
+    Args:
+        ocr_header: OCR 表头行的单元格文本列表。
+
+    Returns:
+        合并后的表头列表，长度可能小于输入。
+    """
+    if not ocr_header:
+        return ocr_header
+
+    def _is_single_cjk(c: str) -> bool:
+        """判断是否为单个 CJK（中日韩统一表意文字）字符。"""
+        return (
+            len(c) == 1
+            and ('一' <= c <= '鿿' or '㐀' <= c <= '䶿')
+        )
+
+    result: list[str] = []
+    skip_next = False
+    for i, cell in enumerate(ocr_header):
+        if skip_next:
+            skip_next = False
+            continue
+
+        stripped = cell.strip() if cell else ""
+
+        # 尝试与下一个单元格合并（仅当两个都是单个中文字符）
+        if _is_single_cjk(stripped) and i + 1 < len(ocr_header):
+            next_cell = ocr_header[i + 1].strip() if ocr_header[i + 1] else ""
+            if _is_single_cjk(next_cell):
+                candidate = stripped + next_cell
+                if candidate in _INVOICE_HEADER_KEYWORDS:
+                    result.append(candidate)
+                    skip_next = True
+                    continue
+
+        result.append(stripped)
+
+    return result
+
+
 def _map_ocr_cols_to_vlm_cols(
     ocr_header: list[str],
     vlm_data_row: list[str],
@@ -2835,6 +3082,141 @@ def _map_ocr_cols_to_vlm_cols(
                 break
 
     return mapping
+
+
+def _fix_ocr_summary_row_yen_position(
+    new_rows: list[Tag],
+    template_cells: list[Tag],
+    ocr_header: list[str],
+    ocr_header_labels: list[str],
+    col_map: dict[int, int],
+    soup: BeautifulSoup,
+) -> None:
+    """修复 OCR 重建表格中合计行的 ¥ 值列位置。
+
+    OCR 网格中的合计行（首列为"合计"/"合"）在经过模板列匹配后，
+    ¥ 值可能被分配到错误的列——模板列文本匹配对 ¥ 值不感知列语义，
+    会将 "￥57689.91" 匹配到包含该子串的任意模板列文本中。
+
+    此函数重建合计行的 colspan 结构以匹配模板列布局，
+    然后将 ¥ 值放置到正确的数值列（"金额"列、"税额"列）。
+
+    Args:
+        new_rows: OCR 重建后的所有行（会被原地修改）。
+        template_cells: VLM 拼接行的物理单元格模板。
+        ocr_header: OCR 表头行的单元格文本列表。
+        ocr_header_labels: OCR 表头中在 _INVOICE_HEADER_KEYWORDS 内的标签。
+        col_map: OCR 列索引到 VLM 列索引的映射。
+        soup: BeautifulSoup 对象。
+    """
+    # 构建展开后的列标题列表（如 expanded_headers[7] = "金额"）
+    expanded_headers: list[str] = []
+    for vc, orig in enumerate(template_cells):
+        colspan = int(orig.get("colspan", 1))
+        # 确定该物理列对应的标签
+        label = ""
+        vlm_tpl_norm = _normalize_for_matching(
+            orig.get_text().strip()
+        ).replace(" ", "")
+        for oc_hdr in ocr_header_labels:
+            hdr_norm = _normalize_for_matching(oc_hdr).replace(" ", "")
+            if hdr_norm and vlm_tpl_norm and (
+                hdr_norm in vlm_tpl_norm or vlm_tpl_norm in hdr_norm
+            ):
+                label = oc_hdr
+                break
+        if not label:
+            for oc, mapped_vc in col_map.items():
+                if mapped_vc == vc and oc < len(ocr_header):
+                    candidate = ocr_header[oc].strip()
+                    if candidate in _INVOICE_HEADER_KEYWORDS:
+                        label = candidate
+                        break
+        for _ in range(colspan):
+            expanded_headers.append(label)
+
+    # 找到"金额"和"税额"列的展开索引
+    amount_expanded_cols = [
+        i for i, h in enumerate(expanded_headers) if h == "金额"
+    ]
+    tax_expanded_cols = [
+        i for i, h in enumerate(expanded_headers) if h == "税额"
+    ]
+
+    logger.info(
+        f"OCR合计行¥位置修复: expanded_headers={expanded_headers}, "
+        f"金额列={amount_expanded_cols}, 税额列={tax_expanded_cols}, "
+        f"new_rows数={len(new_rows)}"
+    )
+
+    for row in new_rows:
+        cells = row.find_all("td")
+        if not cells:
+            continue
+        first_text = cells[0].get_text().strip()
+        logger.info(
+            f"OCR合计行¥位置修复: 检查行 first_text='{first_text}', "
+            f"cells数={len(cells)}"
+        )
+        if first_text not in ("合计", "合"):
+            continue
+
+        # 提取行中所有 ¥/￥ 值
+        yen_values: list[str] = []
+        for td in cells:
+            text = td.get_text().strip()
+            for m in re.finditer(r'[¥￥][\d.,]+', text):
+                yen_values.append(m.group())
+
+        if not yen_values:
+            continue
+
+        # 重建行结构：用模板列的 colspan 创建单元格
+        row.clear()
+        for orig in template_cells:
+            new_td = soup.new_tag("td")
+            cs = orig.get("colspan")
+            if cs:
+                new_td["colspan"] = cs
+            row.append(new_td)
+
+        rebuilt_cells = row.find_all("td")
+        for td in rebuilt_cells:
+            td.string = ""
+
+        # 放置"合计"标签到第一列
+        rebuilt_cells[0].string = "合计"
+
+        # 找到每个 ¥ 值对应的展开列索引并放置
+        # ¥ 值顺序通常为 [金额¥值, 税额¥值]
+        for yi, yen_val in enumerate(yen_values):
+            if yi == 0 and amount_expanded_cols:
+                target_expanded = amount_expanded_cols[0]
+            elif yi == 1 and tax_expanded_cols:
+                target_expanded = tax_expanded_cols[0]
+            elif yi < len(amount_expanded_cols):
+                target_expanded = amount_expanded_cols[yi]
+            else:
+                continue
+
+            # 展开列索引 → 物理列索引
+            phys_idx = 0
+            expanded_so_far = 0
+            for ci, td in enumerate(rebuilt_cells):
+                cs = int(td.get("colspan", 1))
+                if expanded_so_far + cs > target_expanded:
+                    phys_idx = ci
+                    break
+                expanded_so_far += cs
+
+            if phys_idx < len(rebuilt_cells):
+                rebuilt_cells[phys_idx].string = yen_val
+
+        logger.info(
+            f"OCR合计行¥位置修复: ¥值={yen_values}, "
+            f"金额列展开索引={amount_expanded_cols}, "
+            f"税额列展开索引={tax_expanded_cols}"
+        )
 
 
 def _rebuild_merged_rows_from_ocr(
@@ -2897,6 +3279,10 @@ def _rebuild_merged_rows_from_ocr(
 
     # 2. 建立 OCR 列 → VLM 列映射
     ocr_header = ocr_grid[header_row_idx]
+    # [自定义] 合并 OCR 表头中被拆分的单个中文字符
+    # 小图片上 PaddleOCR 可能将"金额"/"税额"/"单价"等标签
+    # 拆分为独立字符（如"金"+"额"），合并后便于后续列映射和标签匹配。
+    ocr_header = _merge_split_header_chars(ocr_header)
     # 使用拼接行的原始单元格文本（不展开 colspan）做列匹配
     concat_row_cells = rows[data_row_start].find_all(["td", "th"])
     # 如果 data_row_start 未指向拼接行，则查找真正的拼接行
@@ -3014,12 +3400,23 @@ def _rebuild_merged_rows_from_ocr(
             new_tr.append(new_td)
         new_rows.append(new_tr)
 
-    # 5. 在 VLM 拼接行之前插入 OCR 表头行
-    # OCR 表头来自 ocr_grid[header_row_idx] 中在 _INVOICE_HEADER_KEYWORDS 里的标签
+    # 提取 OCR 表头标签（供后续步骤 4.5 和步骤 5 共用）
     ocr_header_labels = [
         h for h in ocr_header
         if h.strip() in _INVOICE_HEADER_KEYWORDS
     ]
+
+    # 4.5 修复 OCR 重建表格中合计行的 ¥ 值列位置
+    # OCR 行中的合计行（首列为"合计"）经过模板列匹配后，
+    # ¥ 值可能被分配到错误的列（模板列文本匹配对 ¥ 值不感知列语义）。
+    # 需要按 TH 行的 colspan 结构重建合计行，将 ¥ 值对齐到正确列。
+    _fix_ocr_summary_row_yen_position(
+        new_rows, template_cells, ocr_header, ocr_header_labels,
+        col_map, soup,
+    )
+
+    # 5. 在 VLM 拼接行之前插入 OCR 表头行
+    # OCR 表头来自 ocr_grid[header_row_idx] 中在 _INVOICE_HEADER_KEYWORDS 里的标签
     if ocr_header_labels and len(ocr_header_labels) >= 3:
         # 用 col_map 将 OCR 表头标签映射到 VLM 列位置
         header_tr = soup.new_tag("tr")
