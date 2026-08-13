@@ -2442,6 +2442,30 @@ def _is_invoice_table(table: Tag) -> bool:
     return match_count >= 3
 
 
+_SPARSE_EMPTY_RATIO_THRESHOLD = 0.3
+
+
+def _is_structurally_sparse_table(table: Tag) -> bool:
+    """判断表格是否为结构性稀疏表（如财务报表、征信报告）。
+
+    这类表格的空单元格是合法留白（矩阵稀疏），非 VLM 遗漏。
+    且表头不含"金额/税额/数量/单价"等关键词，列类型全部归为 "text"，
+    _fill_empty_cells_from_ocr_grid 的类型匹配退化为"任意文本填任意空列"，
+    会灌入表头文字/行标签，产生重复内容。因此跳过 OCR 补充。
+
+    Args:
+        table: BeautifulSoup <table> Tag。
+
+    Returns:
+        True 表示空单元格占比过高，判定为结构性稀疏。
+    """
+    tds = table.find_all("td")
+    if not tds:
+        return False
+    empty_count = sum(1 for c in tds if not c.get_text().strip())
+    return (empty_count / len(tds)) > _SPARSE_EMPTY_RATIO_THRESHOLD
+
+
 def _has_colspan_mismatch(html: str) -> bool:
     """快速检测表格是否存在 colspan 不一致的问题。
 
@@ -2667,10 +2691,12 @@ def _parse_vlm_table_structure(rows: list[Tag]) -> tuple[list[list[str]], list[l
 def _detect_data_row_start(rows: list[Tag], vlm_data: list[list[str]]) -> int:
     """检测数据行起始位置。
 
-    规则：
+    表头是表格开头的连续块。规则：
     1. 含 <th> 的行视为表头。
     2. 含 <img> 的行视为数据行（含手写/签章图片），不参与表头扩展。
-    3. 全短标签行（<15 字且非数据值）视为类表头。
+    3. 含数值的行视为数据行，终止表头扩展——表头不含裸数值
+       （"2022年度"因含"年度"二字，_is_data_value 判为 False）。
+    4. 全短标签行（<15 字且非数据值）仅在表头块内视为类表头。
 
     Args:
         rows: <tr> 标签列表。
@@ -2689,6 +2715,12 @@ def _detect_data_row_start(rows: list[Tag], vlm_data: list[list[str]]) -> int:
         else:
             cells = row.find_all("td")
             texts = [c.get_text().strip() for c in cells]
+            # 含数值 → 已进入数据区，终止表头判定。
+            # 防止"数值列本为空的标签数据行"（如所有者权益变动表中间的
+            # "加:会计政策变更""1.提取盈余公积"等）被误判为表头，
+            # 导致 data_row_start 一路推进到表格末尾行。
+            if any(_is_data_value(t) for t in texts if t):
+                break
             if texts and all(
                 len(t) < 15 and not _is_data_value(t)
                 for t in texts if t
@@ -3091,6 +3123,7 @@ def _fix_ocr_summary_row_yen_position(
     ocr_header_labels: list[str],
     col_map: dict[int, int],
     soup: BeautifulSoup,
+    ocr_data_rows: list[list[str]] | None = None,
 ) -> None:
     """修复 OCR 重建表格中合计行的 ¥ 值列位置。
 
@@ -3108,6 +3141,10 @@ def _fix_ocr_summary_row_yen_position(
         ocr_header_labels: OCR 表头中在 _INVOICE_HEADER_KEYWORDS 内的标签。
         col_map: OCR 列索引到 VLM 列索引的映射。
         soup: BeautifulSoup 对象。
+        ocr_data_rows: OCR 数据行网格（含合计行），用于从 OCR 原始合计行提取 ¥ 值。
+            当 VLM 金额单元格漏掉金额合计时，步骤 4 的文本匹配会丢弃该 ¥ 值，
+            此参数使本函数能回退到完整的 OCR 合计行（按 x 排序，¥ 顺序为
+            [金额¥, 税额¥]）。为 None 或未找到合计行时回退到重建行提取。
     """
     # 构建展开后的列标题列表（如 expanded_headers[7] = "金额"）
     expanded_headers: list[str] = []
@@ -3143,6 +3180,18 @@ def _fix_ocr_summary_row_yen_position(
         i for i, h in enumerate(expanded_headers) if h == "税额"
     ]
 
+    # 优先从 OCR 原始合计行提取 ¥ 值。VLM 可能漏掉金额合计（如消防发票），
+    # 步骤 4 会因此丢弃该 ¥ 值；OCR 合计行按 x 排序，¥ 值顺序为 [金额¥, 税额¥]。
+    ocr_summary_yen: list[str] = []
+    if ocr_data_rows:
+        for orow in ocr_data_rows:
+            if not orow or orow[0].strip() not in ("合计", "合"):
+                continue
+            for c in orow:
+                for m in re.finditer(r'[¥￥][\d.,]+', c):
+                    ocr_summary_yen.append(m.group())
+            break
+
     logger.info(
         f"OCR合计行¥位置修复: expanded_headers={expanded_headers}, "
         f"金额列={amount_expanded_cols}, 税额列={tax_expanded_cols}, "
@@ -3161,12 +3210,14 @@ def _fix_ocr_summary_row_yen_position(
         if first_text not in ("合计", "合"):
             continue
 
-        # 提取行中所有 ¥/￥ 值
-        yen_values: list[str] = []
-        for td in cells:
-            text = td.get_text().strip()
-            for m in re.finditer(r'[¥￥][\d.,]+', text):
-                yen_values.append(m.group())
+        # 提取合计行所有 ¥/￥ 值：优先用 OCR 原始合计行（完整），
+        # 回退到重建行文本（OCR 未识别到合计行或未含 ¥ 时）
+        yen_values = list(ocr_summary_yen)
+        if not yen_values:
+            for td in cells:
+                text = td.get_text().strip()
+                for m in re.finditer(r'[¥￥][\d.,]+', text):
+                    yen_values.append(m.group())
 
         if not yen_values:
             continue
@@ -3412,7 +3463,7 @@ def _rebuild_merged_rows_from_ocr(
     # 需要按 TH 行的 colspan 结构重建合计行，将 ¥ 值对齐到正确列。
     _fix_ocr_summary_row_yen_position(
         new_rows, template_cells, ocr_header, ocr_header_labels,
-        col_map, soup,
+        col_map, soup, ocr_data_rows,
     )
 
     # 5. 在 VLM 拼接行之前插入 OCR 表头行
@@ -3779,6 +3830,11 @@ def supplement_vlm_table_cells_with_ocr(
                     # 用于检测和纠正 VLM 的多行拼接问题
                     is_invoice = _is_invoice_table(table)
                     if not has_empty and not has_img and not is_invoice:
+                        continue
+                    # 结构性稀疏表格（如财务报表、征信报告）的空单元格是合法留白，
+                    # 非 VLM 遗漏，不应做 OCR 填充（否则会因列类型退化为全 "text" 而把
+                    # 表头文字/行标签误填进空列，产生重复内容）。发票与含 <img> 的表格除外。
+                    if _is_structurally_sparse_table(table) and not has_img and not is_invoice:
                         continue
                 except Exception:
                     continue
