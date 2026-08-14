@@ -1037,6 +1037,11 @@ def split_summary_from_data_cell(html: str) -> str:
     modified = False
     for table in soup.find_all("table"):
         try:
+            # [自定义] 仅对发票表格执行合计/小计拆分。
+            # 财务报表等通用表格中的「流动资产合计」「负债合计」「所有者权益合计」
+            # 等是合法的会计科目行标签，结尾虽含「合计」但不应拆分。
+            if not _is_invoice_table(table):
+                continue
             _split_summary_rows_in_table(soup, table)
             modified = True  # 内部无异常即认为可能已修改
         except Exception:

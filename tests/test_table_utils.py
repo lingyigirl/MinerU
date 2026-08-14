@@ -14,7 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from bs4 import BeautifulSoup
 
-from mineru.utils.custom.table_utils import extract_column_header_prefixes
+from mineru.utils.custom.table_utils import (
+    extract_column_header_prefixes,
+    split_summary_from_data_cell,
+)
 
 
 def _row_texts(html):
@@ -86,7 +89,46 @@ def test_extract_column_header_prefixes_keeps_compact_keyword():
     assert not any("金额42123.20" in c for c in data_row), f"不应残留「金额42123.20」，实际 {data_row}"
 
 
+def test_split_summary_from_data_cell_skips_financial_statement():
+    """财务报表行标签「流动资产合计」结尾含「合计」但不应被拆分。
+
+    复现场景：资产负债表中「流动资产合计」「负债合计」等是合法的会计科目
+    行标签（以「合计」结尾）。split_summary_from_data_cell 的 endswith 匹配
+    曾将其误拆为「流动资产」+「合计」两行，本测试确保非发票表格跳过该处理。
+    """
+    table_html = """<table>
+      <tr><td>资 产</td><td>2023年12月31日</td><td>2022年12月31日</td></tr>
+      <tr><td>流动资产合计</td><td>30,645,434.96</td><td>12,851,478.30</td></tr>
+      <tr><td>非流动资产合计</td><td>11,400,819.85</td><td>7,310,307.28</td></tr>
+    </table>"""
+    out = split_summary_from_data_cell(table_html)
+
+    # 行标签应保持完整，不得拆出「流动资产」+「合计」两行
+    assert "流动资产合计" in out, f"「流动资产合计」应保持完整，实际 {out}"
+    assert "非流动资产合计" in out, f"「非流动资产合计」应保持完整，实际 {out}"
+    assert "<td>合计</td>" not in out, f"不应拆出独立的「合计」行，实际 {out}"
+
+
+def test_split_summary_from_data_cell_splits_invoice():
+    """发票表格中「*供电*电费 合计」仍应拆分出「合计」行，行为不回退。
+
+    防止加入发票门控后误伤真正的发票场景：发票表头含「项目名称/数量/单价/
+    金额/税额」等关键词，可被 _is_invoice_table 识别，合计标签应继续拆分。
+    """
+    table_html = """<table>
+      <tr><th>项目名称</th><th>规格型号</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th><th>税率/征收率</th><th>税额</th></tr>
+      <tr><td>*供电*电费 合计</td><td></td><td></td><td></td><td></td><td>¥4942.85</td><td></td><td>¥28973.82</td></tr>
+    </table>"""
+    out = split_summary_from_data_cell(table_html)
+
+    # 「合计」应从数据标签中拆出为独立行
+    assert "合计" in out, f"发票合计标签应保留，实际 {out}"
+    assert "*供电*电费" in out, f"数据标签「*供电*电费」应保留，实际 {out}"
+
+
 if __name__ == "__main__":
     test_extract_column_header_prefixes_splits_spaced_keyword()
     test_extract_column_header_prefixes_keeps_compact_keyword()
-    print("✅ extract_column_header_prefixes 列名拆分回归测试通过")
+    test_split_summary_from_data_cell_skips_financial_statement()
+    test_split_summary_from_data_cell_splits_invoice()
+    print("✅ table_utils 列名拆分 + 合计拆分回归测试通过")
