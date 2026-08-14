@@ -19,6 +19,7 @@ from mineru.utils.custom.table_utils import (
     _parse_vlm_table_structure,
     _is_structurally_sparse_table,
     _rebuild_merged_rows_from_ocr,
+    _fill_empty_cells_from_ocr_grid,
 )
 
 
@@ -288,6 +289,68 @@ def test_ocr_rebuild_summary_yen_unchanged_when_template_has_both():
     )
 
 
+def _fill_table_from_grid(table_html, ocr_grid):
+    """用 OCR 网格填充表格，返回填充后的表格文本。
+
+    Args:
+        table_html: 表格 HTML 字符串。
+        ocr_grid: OCR 识别文字网格（每行内按 x 排序）。
+
+    Returns:
+        (modified, table_text)：是否修改，以及填充后表格的纯文本。
+    """
+    soup = BeautifulSoup(table_html, "html.parser")
+    table = soup.find("table")
+    modified = _fill_empty_cells_from_ocr_grid(soup, table, ocr_grid)
+    return modified, table.get_text()
+
+
+def test_fill_empty_cells_skips_fullwidth_duplicate_labels():
+    """全角分区标题与 VLM 半角标签重复时不应被复制填充（原则 1：输出不多不少）。
+
+    资产负债表式场景：VLM 已含半角"递延税项:"（同行）与"流动资产:"/"流动负债:"
+    （顶部标题行），OCR 读出全角"递延税项："/"流动资产："/"流动负债："。旧逻辑仅
+    同行精确去重，全角逃过去重被填入空的行次/期末数列，产生重复字段。
+    """
+    table_html = """<table>
+      <tr><td>资 产</td><td>行次</td><td>年初数</td><td>期末数</td><td>负债</td><td>行次</td><td>年初数</td><td>期末数</td></tr>
+      <tr><td>流动资产:</td><td></td><td></td><td></td><td>流动负债:</td><td></td><td></td><td></td></tr>
+      <tr><td>货币资金</td><td>1</td><td>100.00</td><td>200.00</td><td>短期借款</td><td>68</td><td>100.00</td><td></td></tr>
+      <tr><td>递延税项:</td><td></td><td></td><td></td><td>未分配利润</td><td>121</td><td>300.00</td><td>400.00</td></tr>
+    </table>"""
+    ocr_grid = [
+        ["资 产", "行次", "年初数", "期末数", "负债", "行次", "年初数", "期末数"],
+        ["流动资产：", "", "", "", "流动负债：", "", "", ""],
+        ["货币资金", "1", "100.00", "200.00", "短期借款", "68", "100.00", ""],
+        ["递延税项：", "", "", "", "未分配利润", "121", "300.00", "400.00"],
+    ]
+    modified, text = _fill_table_from_grid(table_html, ocr_grid)
+
+    assert "递延税项：" not in text, f"全角「递延税项：」不应被复制填充，实际 {text!r}"
+    assert "流动资产：" not in text, f"全角「流动资产：」不应被复制填充，实际 {text!r}"
+    assert "流动负债：" not in text, f"全角「流动负债：」不应被复制填充，实际 {text!r}"
+    assert modified is False, "全部 OCR 文本均为重复标签，不应产生任何修改"
+
+
+def test_fill_empty_cells_places_new_text():
+    """新增文本（VLM 漏掉的内容）仍应被"放置"进空单元格（去重不误伤新信息）。
+
+    回归保护：全表规范化去重只跳过 VLM 已含的标签，不应把真正新增的文本也拦掉。
+    """
+    table_html = """<table>
+      <tr><td>项目</td><td>金额</td><td>备注</td></tr>
+      <tr><td>营业收入</td><td>100.00</td><td></td></tr>
+    </table>"""
+    ocr_grid = [
+        ["项目", "金额", "备注"],
+        ["营业收入", "100.00", "主营业务"],  # "主营业务"为 VLM 漏掉的新增文本
+    ]
+    modified, text = _fill_table_from_grid(table_html, ocr_grid)
+
+    assert "主营业务" in text, f"新增文本「主营业务」应被放置进空单元格，实际 {text!r}"
+    assert modified is True, "存在新增文本时应对表格做出修改"
+
+
 if __name__ == "__main__":
     test_equity_statement_label_only_rows_not_treated_as_header()
     test_simple_header_and_data()
@@ -296,4 +359,6 @@ if __name__ == "__main__":
     test_is_structurally_sparse_table()
     test_ocr_rebuild_recovers_amount_summary_yen()
     test_ocr_rebuild_summary_yen_unchanged_when_template_has_both()
-    print("✅ 所有 _detect_data_row_start / 稀疏门控 / OCR 重建 回归测试通过")
+    test_fill_empty_cells_skips_fullwidth_duplicate_labels()
+    test_fill_empty_cells_places_new_text()
+    print("✅ 所有 _detect_data_row_start / 稀疏门控 / OCR 重建 / 去重 回归测试通过")

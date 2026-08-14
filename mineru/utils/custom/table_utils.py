@@ -3636,6 +3636,14 @@ def _fill_empty_cells_from_ocr_grid(
     modified = False
     filled_cell_ids = set()  # 记录已填充的 Tag id，处理 colspan 重复引用
 
+    # 预计算全表 VLM 文本（规范化后），供文本类 OCR 去重使用
+    vlm_all_norm = {
+        _normalize_for_matching(t)
+        for row in vlm_data
+        for t in row
+        if t
+    }
+
     for vlm_row_idx in range(data_row_start, len(vlm_data)):
         vlm_row = vlm_data[vlm_row_idx]
         vlm_tag_row = vlm_cells[vlm_row_idx]
@@ -3644,10 +3652,16 @@ def _fill_empty_cells_from_ocr_grid(
         ocr_texts = ocr_pool.get(vlm_row_idx, [])
         ocr_new: list[tuple[str, str]] = []
         for ot in ocr_texts:
-            # 跳过已在 VLM 行中精确匹配的值
-            if any(ot == vt for vt in vlm_row if vt):
-                continue
             item_type = _classify_ocr_item_type(ot)
+            if item_type == "text":
+                # 文本（标签）：规范化后与全表比对，VLM 已含该标签（全角/半角一致）
+                # 即视为重复，不做填充——只"放置"新增信息，不复制已有信息（原则 1）
+                if _normalize_for_matching(ot) in vlm_all_norm:
+                    continue
+            else:
+                # 数值/税率：仅与同行精确比对去重（数值可合法重复出现）
+                if any(ot == vt for vt in vlm_row if vt):
+                    continue
             ocr_new.append((ot, item_type))
 
         if not ocr_new:
