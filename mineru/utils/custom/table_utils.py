@@ -2241,12 +2241,9 @@ def extract_column_header_prefixes(html: str) -> str:
                     text = td.get_text().strip()
                     if not text:
                         continue
-                    for kw in sorted(_INVOICE_DATA_COLUMN_KEYWORDS, key=len, reverse=True):
-                        if text.startswith(kw) and len(text) > len(kw):
-                            rest = text[len(kw):].strip()
-                            if rest:
-                                concat_cells += 1
-                            break
+                    m = _match_data_column_keyword(text)
+                    if m and m[1]:
+                        concat_cells += 1
                 if concat_cells >= 2:
                     data_row = row
                     break
@@ -2262,18 +2259,9 @@ def extract_column_header_prefixes(html: str) -> str:
                 colspan = int(td.get("colspan", 1))
                 label = ""
                 data = text
-                for kw in sorted(_INVOICE_DATA_COLUMN_KEYWORDS, key=len, reverse=True):
-                    if text.startswith(kw) and len(text) > len(kw):
-                        rest = text[len(kw):].strip()
-                        if rest:
-                            label = kw
-                            data = rest
-                        break
-                    # 纯关键词单元格（如独立的 "规格型号"）→ 提取为表头
-                    if text == kw:
-                        label = kw
-                        data = ""
-                        break
+                m = _match_data_column_keyword(text)
+                if m:
+                    label, data = m
                 # 按 colspan 展开：每个物理列一个 header_label（用于对齐）
                 for _ in range(colspan):
                     header_labels.append(label if _ == 0 else "")
@@ -2302,12 +2290,9 @@ def extract_column_header_prefixes(html: str) -> str:
                         text = td.get_text().strip()
                         if not text:
                             continue
-                        for kw in sorted(_INVOICE_DATA_COLUMN_KEYWORDS, key=len, reverse=True):
-                            if text.startswith(kw) and len(text) > len(kw):
-                                rest = text[len(kw):].strip()
-                                if rest and _is_data_value(rest):
-                                    td.string = rest
-                                break
+                        m = _match_data_column_keyword(text)
+                        if m and m[1] and _is_data_value(m[1]):
+                            td.string = m[1]
 
                 # 从数据行单元格中提取 ¥/￥ 金额值并移至合计行
                 # 避免 ¥ 值在数据行和合计行重复出现
@@ -2907,6 +2892,38 @@ _INVOICE_DATA_COLUMN_KEYWORDS = {
     "项目名称", "货物或应税劳务、服务名称", "规格型号", "单位",
     "数量", "单价", "金额", "税率", "税额", "税率/征收率",
 }
+
+
+def _match_data_column_keyword(text: str) -> tuple[str, str] | None:
+    """识别文本开头的发票数据列关键词，容忍关键词内部空格。
+
+    VLM 对纵向排版的表头（如"数量""单价"上下两字）会输出为"数 量"、
+    "单 价"（关键词内部含空格）。先按原文本直接前缀匹配（保留数据值内
+    空格），失败时再用去除全部空白后的紧凑文本匹配。
+
+    Args:
+        text: 单元格文本（已 strip）。
+
+    Returns:
+        (keyword, data) 元组；未匹配返回 None。data 为去除关键词前缀后的
+        剩余文本（空字符串表示纯关键词单元格）。
+    """
+    compact = "".join(text.split())
+    for kw in sorted(_INVOICE_DATA_COLUMN_KEYWORDS, key=len, reverse=True):
+        # 纯关键词单元格（如独立的"规格型号"）
+        if text == kw:
+            return kw, ""
+        # 直接前缀匹配（如"单位吨"→"单位"+"吨"）
+        if text.startswith(kw) and len(text) > len(kw):
+            rest = text[len(kw):].strip()
+            if rest:
+                return kw, rest
+        # 关键词内部含空格（如"数 量5203"→"数量"+"5203"）
+        if compact != text and compact.startswith(kw) and len(compact) > len(kw):
+            rest = compact[len(kw):].strip()
+            if rest:
+                return kw, rest
+    return None
 
 
 def _try_split_concatenated_numbers(text: str, num_parts: int = 2) -> list[str]:
