@@ -49,7 +49,7 @@ def generate_rotation_corrected_pdf(pdf_bytes: bytes, dpi: int = DEFAULT_PDF_IMA
 
     流程：
     1. pypdfium2 逐页渲染为 PIL Image（保持 dpi 分辨率，不降采样）
-    2. image_rotate() 对每页做 4 方向分类 + 旋转修正（含混合朝向页面的局部修正）
+    2. image_rotate() 对每页做 4 方向分类 + 旋转修正
     3. 将修正后的所有页面合成单 PDF，写入 resolution=dpi 元数据，
        使页面尺寸与源 PDF 一致，同时图像像素保持 dpi 分辨率不降采样
 
