@@ -20,6 +20,7 @@ from mineru.utils.custom.table_utils import (
     _is_structurally_sparse_table,
     _rebuild_merged_rows_from_ocr,
     _fill_empty_cells_from_ocr_grid,
+    _split_concatenated_row_deterministically,
 )
 
 
@@ -349,6 +350,63 @@ def test_fill_empty_cells_places_new_text():
 
     assert "主营业务" in text, f"新增文本「主营业务」应被放置进空单元格，实际 {text!r}"
     assert modified is True, "存在新增文本时应对表格做出修改"
+
+
+def test_fill_empty_cells_places_repeated_text_value():
+    """跨行重复文本值（如单位「吨」）在 VLM 漏掉某一行时仍应被"放置"进空单元格。
+
+    回归保护：去重范围只应覆盖「同行 + 表头行」，不应扩展到其它数据行——否则
+    单位「吨」这类可合法重复出现的值会因全表去重被误拦，导致漏识别单元格无法恢复。
+    """
+    table_html = """<table>
+      <tr><td>项目</td><td>单位</td><td>金额</td></tr>
+      <tr><td>水费</td><td>吨</td><td>100.00</td></tr>
+      <tr><td>电费</td><td></td><td>200.00</td></tr>
+    </table>"""
+    ocr_grid = [
+        ["项目", "单位", "金额"],
+        ["水费", "吨", "100.00"],
+        ["电费", "吨", "200.00"],  # OCR 读到第二行也是「吨」
+    ]
+    modified, text = _fill_table_from_grid(table_html, ocr_grid)
+
+    assert "吨" in text, f"重复文本值「吨」应被放置进漏识别单元格，实际 {text!r}"
+    assert modified is True, "存在漏识别的重复值时应对表格做出修改"
+
+
+def test_split_concatenated_row_deterministically_preserves_all_values():
+    """确定性拆分：VLM 拼接行应拆回 2 数据行 + 1 合计行，且数值完整无丢失。
+
+    回归保护：VLM 将「居民生活 + 生产」两张明细拼接为单行时（数量
+    "2892.0015910.00"、单价 "1.407766251722.11650471401" 等），旧 OCR
+    重建会丢失 15910.00 / 2.11650471401 并错位金额/税率列。确定性拆分
+    应直接按数据行数 N 拆回，保留全部数值且表头 colspan 对齐。
+    """
+    table_html = """<table>
+      <tr><td colspan="2">货物或应税劳务、服务名称*水冰雪*1-居民生活*水冰雪*5-生产合 计</td>
+          <td>规格型号</td><td>单位吨吨</td>
+          <td>数量2892.0015910.00</td>
+          <td colspan="2">单价1.407766251722.11650471401</td>
+          <td>金额4071.2633673.59¥37744.85</td>
+          <td>税率3%3%</td><td>税额122.141010.21¥1132.35</td></tr>
+    </table>"""
+    soup = BeautifulSoup(table_html, "html.parser")
+    table = soup.find("table")
+    vlm_data, _ = _parse_vlm_table_structure(table.find_all("tr"))
+
+    ok = _split_concatenated_row_deterministically(soup, table, vlm_data, 0)
+
+    assert ok is True, "确定性拆分应成功"
+    text = table.get_text()
+    # 值保真：关键数值（含曾被 OCR 重建丢失的 15910.00 / 2.11650471401）必须齐全
+    for expected in ("2892.00", "15910.00", "1.40776625172", "2.11650471401",
+                     "4071.26", "33673.59", "3%", "122.14", "1010.21",
+                     "¥37744.85", "¥1132.35"):
+        assert expected in text, f"确定性拆分丢失值 {expected!r}，实际 {text!r}"
+    # 行拆分：两条服务名称各自独立成行，合计单列一行
+    assert text.count("居民生活") == 1
+    assert text.count("生产") == 1
+    assert "合计" in text
 
 
 if __name__ == "__main__":
