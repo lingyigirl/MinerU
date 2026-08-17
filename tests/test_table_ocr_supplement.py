@@ -422,7 +422,7 @@ def test_fill_empty_cells_skips_trailing_truncated_label():
 
 
 def test_is_financial_statement_table():
-    """表头含「行次」列的表格应判定为财务报表样式，否则不判定。"""
+    """表头含「行次」或「附注编号」列的表格应判定为财务报表样式，否则不判定。"""
     # 财务报表样式：含「行次」列
     fs_html = """<table>
       <tr><td>项目</td><td>行次</td><td>金额</td></tr>
@@ -440,13 +440,22 @@ def test_is_financial_statement_table():
         "「行 次」应判定为财务报表样式"
     )
 
-    # 非财务报表：无「行次」列
+    # 财务报表样式：含「附注编号」列（会企01/02表资产负债表/利润表）
+    fs_notes_html = """<table>
+      <tr><td>资产</td><td>附注编号</td><td>2022年12月31日</td><td>2021年12月31日</td></tr>
+      <tr><td>货币资金</td><td>七、(二)</td><td>7,633,280.89</td><td>392,045.88</td></tr>
+    </table>"""
+    assert _is_financial_statement_table(_table_from_html(fs_notes_html)) is True, (
+        "含「附注编号」表头应判定为财务报表样式"
+    )
+
+    # 非财务报表：无「行次」/「附注编号」列
     non_fs_html = """<table>
       <tr><td>项目</td><td>单位</td><td>金额</td></tr>
       <tr><td>水费</td><td>吨</td><td>100.00</td></tr>
     </table>"""
     assert _is_financial_statement_table(_table_from_html(non_fs_html)) is False, (
-        "无「行次」表头不应判定为财务报表样式"
+        "无「行次」/「附注编号」表头不应判定为财务报表样式"
     )
 
 

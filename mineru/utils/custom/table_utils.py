@@ -2456,14 +2456,20 @@ def _is_structurally_sparse_table(table: Tag) -> bool:
     return (empty_count / len(tds)) > _SPARSE_EMPTY_RATIO_THRESHOLD
 
 
-def _is_financial_statement_table(table: Tag) -> bool:
-    """判断表格是否为财务报表样式（表头含「行次」列）。
+# 财务报表表头标记：中国标准化财务报表含「行次」（会企03表现金流量表）或
+# 「附注编号」（会企01/02表资产负债表/利润表，附注编号列标注科目对应附注）。
+_FINANCIAL_STATEMENT_MARKERS = {"行次", "附注编号"}
 
-    中国标准化财务报表（资产负债表/利润表/现金流量表/所有者权益变动表）
-    均含「行次」列，用于标注科目/项目的行号。这类表格的空单元格是合法留白
-    （未发生业务的行次/金额为空或「-」），非 VLM 遗漏；VLM 对结构化报表的
-    识别已足够准确。若对其做 OCR 补充，会因 OCR 行对齐错位把截断标签/
-    合并数字/单字噪声灌进空列（原则 4：信任上游正确输出，不过度后处理）。
+
+def _is_financial_statement_table(table: Tag) -> bool:
+    """判断表格是否为财务报表样式（表头含「行次」或「附注编号」列）。
+
+    中国标准化财务报表含「行次」列（会企03表现金流量表）或「附注编号」列
+    （会企01/02表资产负债表/利润表），用于标注科目/项目的行号或对应附注编号。
+    这类表格的空单元格是合法留白（未发生业务的行次/金额为空或「-」），非 VLM
+    遗漏；VLM 对结构化报表的识别已足够准确。若对其做 OCR 补充，会因 OCR 行对齐
+    错位把截断标签/合并数字/单字噪声灌进空列（原则 4：信任上游正确输出，
+    不过度后处理）。
 
     Args:
         table: BeautifulSoup <table> Tag。
@@ -2471,10 +2477,10 @@ def _is_financial_statement_table(table: Tag) -> bool:
     Returns:
         是否为财务报表样式表格。
     """
-    # 仅看前 3 行（表头区域），去除空白后精确匹配「行次」，兼容 VLM 输出「行 次」
+    # 仅看前 3 行（表头区域），去除空白后匹配「行次」或「附注编号」标记
     for tr in table.find_all("tr")[:3]:
         for cell in tr.find_all(["td", "th"]):
-            if "".join(cell.get_text().split()) == "行次":
+            if "".join(cell.get_text().split()) in _FINANCIAL_STATEMENT_MARKERS:
                 return True
     return False
 

@@ -276,6 +276,15 @@ def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm
             f"OCR 表格单元格补充执行失败，将使用原始表格 HTML: {exc}"
         )
 
+    # [自定义] 将被误判为 header 的居中短标题从 discarded_blocks 救回正文，
+    # 必须在 build_para_blocks_from_preproc 之前执行，否则救回的标题不会进入 para_blocks。
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.title_utils import rescue_discarded_title_headers
+        rescue_discarded_title_headers(pdf_info_list)
+    except Exception as exc:
+        logger.warning(f"标题救援执行失败，将跳过: {exc}")
+
     build_para_blocks_from_preproc(pdf_info_list)
     merge_para_text_blocks(
         pdf_info_list,
