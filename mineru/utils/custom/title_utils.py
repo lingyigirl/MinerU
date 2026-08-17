@@ -12,6 +12,7 @@ table_caption，均被保留；而「资产负债表」却被判为 header，被
 合并上游时无需关注此文件，但需保留 hook 调用点。
 """
 
+import re
 from collections import Counter
 
 from mineru.utils.enum_class import BlockType
@@ -101,4 +102,71 @@ def rescue_discarded_title_headers(pdf_info_list: list) -> None:
             preproc.append(block)
         if rescued:
             # 保持 preproc_blocks 按 index 排序，保证标题排在表格之前
+            preproc.sort(key=lambda b: b.get("index", 0))
+
+
+# 发票右上角元数据字段标签（电子发票/专用发票顶栏右侧），
+# VLM 常误判为 header 而丢弃。仅救援「标签:值」且值非空的字段。
+_INVOICE_FIELD_LABELS = ("发票代码", "发票号码", "开票日期", "校验码", "机器编号")
+
+# 票号前缀（专用发票「No 02269458」形式）
+_NO_TICKET_RE = re.compile(r"^No\s+\d")
+
+
+def _is_invoice_field_text(text: str) -> bool:
+    """判断文本是否为发票右上角元数据字段（标签:值 形式）。
+
+    必然正确条件：文本以发票字段标签开头，紧跟全角/半角冒号，且冒号后
+    有非空值（如「发票代码：036002200111」）；或以「No 」+ 数字开头
+    （票号）。其余文本（含孤立的标签、裸数字、监制章等）一律不救。
+
+    Args:
+        text: 待判断的文本（已 strip）。
+
+    Returns:
+        True 表示该文本为发票元数据字段。
+    """
+    t = text.strip()
+    if not t:
+        return False
+    for label in _INVOICE_FIELD_LABELS:
+        # 需要「标签 + 冒号 + 非空值」，如「发票代码：036002200111」；
+        # 「机器编号：」这类孤立标签（无值）不救。
+        if t.startswith(label) and len(t) > len(label) + 1 and t[len(label)] in ("：", ":"):
+            if t[len(label) + 1:].strip():
+                return True
+    if _NO_TICKET_RE.match(t):
+        return True
+    return False
+
+
+def rescue_discarded_invoice_fields(pdf_info_list: list) -> None:
+    """将被误判为 header 的发票右上角元数据字段从 discarded_blocks 救回正文。
+
+    VLM 对电子发票右上角的「发票代码/发票号码/开票日期/校验码」等字段
+    分类不稳定，常判为 header 而被 hybrid 转换（hybrid_magic_model.py）
+    归入 discarded_blocks 丢弃。本函数识别「标签:值」形式的发票元数据字段，
+    改判为 text 并移回 preproc_blocks，恢复丢失的发票字段。
+
+    Args:
+        pdf_info_list: middle.json 的 pdf_info 列表（就地修改）。
+    """
+    for page_info in pdf_info_list:
+        preproc = page_info.setdefault("preproc_blocks", [])
+        discarded = page_info.get("discarded_blocks", [])
+        rescued: list[dict] = []
+        for block in discarded:
+            if block.get("type") not in (BlockType.HEADER, BlockType.FOOTER):
+                continue
+            text = _block_text(block).strip()
+            if not _is_invoice_field_text(text):
+                continue
+            # 救援：转为普通文本块
+            block["type"] = BlockType.TEXT
+            rescued.append(block)
+        for block in rescued:
+            discarded.remove(block)
+            preproc.append(block)
+        if rescued:
+            # 保持 preproc_blocks 按 index 排序，保证字段位于表格之前的正确位置
             preproc.sort(key=lambda b: b.get("index", 0))

@@ -13,6 +13,45 @@ from typing import Optional
 from bs4 import BeautifulSoup, NavigableString, Tag
 from loguru import logger
 
+# ============================================================================
+# 发票处理函数地图（维护索引）
+# ============================================================================
+# 本模块与增值税发票后处理相关的函数分属两个阶段，共用多套关键词常量：
+#
+# 【阶段B：内容生成钩子】入口 _format_embedded_html（vlm_middle_json_mkcontent.py），
+# 按固定顺序串行调用（序号即钩子顺序）：
+#   1. split_merged_table_cells        全行/局部合并单元格拆分（:26）
+#   2. split_summary_from_data_cell    数据行内嵌「合计」拆分 + rowspan 处理（:1022）
+#   3. extract_column_header_prefixes  表头前缀提取 / ¥ 对齐（:2386）
+#   4. normalize_invoice_table         发票专用规范化入口（:2149），内部依次：
+#        _normalize_vat_invoice_columns  8 列签名归一化（名称/单价 colspan 2→1，:2036）
+#        _format_summary_row_colspan     合计行连续空单元格合并（:1684）
+#        _infer_missing_values_in_table  缺失税率推断（默认关闭，:1752）
+#   5. fix_summary_row_yen_position    合计行 ¥/￥ 值列对齐（:2218）
+#   6. split_info_cell_multiline       购买方/销售方信息多行拆分（:1875）
+#
+# 【阶段A：Hybrid OCR 补充】入口 finalize_middle_json
+# （hybrid_model_output_to_middle_json.py）：
+#   supplement_vlm_table_cells_with_ocr  VLM 表格空单元格 OCR 补充 / 拼接行确定性重建（:4384）
+#   supplement_empty_table_cells         通用空单元格 OCR 补充（:2723）
+#
+# 【发票检测与归一化】
+#   _is_invoice_table                发票表级检测（≥3 关键词，:2579）
+#   _normalize_vat_invoice_columns   8 列签名收拢（专用/普通发票，:2036）
+#   _is_structurally_sparse_table / _is_financial_statement_table  反向门控（:2634/:2660）
+#
+# 【共享常量】（关键词集合语义有重叠，维护时注意同步）
+#   _INVOICE_HEADER_KEYWORDS        通用发票表头关键词（:17）
+#   _SPLIT_SUMMARY_KEYWORDS         合计/小计/总计摘要关键词（:1019）
+#   _INVOICE_DETECTION_KEYWORDS     发票检测关键词（:2573）
+#   _INVOICE_DATA_COLUMN_KEYWORDS   数据列关键词（:3126）
+#   _NUMERIC_COLUMN_KEYWORDS        数值列关键词（:3168）
+#   _VAT_INVOICE_NAME_LABELS        货物区名称列标签（:1975）
+#   _VAT_INVOICE_COLUMN_SIGNATURE   8 列签名（除名称外 7 列，:1978）
+#   _VAT_INVOICE_ROW_LABELS         非货物区行级标签（:1981）
+#
+# 注：行号为维护时的近似值，以 grep 实际位置为准；本索引只标注职责与调用链。
+
 # 常见发票表头关键词集合（用于识别合并单元格文本中的表头部分）
 _INVOICE_HEADER_KEYWORDS = {
     "项目名称", "货物或应税劳务、服务名称", "规格型号", "单位", "数量",
@@ -463,15 +502,29 @@ def _classify_tokens(
 def _strip_header_prefix(token: str) -> Optional[dict]:
     """检查 token 是否以已知表头关键词开头，若匹配则剥离。
 
+    VLM 对纵向排版的表头（如「数量」「单价」上下两字）会输出为「数 量」、
+    「单 价」（关键词内部含空格），此时直接前缀匹配会失败。因此先按原文本
+    直接前缀匹配（保留数据值内部空格），失败时再用去除全部空白后的紧凑文本
+    匹配，容忍关键词内部空格（与 _match_data_column_keyword 保持一致）。
+
     Args:
         token: 待检查的 token。
 
     Returns:
         {"header": 表头关键词, "data": 剩余文本} 或 None。
     """
+    # 紧凑文本：去除全部空白，用于容忍关键词内部空格（如「数 量」→「数量」）
+    compact = "".join(token.split())
     for header in sorted(_INVOICE_HEADER_KEYWORDS, key=len, reverse=True):
+        # 直接前缀匹配（保留数据值内部空格）
         if token.startswith(header) and len(token) > len(header):
             data = token[len(header):].strip()
+            if data:
+                return {"header": header, "data": data}
+        # 关键词内部含空格（如「数 量1622」→「数量」+「1622」），
+        # 仅在紧凑文本与原文不同且紧凑文本能前缀匹配时才用紧凑文本
+        if compact != token and compact.startswith(header) and len(compact) > len(header):
+            data = compact[len(header):].strip()
             if data:
                 return {"header": header, "data": data}
     return None
@@ -1453,8 +1506,12 @@ def _handle_summary_split_with_rowspan(
     copied_count = 0
     for idx, (cell_idx, _eff_col) in enumerate(non_rowspan_cols):
         if idx < len(next_cells) and cell_idx < len(data_cells):
-            data_cells[cell_idx].string = next_cells[idx].get_text().strip()
-            copied_count += 1
+            # 仅当 ¥ 行对应格非空时才覆盖，避免用空值清空数据行已识别的值
+            # （如「数 量\n1622」拆出的 1622 被 ¥ 行为空的对应格覆盖为空）
+            val = next_cells[idx].get_text().strip()
+            if val:
+                data_cells[cell_idx].string = val
+                copied_count += 1
 
     if next_row:
         # 验证所有非空 next_cells 值都已被复制，未复制的记录日志
@@ -1953,6 +2010,181 @@ def _has_significant_rowspan(html: str) -> bool:
     return False
 
 
+# 增值税发票货物区「名称」列标签（专用/普通发票共用的首列表头）。
+_VAT_INVOICE_NAME_LABELS = ("货物或应税劳务、服务名称", "项目名称")
+
+# 增值税发票货物区 8 列签名中除名称列外的 7 列，用于完整签名校验。
+_VAT_INVOICE_COLUMN_SIGNATURE = ("规格型号", "单位", "数量", "单价", "金额", "税率", "税额")
+
+# 非货物区行的行级标签（收拢列数时应保留其 colspan，不压缩）。
+_VAT_INVOICE_ROW_LABELS = ("价税合计", "购买方", "销售方", "密码区", "备注")
+
+
+def _is_vat_invoice_row_label(text: str) -> bool:
+    """判断单元格文本是否为非货物区行的行级标签。
+
+    非货物区行（购买方/销售方/价税合计）中的窄标签列（如「购买方」「价税合计
+    (大写)」）即使 colspan>1 也不应收拢，否则会破坏标签列的宽度。标签通常短小
+    且命中 _VAT_INVOICE_ROW_LABELS 或以其中某标签开头（兼容「价税合计(大写)」）。
+
+    Args:
+        text: 单元格文本（未 strip）。
+
+    Returns:
+        True 表示该文本为行级标签。
+    """
+    t = "".join(text.split())
+    if not t:
+        return False
+    return any(t == k or t.startswith(k) for k in _VAT_INVOICE_ROW_LABELS)
+
+
+def _shrink_row_to_cols(cells: list[Tag], target_cols: int) -> None:
+    """将非货物区行收拢到 target_cols，每轮对每个非标签宽单元格各减 1 列。
+
+    增值税发票中购买方/销售方/价税合计行与货物区共享同一总列数，但 VLM 对这些
+    行的宽内容块过分割（信息 5 列、密码/备注内容 3 列、大写金额 8 列）。本函数
+    每轮对每个 colspan≥2 且非行级标签的单元格各减 1 列，直至总和 ≤ target_cols，
+    使冗余列被各宽内容块均匀吸收；行级标签列（如「价税合计(大写)」colspan=2）
+    保持不变。
+
+    Args:
+        cells: 一行中的单元格列表。
+        target_cols: 目标列数。
+    """
+    while True:
+        total = sum(int(c.get("colspan", 1)) for c in cells)
+        if total <= target_cols:
+            return
+        shrinkable = [
+            c for c in cells
+            if int(c.get("colspan", 1)) >= 2
+            and not _is_vat_invoice_row_label(c.get_text())
+        ]
+        if not shrinkable:
+            # 无标签外可缩单元格，避免死循环，保持原样
+            return
+        # 若全部各减 1 会低于 target，则只对前 (total-target) 个宽单元格减 1
+        to_shrink = shrinkable
+        if total - len(shrinkable) < target_cols:
+            to_shrink = shrinkable[: total - target_cols]
+        for c in to_shrink:
+            c["colspan"] = str(int(c.get("colspan", 1)) - 1)
+
+
+def _normalize_vat_invoice_columns(soup: BeautifulSoup, table: Tag) -> None:
+    """将 VLM 过分割为 10 列的增值税发票货物区收拢为 8 列。
+
+    必然正确条件：表格为发票样式，且存在一个 TH 表头行，其首列文本 ∈
+    {货物或应税劳务、服务名称, 项目名称} 且 colspan == 2，「单价」列
+    colspan == 2，且该行完整包含 8 列关键词签名（名称|规格型号|单位|数量|
+    单价|金额|税率|税额）。此时 VLM 把「名称」「单价」两个单列宽列误判为
+    colspan=2，产出 10 列，本函数收拢为 8 列。
+
+    变换：
+    1. 货物区行（名称列与单价列位置均有 colspan≥2 的单元格）：
+       把名称列、单价列 colspan 2→1。
+    2. 其余行（购买方/销售方/价税合计）：把 colspan 总和收拢到目标列数，
+       均匀缩减宽内容块。
+
+    匹配失败（非 8 列签名或名称/单价 colspan 非 2）时保持原样。
+
+    Args:
+        soup: BeautifulSoup 对象。
+        table: <table> Tag。
+    """
+    rows = table.find_all("tr")
+    if len(rows) < 2:
+        return
+
+    # 1. 定位货物区表头行（TH 行），校验 8 列签名 + 名称/单价过分割
+    header_row = None
+    unit_price_idx = -1
+    name_start_col = 0
+    unit_price_start_col = 0
+    header_total_cols = 0
+    for row in rows:
+        th_cells = row.find_all("th")
+        if not th_cells:
+            continue
+        texts = [c.get_text().strip() for c in th_cells]
+        # 名称列必须为首列，且 colspan == 2
+        if not texts or texts[0] not in _VAT_INVOICE_NAME_LABELS:
+            continue
+        if int(th_cells[0].get("colspan", 1)) != 2:
+            continue
+        # 单价列 colspan == 2
+        unit_price_idx = next(
+            (i for i, t in enumerate(texts) if t == "单价"), -1
+        )
+        if unit_price_idx < 0 or int(th_cells[unit_price_idx].get("colspan", 1)) != 2:
+            continue
+        # 完整 8 列签名（除名称外其余 7 列必须齐全）
+        if not set(_VAT_INVOICE_COLUMN_SIGNATURE).issubset(set(texts)):
+            continue
+        header_row = row
+        # 计算名称/单价列起始列号与表头总列数
+        col = 0
+        for i, th in enumerate(th_cells):
+            if i == 0:
+                name_start_col = col
+            if i == unit_price_idx:
+                unit_price_start_col = col
+            col += int(th.get("colspan", 1))
+        header_total_cols = col
+        break
+
+    if header_row is None:
+        return
+
+    # 收拢后目标列数 = 表头总列数 -（名称多余列 + 单价多余列）
+    name_cell = header_row.find_all("th")[0]
+    unit_price_cell = header_row.find_all("th")[unit_price_idx]
+    collapse_amount = (int(name_cell.get("colspan", 1)) - 1) + (
+        int(unit_price_cell.get("colspan", 1)) - 1
+    )
+    target_cols = header_total_cols - collapse_amount
+
+    modified = False
+    for row in rows:
+        cells = row.find_all(["td", "th"])
+        if not cells:
+            continue
+        # 计算每个单元格的起始列号与 colspan
+        spans = []
+        col = 0
+        for c in cells:
+            cs = int(c.get("colspan", 1))
+            spans.append((c, col, cs))
+            col += cs
+        # 判断是否为货物区行：名称列与单价列位置均有 colspan≥2 的单元格
+        name_cell_hit = None
+        unit_price_cell_hit = None
+        for c, s, cs in spans:
+            if name_cell_hit is None and s == name_start_col and cs >= 2:
+                name_cell_hit = c
+            if unit_price_cell_hit is None and s == unit_price_start_col and cs >= 2:
+                unit_price_cell_hit = c
+        if name_cell_hit is not None and unit_price_cell_hit is not None:
+            # 货物区行：名称/单价 colspan 收拢为 1
+            if int(name_cell_hit.get("colspan", 1)) != 1:
+                name_cell_hit["colspan"] = "1"
+                modified = True
+            if int(unit_price_cell_hit.get("colspan", 1)) != 1:
+                unit_price_cell_hit["colspan"] = "1"
+                modified = True
+        elif col > target_cols:
+            # 非货物区行：收拢到目标列数
+            _shrink_row_to_cols(cells, target_cols)
+            modified = True
+
+    if modified:
+        logger.info(
+            f"增值税发票 8 列归一化：表头 {header_total_cols} 列收拢为 "
+            f"{target_cols} 列（名称/单价 colspan 2→1）"
+        )
+
+
 def normalize_invoice_table(html: str) -> str:
     """发票表格专用规范化入口。
 
@@ -2005,6 +2237,9 @@ def normalize_invoice_table(html: str) -> str:
                 continue
 
             logger.debug("检测到发票表格，执行发票专用规范化")
+            # 8 列签名归一化（名称/单价 colspan 2→1）必须先于合计行格式化，
+            # 否则收拢改变了列索引后，合计行 ¥ 对齐依赖的列位置会错位。
+            _normalize_vat_invoice_columns(soup, table)
             # 合计行格式化
             _format_summary_row_colspan(soup, table)
             # 缺失值推断
