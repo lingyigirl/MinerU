@@ -114,8 +114,50 @@ def test_rescue_skips_repeated_running_header_across_pages():
     assert len(pdf_info_list[0]["discarded_blocks"]) == 1, "重复页眉应留在 discarded_blocks"
 
 
+def test_rescue_long_title_within_limit():
+    """13 字居中标题「2023年12月份会计报表」应被救回（覆盖 20 字上限内的长标题）。"""
+    page_w, page_h = 595, 842
+    # 居中 13 字标题：中心 x = (180+415)/2 = 297.5 ≈ 页中心 297.5
+    title_block = _header_block("2023年12月份会计报表", [180, 26, 415, 42])
+    pdf_info_list = [{
+        "page_size": [page_w, page_h],
+        "page_idx": 0,
+        "preproc_blocks": [],
+        "discarded_blocks": [title_block],
+    }]
+
+    rescue_discarded_title_headers(pdf_info_list)
+
+    preproc = pdf_info_list[0]["preproc_blocks"]
+    discarded = pdf_info_list[0]["discarded_blocks"]
+    assert len(preproc) == 1, "13 字居中标题应被救回"
+    assert preproc[0]["type"] == "title", "救回后类型应为 title"
+    assert preproc[0]["level"] == 2, "救回后层级应为 level 2"
+    assert discarded == [], "救回后应从 discarded_blocks 移除"
+
+
+def test_rescue_skips_overlong_header():
+    """超过 20 字的居中单行 header（段落/页眉说明）不应被救回，锁死上限。"""
+    page_w, page_h = 595, 842
+    overlong_text = "超长标题" * 6  # 24 字，超过 _MAX_TITLE_LEN=20
+    block = _header_block(overlong_text, [180, 26, 415, 42])  # 居中
+    pdf_info_list = [{
+        "page_size": [page_w, page_h],
+        "page_idx": 0,
+        "preproc_blocks": [],
+        "discarded_blocks": [block],
+    }]
+
+    rescue_discarded_title_headers(pdf_info_list)
+
+    assert pdf_info_list[0]["preproc_blocks"] == [], "超过 20 字的居中 header 不应被救回"
+    assert len(pdf_info_list[0]["discarded_blocks"]) == 1, "超长 header 应留在 discarded_blocks"
+
+
 if __name__ == "__main__":
     test_rescue_centered_title_header()
     test_rescue_skips_left_aligned_running_header()
     test_rescue_skips_repeated_running_header_across_pages()
+    test_rescue_long_title_within_limit()
+    test_rescue_skips_overlong_header()
     print("标题救援回归测试全部通过")
