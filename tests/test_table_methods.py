@@ -1,6 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""测试 make_table_body、make_table_caption 和 make_table_footnote 方法"""
+"""测试表格内容列表生成（make_blocks_to_content_list 的 TABLE 分支）。
+
+覆盖 特定文档类型优化规范.md 原则 11（回归测试多样性）：
+验证 TABLE 段落块（含 table_body / table_caption / table_footnote 子块）
+被正确转换为 content_list 格式：HTML 表格加图片前缀、标题/脚注文本提取、
+bbox 归一化与 page_idx 注入。
+
+历史说明：本文件原测试 make_table_body/make_table_caption/make_table_footnote
+三个函数，上游 2.7.6 → 3.2.0 升级时被重构移除，改为统一由
+make_blocks_to_content_list 处理 TABLE 块，故按现行 API 重写。
+"""
 
 import sys
 import os
@@ -8,343 +18,105 @@ import os
 # 添加本地项目路径到系统路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from mineru.backend.vlm.vlm_middle_json_mkcontent import (
-    make_table_body,
-    make_table_caption,
-    make_table_footnote
-)
+from mineru.backend.vlm.vlm_middle_json_mkcontent import make_blocks_to_content_list
 from mineru.utils.enum_class import BlockType, ContentType
 
 
-def test_make_table_body():
-    """测试 make_table_body 方法"""
-    
-    print("=== 测试 make_table_body 方法 ===\n")
-    
-    # 模拟表格主体块
-    block = {
-        "type": BlockType.TABLE_BODY,
-        "lines": [
-            {
-                "spans": [
-                    {
-                        "type": ContentType.TABLE,
-                        "html": '''
-                            <table border="1">
-                                <tr>
-                                    <th>列1</th>
-                                    <th>列2</th>
-                                </tr>
-                                <tr>
-                                    <td>数据1</td>
-                                    <td>数据2</td>
-                                </tr>
-                            </table>
-                        ''',
-                        "image_path": "table_images/table1.png"
-                    }
-                ]
-            }
-        ]
-    }
-    
-    para_block = {
-        "type": BlockType.TABLE_BODY,
+def _table_para_block(html=None, image_path=None, caption=None, footnote=None):
+    """构造一个 TABLE 段落块（含 body/caption/footnote 子块）。
+
+    Args:
+        html: 表格 body 的 HTML 字符串。
+        image_path: 表格 body 的图片路径。
+        caption: 表格标题文本。
+        footnote: 表格脚注文本。
+
+    Returns:
+        TABLE 段落块字典。
+    """
+    blocks = []
+    if html or image_path:
+        span = {"type": ContentType.TABLE}
+        if html:
+            span["html"] = html
+        if image_path:
+            span["image_path"] = image_path
+        blocks.append({"type": BlockType.TABLE_BODY, "lines": [{"spans": [span]}]})
+    if caption:
+        blocks.append({
+            "type": BlockType.TABLE_CAPTION,
+            "lines": [{"spans": [{"type": ContentType.TEXT, "content": caption}]}],
+        })
+    if footnote:
+        blocks.append({
+            "type": BlockType.TABLE_FOOTNOTE,
+            "lines": [{"spans": [{"type": ContentType.TEXT, "content": footnote}]}],
+        })
+    return {
+        "type": BlockType.TABLE,
         "bbox": [100, 200, 600, 500],
-        "lines": [
-            {
-                "spans": [
-                    {
-                        "type": ContentType.TEXT,
-                        "content": "表格主体内容"
-                    }
-                ]
-            }
-        ]
+        "blocks": blocks,
     }
-    
-    output_content = []
+
+
+def test_table_body_with_image():
+    """表格 body 含 HTML 与图片路径时，HTML 与加前缀的图片路径均被保留。"""
     img_buket_path = "https://example.com/images"
-    page_idx = 0
-    page_size = [1000, 1200]
-    
-    print(f"输入参数:")
-    print(f"  - 表格HTML: 包含2列2行的表格")
-    print(f"  - 图片路径: {block['lines'][0]['spans'][0]['image_path']}")
-    print(f"  - 图片桶路径: {img_buket_path}")
-    print(f"  - 页面索引: {page_idx}")
-    print(f"  - 页面尺寸: {page_size}\n")
-    
-    # 调用方法
-    make_table_body(block, para_block, img_buket_path, page_idx, page_size, output_content)
-    
-    # 输出结果
-    print(f"输出结果:")
-    print(f"  - 生成的项目数量: {len(output_content)}\n")
-    
-    if output_content:
-        result = output_content[0]
-        print(f"表格主体内容:")
-        print(f"  - 类型: {result['type']}")
-        print(f"  - 文本: {result.get('text', '')}")
-        if BlockType.TEXT in result:
-            print(f"  - HTML内容: {result[BlockType.TEXT][:50]}..." if len(result[BlockType.TEXT]) > 50 else f"  - HTML内容: {result[BlockType.TEXT]}")
-        if 'img_path' in result:
-            print(f"  - 图片路径: {result['img_path']}")
-        if 'bbox' in result:
-            print(f"  - 边界框: {result['bbox']}")
-        print(f"  - 页面索引: {result['page_idx']}")
-        print()
-    
-    # 验证结果
-    print("=== 验证结果 ===")
-    
-    assert len(output_content) == 1, f"期望生成1个项目，实际生成{len(output_content)}个"
-    print("✅ 生成项目数量正确")
-    
-    assert output_content[0]['type'] == BlockType.TABLE_BODY, "类型应该是TABLE_BODY"
-    print("✅ 类型正确")
-    
-    assert BlockType.TEXT in output_content[0], "应该包含HTML内容"
-    assert '<table' in output_content[0][BlockType.TEXT], "HTML内容应该包含<table标签"
-    print("✅ HTML内容正确")
-    
-    assert 'img_path' in output_content[0], "应该包含图片路径"
-    assert output_content[0]['img_path'] == f"{img_buket_path}/{block['lines'][0]['spans'][0]['image_path']}", "图片路径不正确"
-    print("✅ 图片路径正确")
-    
-    assert 'bbox' in output_content[0], "应该包含边界框"
-    assert 'page_idx' in output_content[0], "应该包含页面索引"
-    print("✅ 边界框和页面索引正确")
-    
-    print("\n=== make_table_body 测试完成 ===\n")
+    para_block = _table_para_block(
+        html="<table><tr><td>数据</td></tr></table>",
+        image_path="table_images/table1.png",
+    )
 
+    result = make_blocks_to_content_list(para_block, img_buket_path, 0, [1000, 1000])
 
-def test_make_table_caption():
-    """测试 make_table_caption 方法"""
-    
-    print("=== 测试 make_table_caption 方法 ===\n")
-    
-    # 模拟表格标题块
-    block = {
-        "type": BlockType.TABLE_CAPTION,
-        "lines": [
-            {
-                "spans": [
-                    {
-                        "type": ContentType.TEXT,
-                        "content": "表1：测试表格标题"
-                    }
-                ]
-            }
-        ]
-    }
-    
-    para_block = {
-        "type": BlockType.TABLE_CAPTION,
-        "bbox": [100, 100, 600, 150],
-        "lines": [
-            {
-                "spans": [
-                    {
-                        "type": ContentType.TEXT,
-                        "content": "表格标题"
-                    }
-                ]
-            }
-        ]
-    }
-    
-    output_content = []
-    img_buket_path = "https://example.com/images"
-    page_idx = 0
-    page_size = [1000, 1200]
-    
-    print(f"输入参数:")
-    print(f"  - 标题文本: {block['lines'][0]['spans'][0]['content']}")
-    print(f"  - 页面索引: {page_idx}")
-    print(f"  - 页面尺寸: {page_size}\n")
-    
-    # 调用方法
-    try:
-        make_table_caption(block, para_block, img_buket_path, page_idx, page_size, output_content)
-        
-        # 输出结果
-        print(f"输出结果:")
-        print(f"  - 生成的项目数量: {len(output_content)}\n")
-        
-        if output_content:
-            result = output_content[0]
-            print(f"表格标题内容:")
-            print(f"  - 类型: {result['type']}")
-            print(f"  - 文本: {result.get('text', '')}")
-            if BlockType.TEXT in result:
-                print(f"  - 附加文本: {result[BlockType.TEXT]}")
-            if 'bbox' in result:
-                print(f"  - 边界框: {result['bbox']}")
-            print(f"  - 页面索引: {result['page_idx']}")
-            print()
-        
-        # 验证结果
-        print("=== 验证结果 ===")
-        
-        assert len(output_content) == 1, f"期望生成1个项目，实际生成{len(output_content)}个"
-        print("✅ 生成项目数量正确")
-        
-        assert output_content[0]['type'] == BlockType.TABLE_CAPTION, "类型应该是TABLE_CAPTION"
-        print("✅ 类型正确")
-        
-        assert 'bbox' in output_content[0], "应该包含边界框"
-        assert 'page_idx' in output_content[0], "应该包含页面索引"
-        print("✅ 边界框和页面索引正确")
-        
-        print("\n=== make_table_caption 测试完成 ===\n")
-        
-    except AttributeError as e:
-        print(f"❌ 方法调用失败: {e}")
-        print("注意：该方法可能存在实现问题，text字段初始化为字符串但尝试使用append方法")
-        print("\n=== make_table_caption 测试完成（发现潜在问题） ===\n")
-
-
-def test_make_table_footnote():
-    """测试 make_table_footnote 方法"""
-    
-    print("=== 测试 make_table_footnote 方法 ===\n")
-    
-    # 模拟表格脚注块
-    block = {
-        "type": BlockType.TABLE_FOOTNOTE,
-        "lines": [
-            {
-                "spans": [
-                    {
-                        "type": ContentType.TEXT,
-                        "content": "注：本表格数据仅供参考"
-                    }
-                ]
-            }
-        ]
-    }
-    
-    para_block = {
-        "type": BlockType.TABLE_FOOTNOTE,
-        "bbox": [100, 550, 600, 600],
-        "lines": [
-            {
-                "spans": [
-                    {
-                        "type": ContentType.TEXT,
-                        "content": "表格脚注"
-                    }
-                ]
-            }
-        ]
-    }
-    
-    output_content = []
-    img_buket_path = "https://example.com/images"
-    page_idx = 0
-    page_size = [1000, 1200]
-    
-    print(f"输入参数:")
-    print(f"  - 脚注文本: {block['lines'][0]['spans'][0]['content']}")
-    print(f"  - 页面索引: {page_idx}")
-    print(f"  - 页面尺寸: {page_size}\n")
-    
-    # 调用方法
-    try:
-        make_table_footnote(block, para_block, img_buket_path, page_idx, page_size, output_content)
-        
-        # 输出结果
-        print(f"输出结果:")
-        print(f"  - 生成的项目数量: {len(output_content)}\n")
-        
-        if output_content:
-            result = output_content[0]
-            print(f"表格脚注内容:")
-            print(f"  - 类型: {result['type']}")
-            print(f"  - 文本: {result.get('text', '')}")
-            if BlockType.TEXT in result:
-                print(f"  - 附加文本: {result[BlockType.TEXT]}")
-            if 'bbox' in result:
-                print(f"  - 边界框: {result['bbox']}")
-            print(f"  - 页面索引: {result['page_idx']}")
-            print()
-        
-        # 验证结果
-        print("=== 验证结果 ===")
-        
-        assert len(output_content) == 1, f"期望生成1个项目，实际生成{len(output_content)}个"
-        print("✅ 生成项目数量正确")
-        
-        assert output_content[0]['type'] == BlockType.TABLE_FOOTNOTE, "类型应该是TABLE_FOOTNOTE"
-        print("✅ 类型正确")
-        
-        assert 'bbox' in output_content[0], "应该包含边界框"
-        assert 'page_idx' in output_content[0], "应该包含页面索引"
-        print("✅ 边界框和页面索引正确")
-        
-        print("\n=== make_table_footnote 测试完成 ===\n")
-        
-    except AttributeError as e:
-        print(f"❌ 方法调用失败: {e}")
-        print("注意：该方法可能存在实现问题，text字段初始化为字符串但尝试使用append方法")
-        print("\n=== make_table_footnote 测试完成（发现潜在问题） ===\n")
+    assert result["type"] == ContentType.TABLE
+    # 表格 HTML 存于 table_body 字段
+    assert BlockType.TABLE_BODY in result
+    assert "<table" in result[BlockType.TABLE_BODY]
+    # 图片路径加前缀
+    assert result["img_path"] == f"{img_buket_path}/table_images/table1.png"
 
 
 def test_table_body_without_image():
-    """测试不带图片的表格主体"""
-    
-    print("=== 测试不带图片的表格主体 ===\n")
-    
-    block = {
-        "type": BlockType.TABLE_BODY,
-        "lines": [
-            {
-                "spans": [
-                    {
-                        "type": ContentType.TABLE,
-                        "html": '<table><tr><td>数据</td></tr></table>'
-                    }
-                ]
-            }
-        ]
-    }
-    
-    para_block = {
-        "type": BlockType.TABLE_BODY,
-        "bbox": [100, 200, 600, 500],
-        "lines": [
-            {
-                "spans": [
-                    {
-                        "type": ContentType.TEXT,
-                        "content": "表格"
-                    }
-                ]
-            }
-        ]
-    }
-    
-    output_content = []
-    img_buket_path = "https://example.com/images"
-    page_idx = 0
-    page_size = [1000, 1200]
-    
-    make_table_body(block, para_block, img_buket_path, page_idx, page_size, output_content)
-    
-    assert len(output_content) == 1
-    assert 'img_path' not in output_content[0], "不应该包含图片路径"
-    print("✅ 不带图片的表格主体处理正确\n")
+    """表格 body 仅含 HTML 时，img_path 为空字符串而非图片路径。"""
+    para_block = _table_para_block(html="<table><tr><td>数据</td></tr></table>")
+
+    result = make_blocks_to_content_list(para_block, "https://example.com/images", 0, [1000, 1000])
+
+    assert BlockType.TABLE_BODY in result
+    assert result["img_path"] == ""
+
+
+def test_table_caption_and_footnote():
+    """表格标题与脚注文本被提取到对应列表字段。"""
+    para_block = _table_para_block(
+        html="<table><tr><td>数据</td></tr></table>",
+        caption="表1：测试表格标题",
+        footnote="注：本表格数据仅供参考",
+    )
+
+    result = make_blocks_to_content_list(para_block, "https://example.com/images", 0, [1000, 1000])
+
+    assert result[BlockType.TABLE_CAPTION] == ["表1：测试表格标题"]
+    assert result[BlockType.TABLE_FOOTNOTE] == ["注：本表格数据仅供参考"]
+
+
+def test_table_bbox_and_page_idx():
+    """bbox 被归一化到千分比坐标，page_idx 被注入。"""
+    para_block = _table_para_block(html="<table><tr><td>数据</td></tr></table>")
+
+    result = make_blocks_to_content_list(para_block, "https://example.com/images", 3, [1000, 1000])
+
+    assert result["bbox"] == [100, 200, 600, 500]
+    assert result["page_idx"] == 3
 
 
 if __name__ == "__main__":
-    # 运行所有测试
-    test_make_table_body()
-    test_make_table_caption()
-    test_make_table_footnote()
+    test_table_body_with_image()
     test_table_body_without_image()
-    
-    print("="*50)
+    test_table_caption_and_footnote()
+    test_table_bbox_and_page_idx()
+
+    print("=" * 50)
     print("所有测试完成！")
-    print("="*50)
+    print("=" * 50)
