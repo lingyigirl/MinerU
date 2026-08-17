@@ -2456,6 +2456,29 @@ def _is_structurally_sparse_table(table: Tag) -> bool:
     return (empty_count / len(tds)) > _SPARSE_EMPTY_RATIO_THRESHOLD
 
 
+def _is_financial_statement_table(table: Tag) -> bool:
+    """判断表格是否为财务报表样式（表头含「行次」列）。
+
+    中国标准化财务报表（资产负债表/利润表/现金流量表/所有者权益变动表）
+    均含「行次」列，用于标注科目/项目的行号。这类表格的空单元格是合法留白
+    （未发生业务的行次/金额为空或「-」），非 VLM 遗漏；VLM 对结构化报表的
+    识别已足够准确。若对其做 OCR 补充，会因 OCR 行对齐错位把截断标签/
+    合并数字/单字噪声灌进空列（原则 4：信任上游正确输出，不过度后处理）。
+
+    Args:
+        table: BeautifulSoup <table> Tag。
+
+    Returns:
+        是否为财务报表样式表格。
+    """
+    # 仅看前 3 行（表头区域），去除空白后精确匹配「行次」，兼容 VLM 输出「行 次」
+    for tr in table.find_all("tr")[:3]:
+        for cell in tr.find_all(["td", "th"]):
+            if "".join(cell.get_text().split()) == "行次":
+                return True
+    return False
+
+
 def _has_colspan_mismatch(html: str) -> bool:
     """快速检测表格是否存在 colspan 不一致的问题。
 
@@ -3991,16 +4014,32 @@ def _fill_empty_cells_from_ocr_grid(
         # 收集该 VLM 行对应的 OCR 文本（过滤已在 VLM 中存在的标签）
         ocr_texts = ocr_pool.get(vlm_row_idx, [])
         ocr_new: list[tuple[str, str]] = []
+        # 本行 VLM 单元格的规范化文本（去重比对用，全角/半角标点一致）
+        vlm_row_norms = [_normalize_for_matching(vt) for vt in vlm_row if vt]
         for ot in ocr_texts:
             item_type = _classify_ocr_item_type(ot)
             if item_type == "text":
                 ot_norm = _normalize_for_matching(ot)
-                # 文本（标签）：同行或表头行已含该标签（全角/半角一致）即视为重复，
-                # 不做填充——只"放置"新增信息，不复制已有信息（原则 1）。
+                # 文本（标签）：同行或表头行已含该标签即视为重复，不做填充——
+                # 只"放置"新增信息，不复制已有信息（原则 1）。
                 # 仅查同行 + 表头，不查其它数据行，避免误伤可重复出现的值。
-                if any(ot_norm == _normalize_for_matching(vt) for vt in vlm_row if vt):
+                # 去重分两级：
+                # ① 规范化后精确相等（覆盖全角/半角标点差异）；
+                # ② 较长文本（≥4 字）的子串匹配——OCR 常截断 VLM 标签或丢失
+                #    序号前缀，如「、经营活动产生的现金流量：」是
+                #    「一、经营活动产生的现金流量:」去掉「一、」的截断重复。
+                #    仅对较长文本启用，避免误伤「吨」「免税」等短值。
+                if ot_norm in vlm_row_norms:
+                    continue
+                if len(ot_norm) >= 4 and any(
+                    ot_norm in vt_norm for vt_norm in vlm_row_norms
+                ):
                     continue
                 if ot_norm in vlm_header_norm:
+                    continue
+                if len(ot_norm) >= 4 and any(
+                    ot_norm in ht_norm for ht_norm in vlm_header_norm
+                ):
                     continue
             else:
                 # 数值/税率：仅与同行精确比对去重（数值可合法重复出现）
@@ -4210,6 +4249,11 @@ def supplement_vlm_table_cells_with_ocr(
                     # 非 VLM 遗漏，不应做 OCR 填充（否则会因列类型退化为全 "text" 而把
                     # 表头文字/行标签误填进空列，产生重复内容）。发票与含 <img> 的表格除外。
                     if _is_structurally_sparse_table(table) and not has_img and not is_invoice:
+                        continue
+                    # [自定义] 财务报表样式表格（表头含「行次」）即使非稀疏（密集报表，
+                    # 大量「-」占位）其空单元格也是合法留白。OCR 行对齐错位会灌入
+                    # 截断标签/合并数字/单字噪声，故跳过 OCR 补充。发票与含 <img> 表格除外。
+                    if _is_financial_statement_table(table) and not has_img and not is_invoice:
                         continue
                 except Exception:
                     continue

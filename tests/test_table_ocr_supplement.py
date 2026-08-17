@@ -18,6 +18,7 @@ from mineru.utils.custom.table_utils import (
     _detect_data_row_start,
     _parse_vlm_table_structure,
     _is_structurally_sparse_table,
+    _is_financial_statement_table,
     _rebuild_merged_rows_from_ocr,
     _fill_empty_cells_from_ocr_grid,
     _split_concatenated_row_deterministically,
@@ -374,6 +375,81 @@ def test_fill_empty_cells_places_repeated_text_value():
     assert modified is True, "存在漏识别的重复值时应对表格做出修改"
 
 
+def test_fill_empty_cells_skips_truncated_numbering_label():
+    """丢失序号前缀的截断标签不应被复制填充（原则 1：输出不多不少）。
+
+    现金流量表式场景：VLM 已含「一、经营活动产生的现金流量:」（分区标题），
+    OCR 因序号「一」独立成框丢失而读出截断的「、经营活动产生的现金流量：」
+    （残留「、」+ 全角冒号）。旧逻辑只做规范化后精确相等，截断标签逃过去重
+    被填进空的行次列，产生重复字段。
+    """
+    table_html = """<table>
+      <tr><td>项目</td><td>行次</td><td>金额</td><td>补充资料</td><td>行次</td><td>金额</td></tr>
+      <tr><td>一、经营活动产生的现金流量:</td><td></td><td></td><td>1、将净利润调节为经营活动现金流量:</td><td></td><td></td></tr>
+    </table>"""
+    ocr_grid = [
+        ["项目", "行次", "金额", "补充资料", "行次", "金额"],
+        ["、经营活动产生的现金流量：", "", "", "、将净利润调节为经营活动现金流量：", "", ""],
+    ]
+    modified, text = _fill_table_from_grid(table_html, ocr_grid)
+
+    assert "、经营活动产生的现金流量：" not in text, (
+        f"截断标签「、经营活动产生的现金流量：」不应被复制填充，实际 {text!r}"
+    )
+    assert modified is False, "全部 OCR 文本均为截断重复标签，不应产生任何修改"
+
+
+def test_fill_empty_cells_skips_trailing_truncated_label():
+    """尾字截断的标签不应被复制填充（子串去重覆盖行尾截断）。
+
+    现金流量表式场景：VLM 已含「支付的其他与筹资活动有关的现金」，
+    OCR 识别丢末字「金」得「支付的其他与筹资活动有关的现」。旧逻辑精确
+    相等无法判重，截断标签被填进金额列。
+    """
+    table_html = """<table>
+      <tr><td>项目</td><td>行次</td><td>金额</td></tr>
+      <tr><td>支付的其他与筹资活动有关的现金</td><td>52</td><td></td></tr>
+    </table>"""
+    ocr_grid = [
+        ["项目", "行次", "金额"],
+        ["支付的其他与筹资活动有关的现", "52", ""],
+    ]
+    modified, text = _fill_table_from_grid(table_html, ocr_grid)
+
+    assert modified is False, (
+        f"截断标签不应产生任何修改（不应被填进金额列），实际 {text!r}"
+    )
+
+
+def test_is_financial_statement_table():
+    """表头含「行次」列的表格应判定为财务报表样式，否则不判定。"""
+    # 财务报表样式：含「行次」列
+    fs_html = """<table>
+      <tr><td>项目</td><td>行次</td><td>金额</td></tr>
+      <tr><td>一、经营活动产生的现金流量:</td><td></td><td></td></tr>
+    </table>"""
+    assert _is_financial_statement_table(_table_from_html(fs_html)) is True, (
+        "含「行次」表头应判定为财务报表样式"
+    )
+
+    # 兼容 VLM 输出「行 次」（关键词内部含空格）
+    fs_spaced_html = """<table>
+      <tr><td>项目</td><td>行 次</td><td>金额</td></tr>
+    </table>"""
+    assert _is_financial_statement_table(_table_from_html(fs_spaced_html)) is True, (
+        "「行 次」应判定为财务报表样式"
+    )
+
+    # 非财务报表：无「行次」列
+    non_fs_html = """<table>
+      <tr><td>项目</td><td>单位</td><td>金额</td></tr>
+      <tr><td>水费</td><td>吨</td><td>100.00</td></tr>
+    </table>"""
+    assert _is_financial_statement_table(_table_from_html(non_fs_html)) is False, (
+        "无「行次」表头不应判定为财务报表样式"
+    )
+
+
 def test_split_concatenated_row_deterministically_preserves_all_values():
     """确定性拆分：VLM 拼接行应拆回 2 数据行 + 1 合计行，且数值完整无丢失。
 
@@ -419,4 +495,9 @@ if __name__ == "__main__":
     test_ocr_rebuild_summary_yen_unchanged_when_template_has_both()
     test_fill_empty_cells_skips_fullwidth_duplicate_labels()
     test_fill_empty_cells_places_new_text()
+    test_fill_empty_cells_places_repeated_text_value()
+    test_fill_empty_cells_skips_truncated_numbering_label()
+    test_fill_empty_cells_skips_trailing_truncated_label()
+    test_is_financial_statement_table()
+    test_split_concatenated_row_deterministically_preserves_all_values()
     print("✅ 所有 _detect_data_row_start / 稀疏门控 / OCR 重建 / 去重 回归测试通过")
