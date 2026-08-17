@@ -3286,6 +3286,9 @@ def _split_decimal_values(data: str, n_data: int) -> list[str]:
     """
     if not data or n_data < 2:
         return []
+    # [自定义] 剔除值间空白（如 "1.78640768223\n1.11650431565" 中的 \n）。
+    # 本函数只接受 \d+\.\d+ 纯数值，空白无语义，剔除后按等精度切分不受影响。
+    data = re.sub(r"\s+", "", data)
     dots = [i for i, ch in enumerate(data) if ch == "."]
     if len(dots) != n_data:
         return []
@@ -3689,6 +3692,54 @@ def _reconstruction_preserves_vlm_values(
     return rebuilt_digits >= vlm_digits * 0.95
 
 
+def _remove_orphaned_summary_continuation_row(
+    cont_row: Tag,
+    concat_has_rowspan: bool,
+    new_rows: list[Tag],
+) -> None:
+    """删除 VLM 拼接行被重建后遗留的 rowspan 续行（原始合计 ¥ 行）。
+
+    VLM 将发票「金额/税额」列的合计值放在拼接行的 rowspan 续行中
+    （如 <tr><td>¥34552.25</td><td>¥1036.57</td></tr>）。重建拼接行时
+    只替换拼接行本身，续行被遗留，形成孤立重复的合计 ¥ 行（违反原则 1）。
+
+    删除条件（原则 4 强约束，全部满足才删除，否则保持原样）：
+    1. 拼接行含 rowspan≥2 的单元格（续行的前提）；
+    2. 续行所有非空单元格均为 ¥/￥ 数值（无其它文本）；
+    3. 续行的 ¥ 数值已被重建新行保留（规范化后比对，避免丢值）。
+
+    注意：拼接行在调用本函数前已被 decompose()，bs4 的 decompose() 会清空
+    子节点，故 rowspan 信息需由调用方在 decompose 之前捕获后经
+    ``concat_has_rowspan`` 传入，而非在此处读取拼接行 Tag。
+
+    Args:
+        cont_row: 待判定/删除的续行。
+        concat_has_rowspan: 拼接行在 decompose 前是否含 rowspan≥2 的单元格。
+        new_rows: 重建后的新行（含合计行），用于校验 ¥ 值是否已保留。
+    """
+    # 条件 1：拼接行须含 rowspan（否则不存在续行）
+    if not concat_has_rowspan:
+        return
+    # 条件 2：续行须为「仅含 ¥/￥ 数值与空单元格」的合计行
+    yen_values: list[str] = []
+    for c in cont_row.find_all(["td", "th"]):
+        text = c.get_text().strip()
+        if not text:
+            continue
+        if not re.fullmatch(r"[¥￥][\d.,]+", text):
+            return  # 含非 ¥ 文本（如「免税」「3%」）→ 非续行，不删
+        yen_values.append(_normalize_for_matching(text).replace(",", ""))
+    if not yen_values:
+        return  # 纯空行，保守不删
+    # 条件 3：续行 ¥ 值须已被重建新行保留（否则删除会丢值，违反原则 1）
+    rebuilt_text = _normalize_for_matching(
+        "".join(c.get_text() for r in new_rows for c in r.find_all(["td", "th"]))
+    ).replace(",", "")
+    if any(v not in rebuilt_text for v in yen_values):
+        return  # 值未保留（如 OCR 漏识别合计行），不删
+    cont_row.decompose()
+
+
 def _split_concatenated_row_deterministically(
     soup: BeautifulSoup,
     table: Tag,
@@ -3813,13 +3864,36 @@ def _split_concatenated_row_deterministically(
             # 规格型号等：置空（发票常无此列值）
             col_values[vc] = [""] * n_data
 
+    # 4.5 [自定义] 从 rowspan 续行回填金额/税额合计 ¥ 值（原则 1 不多不少）
+    # VLM 用 rowspan 布局表示货物区时，拼接行的金额/税额单元格无 ¥，合计放在
+    # 紧随其后的续行（如 <tr><td>¥34552.25</td><td>¥1036.57</td></tr>）。
+    # 仅在续行是「纯 ¥ 数值」且 ¥ 数量等于金额/税额列数时回填，否则保持原样。
+    cont_row = rows[concat_row_idx + 1] if concat_row_idx + 1 < len(rows) else None
+    if cont_row is not None:
+        cont_nonempty = [
+            c.get_text().strip()
+            for c in cont_row.find_all(["td", "th"])
+            if c.get_text().strip()
+        ]
+        if cont_nonempty and all(
+            re.fullmatch(r"[¥￥][\d.,]+", t) for t in cont_nonempty
+        ):
+            yen_cols = [vc for vc, kw, _ in parsed if kw in ("金额", "税额")]
+            if len(cont_nonempty) == len(yen_cols):
+                for vc, y in zip(yen_cols, cont_nonempty):
+                    if not summary_values.get(vc):
+                        summary_values[vc] = y
+
     # 5. 构建 N 个数据行 + 1 个合计行（沿用模板列 colspan）
+    # [自定义] 只复制 colspan、丢弃 rowspan：rowspan 是 VLM 拼接行「自身 + 续行
+    # 占两视觉行」的标记，这里已把拼接行与续行拆成 N 个独立物理行，续行 ¥ 也已在
+    # 步骤 4.5 回填并删除，故新行不应再携带 rowspan（否则渲染成 rowspan=N 的坏表）。
     new_rows: list[Tag] = []
     for i in range(n_data):
         tr = soup.new_tag("tr")
         for vc, orig in enumerate(template_cells):
             td = soup.new_tag("td")
-            for attr in ("colspan", "rowspan"):
+            for attr in ("colspan",):
                 if orig.get(attr):
                     td[attr] = orig[attr]
             td.string = col_values.get(vc, [""] * n_data)[i]
@@ -3829,7 +3903,7 @@ def _split_concatenated_row_deterministically(
     summary_tr = soup.new_tag("tr")
     for vc, orig in enumerate(template_cells):
         td = soup.new_tag("td")
-        for attr in ("colspan", "rowspan"):
+        for attr in ("colspan",):
             if orig.get(attr):
                 td[attr] = orig[attr]
         if vc in summary_values and summary_values[vc]:
@@ -3841,11 +3915,11 @@ def _split_concatenated_row_deterministically(
         summary_tr.append(td)
     new_rows.append(summary_tr)
 
-    # 6. 插入表头行（用拼接行模板列 + 关键词标签，保留 colspan）
+    # 6. 插入表头行（用拼接行模板列 + 关键词标签，保留 colspan、丢弃 rowspan）
     header_tr = soup.new_tag("tr")
     for vc, orig in enumerate(template_cells):
         th = soup.new_tag("th")
-        for attr in ("colspan", "rowspan"):
+        for attr in ("colspan",):
             if orig.get(attr):
                 th[attr] = orig[attr]
         kw = parsed[vc][1]
@@ -3855,7 +3929,21 @@ def _split_concatenated_row_deterministically(
 
     # 7. 替换原拼接行
     prev = rows[concat_row_idx - 1] if concat_row_idx > 0 else None
-    rows[concat_row_idx].decompose()
+    concat_row = rows[concat_row_idx]
+    # [自定义] 捕获 rowspan（bs4 的 decompose() 会清空子节点，须在其之前读取）
+    concat_has_rowspan = any(
+        int(c.get("rowspan", 1)) >= 2
+        for c in concat_row.find_all(["td", "th"])
+    )
+    concat_row.decompose()
+    # [自定义] 删除拼接行的 rowspan 续行（原始合计 ¥ 行），
+    # 避免重建后残留孤立重复行（如 <tr><td>¥34552.25</td><td>¥1036.57</td></tr>）。
+    # 复用 OCR 重建路径的 _remove_orphaned_summary_continuation_row：三条件
+    # （含 rowspan + 续行纯 ¥ + 值已被新合计行保留）全满足才删，否则保持原样。
+    if concat_row_idx + 1 < len(rows):
+        _remove_orphaned_summary_continuation_row(
+            rows[concat_row_idx + 1], concat_has_rowspan, new_rows
+        )
     if prev is not None:
         target = prev
         for tr in reversed(new_rows):
@@ -4140,7 +4228,20 @@ def _rebuild_merged_rows_from_ocr(
     insertion_point = rows[concat_row_idx - 1] if concat_row_idx > 0 else None
 
     # 删除拼接行
-    rows[concat_row_idx].decompose()
+    concat_row = rows[concat_row_idx]
+    # [自定义] 删除拼接行的 rowspan 续行（VLM 原始合计 ¥ 行），
+    # 避免重建后残留孤立重复行（如 <tr><td>¥34552.25</td><td>¥1036.57</td></tr>）。
+    # 仅当续行是纯 ¥ 值且该值已被新合计行保留时删除（原则 1 不多不少）。
+    # 注意：bs4 的 decompose() 会清空子节点，须在其之前捕获 rowspan 信息。
+    concat_has_rowspan = any(
+        int(c.get("rowspan", 1)) >= 2
+        for c in concat_row.find_all(["td", "th"])
+    )
+    concat_row.decompose()
+    if concat_row_idx + 1 < len(rows):
+        _remove_orphaned_summary_continuation_row(
+            rows[concat_row_idx + 1], concat_has_rowspan, new_rows
+        )
 
     # 在插入点之后插入新行
     if insertion_point is not None:

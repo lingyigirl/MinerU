@@ -494,6 +494,59 @@ def test_split_concatenated_row_deterministically_preserves_all_values():
     assert "合计" in text
 
 
+def test_split_concatenated_row_deterministically_removes_orphan_continuation():
+    """确定性拆分：rowspan 布局应从续行回填金额/税额合计 ¥ 并删除续行。
+
+    VLM 用 rowspan 布局表示专用发票货物区时，拼接行的金额/税额单元格无 ¥，
+    ¥ 合计放在紧随其后的续行（<tr><td>¥34552.25</td><td>¥1036.57</td></tr>）。
+    确定性拆分应把续行 ¥ 回填到合计行金额/税额列，并删除续行（原则 1 不多不少）。
+    单价含内部 \\n（"1.78640768223\\n1.11650431565"）也应能正确拆分（遗留 2）。
+    """
+    table_html = """<table>
+      <tr><td>购
+买
+方</td><td colspan="5">名称:赣州鑫冠科技股份有限公司纳税人识别号:91360700589231468Y地址、电话:江西省赣州市赣州经济技术开发区坪峰岭路21号0797-8335818</td><td>密
+码
+区</td><td colspan="3">03&gt;64685*83</td></tr>
+      <tr><td rowspan="2" colspan="2">货物或应税劳务、服务名称*水冰雪*生产*水冰雪*生活一阶
+合 计</td><td rowspan="2">规格型号</td><td rowspan="2">单位</td>
+          <td rowspan="2">数量
+18328.00
+1622.00</td><td rowspan="2" colspan="2">单价
+1.78640768223
+1.11650431565</td><td>金额
+32741.28
+1810.97</td><td rowspan="2">税率
+3%
+3%</td><td>税 额
+982.24
+54.33</td></tr>
+      <tr><td>¥34552.25</td><td>¥1036.57</td></tr>
+      <tr><td colspan="2">价税合计(大写)</td><td colspan="8">叁万伍仟伍佰捌拾捌圆捌角贰分 (小写)¥35588.82</td></tr>
+    </table>"""
+    soup = BeautifulSoup(table_html, "html.parser")
+    table = soup.find("table")
+    rows = table.find_all("tr")
+    vlm_data, _ = _parse_vlm_table_structure(rows)
+
+    ok = _split_concatenated_row_deterministically(soup, table, vlm_data, 0)
+
+    assert ok is True, "确定性拆分应成功"
+    text = table.get_text()
+    # 数据值齐全
+    for expected in ("18328.00", "1622.00", "1.78640768223", "1.11650431565",
+                     "32741.28", "1810.97", "982.24", "54.33"):
+        assert expected in text, f"确定性拆分丢失值 {expected!r}，实际 {text!r}"
+    # ¥ 回填到合计行：金额/税额合计各出现 1 次（续行已删，不重复）
+    assert "¥34552.25" in text, f"合计行应回填金额合计 ¥，实际 {text!r}"
+    assert "¥1036.57" in text, f"合计行应回填税额合计 ¥，实际 {text!r}"
+    assert text.count("34552.25") == 1, f"金额合计不应重复，实际 {text!r}"
+    assert text.count("1036.57") == 1, f"税额合计不应重复，实际 {text!r}"
+    # 新行不得复制模板拼接行的 rowspan（rowspan 只表示「拼接行 + 续行」占两视觉行，
+    # 拆成独立物理行后应丢弃，否则渲染成 rowspan=2 的坏表）
+    assert "rowspan" not in str(table), f"重建后不应残留 rowspan，实际 {str(table)!r}"
+
+
 if __name__ == "__main__":
     test_equity_statement_label_only_rows_not_treated_as_header()
     test_simple_header_and_data()
@@ -509,4 +562,5 @@ if __name__ == "__main__":
     test_fill_empty_cells_skips_trailing_truncated_label()
     test_is_financial_statement_table()
     test_split_concatenated_row_deterministically_preserves_all_values()
+    test_split_concatenated_row_deterministically_removes_orphan_continuation()
     print("✅ 所有 _detect_data_row_start / 稀疏门控 / OCR 重建 / 去重 回归测试通过")
