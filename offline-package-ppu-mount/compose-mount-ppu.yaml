@@ -8,16 +8,18 @@
 #
 # 使用前修改:
 #   1. 源码路径 — 宿主机 fork mineru/ 目录（默认 /data/mineru-src/mineru）
+#      ← 由 build-ppu-src.sh 打包的 mineru-src-3.4.4.tar.gz 解压而来：
+#        mkdir -p /data/mineru-src && tar xzf mineru-src-3.4.4.tar.gz -C /data/mineru-src
 #   2. CUDA_VISIBLE_DEVICES — 指定 PPU 卡号（ppu-smi 查看）
-#   3. mineru.json 路径 — 与模型实际路径一致
-#   4. 输出目录
+#   3. 数据/模型挂载 — /mnt、/datapool 与服务器实际路径一致（来自 V2.txt）
+#   4. 输出目录 — MINERU_API_OUTPUT_ROOT 落到已挂载的 /datapool 下（持久化）
 #
 # 构建 PPU 基础镜像（一次性）:
 #   docker build --network=host -t mineru:ppu-vllm-latest -f docker/china/ppu.Dockerfile .
 # 启动:
 #   docker compose -f compose-mount-ppu.yaml up -d
 # 更新代码:
-#   rsync 最新 mineru/ 到源码路径 → docker compose -f compose-mount-ppu.yaml restart
+#   重新解压 mineru-src-3.4.4.tar.gz → docker compose -f compose-mount-ppu.yaml restart
 # ============================================================
 services:
   mineru-api:
@@ -38,19 +40,19 @@ services:
       MINERU_MODEL_SOURCE: local
       MINERU_BACKEND: vlm-vllm-async-engine   # PPU 上 vLLM 异步引擎
       CUDA_VISIBLE_DEVICES: "0"              # ← 指定 PPU 卡号（ppu-smi 查看）
-      MINERU_API_OUTPUT_ROOT: /vllm-workspace/output
+      MINERU_API_OUTPUT_ROOT: /datapool/mineru_output   # 输出落到已挂载的 /datapool 下（持久化）
       MINERU_LOG_FILE_ENABLE: "false"
 
     volumes:
       # ---- PPU vLLM 需要 docker.sock（容器内再调度） ----
       - /var/run/docker.sock:/var/run/docker.sock
-      # ---- 配置文件（只读，模型路径与 ppu 镜像内一致） ----
-      - /root/mineru.json:/root/mineru.json:ro
-      # ---- 输出目录 ----
-      - /data/mineru_output:/vllm-workspace/output
+      # ---- 数据/模型挂载（与 V2.txt 服务器一致，按实际路径改） ----
+      - /mnt:/mnt
+      - /datapool:/datapool
       # ---- 源码挂载（关键）：覆盖镜像内 pip 安装的 mineru 包 ----
-      # 注意：路径需与 PPU 镜像实际安装位置一致，先在容器内确认：
-      #   python -c "import mineru; print(mineru.__file__)"
+      # 左半边 /data/mineru-src/mineru 来自 mineru-src-3.4.4.tar.gz（build-ppu-src.sh 产物）
+      # 右半边路径需与 PPU 镜像实际安装位置一致，先在容器内确认：
+      #   docker run --rm mineru:ppu-vllm-latest python3 -c "import mineru; print(mineru.__file__)"
       - /data/mineru-src/mineru:/usr/local/lib/python3.12/dist-packages/mineru
     command:
       mineru-api

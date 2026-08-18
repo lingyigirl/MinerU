@@ -1,0 +1,30 @@
+================================================================
+  MinerU fork（develop）PPU 部署物料清单（方式 A：烤代码进镜像）
+  加速卡: T-Head PPU（/dev/alixpu、/dev/alixpu_ctl）
+  镜像 TAG: mineru:ppu-fork-3.4.4
+================================================================
+
+| 文件名                            | 用途                              |
+|-----------------------------------|-----------------------------------|
+| README-ppu-deploy.md              | 部署教程（部署人员读这个）        |
+| MANIFEST-ppu.txt                  | 本文件                            |
+| check_server_env.sh               | 服务器环境检查（先跑）            |
+| mineru-ppu-fork-3.4.4.tar.gz      | 镜像（构建产物，gitignore）       |
+| compose-ppu.yaml                  | 启动配置                          |
+| README-ppu-build.md               | 构建教程（构建机专用，不随包分发）|
+| ppu-fork.Dockerfile               | 烤代码 Dockerfile（构建机）       |
+| build-ppu-fork.sh                 | 构建 + 导出镜像 tar.gz（构建机）  |
+
+【分发说明】部署人员只需要前 5 项；README-ppu-build.md / ppu-fork.Dockerfile /
+build-ppu-fork.sh 是构建机专用，不随包分发到服务器。
+
+【注意】mineru-ppu-fork-3.4.4.tar.gz 是构建产物，已被 .gitignore 忽略、
+不进 git；由构建机执行 build-ppu-fork.sh 生成（先重建基础镜像，见
+README-ppu-build.md）。
+
+部署流程（部署人员）:
+  1. 服务器上先跑: bash check_server_env.sh（看 PPU 卡）
+  2. docker load -i mineru-ppu-fork-3.4.4.tar.gz
+  3. 改 compose-ppu.yaml（卡号 + 路径）→ docker compose up -d
+
+================================================================

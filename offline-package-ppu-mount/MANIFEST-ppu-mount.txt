@@ -1,0 +1,32 @@
+================================================================
+  MinerU fork（develop）PPU 部署物料清单（方式 B：源码挂载）
+  加速卡: T-Head PPU（/dev/alixpu、/dev/alixpu_ctl）
+  镜像 TAG: mineru:ppu-vllm-latest（服务器现有基础镜像）
+================================================================
+
+| 文件名                            | 用途                              |
+|-----------------------------------|-----------------------------------|
+| README-ppu-mount-deploy.md        | 部署教程（部署人员读这个）        |
+| MANIFEST-ppu-mount.txt            | 本文件                            |
+| check_server_env.sh               | 服务器环境检查（先跑，看镜像版本）|
+| mineru-src-3.4.4.tar.gz           | 源码包（构建产物，gitignore）     |
+| compose-mount-ppu.yaml            | 启动配置（含源码挂载）            |
+| README-ppu-mount-build.md         | 打包源码教程（构建机专用，不随包分发）|
+| build-ppu-src.sh                  | 打包 fork 源码 tar.gz（构建机）   |
+
+【分发说明】部署人员只需要前 5 项；README-ppu-mount-build.md / build-ppu-src.sh
+是构建机专用，不随包分发到服务器。
+
+【注意】mineru-src-3.4.4.tar.gz 是构建产物，已被 .gitignore 忽略、
+不进 git；由构建机执行 build-ppu-src.sh 生成（见 README-ppu-mount-build.md）。
+
+【前置】方式 B 要求服务器基础镜像 mineru 版本已是 3.4.4，否则缺依赖
+（pdftext/magika/mineru-vl-utils）会 import 报错 → 改用方式 A（见
+../offline-package-ppu/README-ppu-deploy.md）。
+
+部署流程（部署人员）:
+  1. 服务器上先跑: bash check_server_env.sh（看 PPU 卡 + 镜像版本）
+  2. 解压源码 → 改 compose-mount-ppu.yaml → docker compose up -d
+  3. 更新: 重新解压源码 → restart（无需重打镜像）
+
+================================================================
