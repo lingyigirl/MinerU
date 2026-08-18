@@ -1,5 +1,9 @@
 # ============================================================
-# MinerU 3.4.4 生产环境 Docker Compose 配置模板
+# MinerU 3.4.4 源码挂载模式 Docker Compose 配置（方式 B）
+#
+# 与 compose-prod.yaml（方式 A 生产离线包）的区别：
+#   - 额外挂载宿主机 mineru/ 源码到容器内 site-packages 路径，
+#     改代码后只需 rsync 源码 + restart，无需重打镜像。
 #
 # 使用前修改:
 #   1. device_ids — 你的 GPU 编号
@@ -7,10 +11,10 @@
 #   3. mineru.json 路径 — 配置文件的宿主机路径
 #   4. 模型路径 — 与 mineru.json 中的 models-dir 一致
 #   5. 输出目录 — 解析结果存放位置
+#   6. 源码路径 — 宿主机上 mineru/ 目录（默认 /data/mineru-src/mineru）
 #
-# 启动: docker compose -f compose-prod.yaml up -d
-# 停止: docker compose -f compose-prod.yaml down
-# 日志: docker compose -f compose-prod.yaml logs -f
+# 启动: docker compose -f compose-mount.yaml up -d
+# 更新: rsync 最新 mineru/ 到宿主机源码路径 → docker compose -f compose-mount.yaml restart
 # ============================================================
 services:
   mineru-api:
@@ -45,6 +49,10 @@ services:
       - /data/mineru_models:/data/mineru_models:ro
       # ---- 输出目录 ----
       - /data/mineru_output:/vllm-workspace/output
+      # ---- 源码挂载（关键：覆盖镜像内安装的 mineru 包） ----
+      # 宿主机源码路径需与 pip 安装位置一致：
+      #   /usr/local/lib/python3.12/dist-packages/mineru
+      - /data/mineru-src/mineru:/usr/local/lib/python3.12/dist-packages/mineru
     command:
       --host 0.0.0.0
       --port 8000
