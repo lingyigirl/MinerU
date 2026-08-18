@@ -1,27 +1,23 @@
 ================================================================
   MinerU 3.4.4 源码挂载模式物料清单（方式 B）
-  镜像 TAG: mineru:3.4.4-upstream
+  镜像 TAG: mineru:3.4.4-upstream（服务器已有，不随本包分发）
 ================================================================
 
-| 文件名                          | 大小      | 用途                        |
-|--------------------------------|-----------|----------------------------|
-| mineru-3.4.4-upstream.tar.gz  | (软链接)  | 基础镜像 → ../offline-package/ |
-| mineru-models-3.4.4.tar.gz    | (软链接)  | Pipeline + VLM 模型 → ../offline-package/ |
-| compose-mount.yaml             | -         | 启动配置（含源码挂载）       |
-| mineru-prod-template.json      | -         | 运行时配置模板（需修改路径） |
-| check_server_env.sh            | -         | 内网服务器环境检查脚本        |
-| README-mount-deploy.md         | -         | 部署 + 更新操作指南          |
-| MANIFEST-mount.txt             | -         | 本文件                      |
+| 文件名                          | 用途                        |
+|--------------------------------|----------------------------|
+| compose-mount.yaml             | 启动配置（含源码挂载）       |
+| mineru-prod-template.json      | 运行时配置模板（需修改路径） |
+| check_server_env.sh            | 内网服务器环境检查脚本        |
+| README-mount-deploy.md         | 部署 + 更新操作指南          |
+| MANIFEST-mount.txt             | 本文件                      |
 
-【重要】大文件为软链接，指向同级目录 ../offline-package/。
-传输到内网服务器时，必须把 offline-package/ 和 offline-package-mount/
-两个目录一起传到同一父目录下（如 /data/ 下），软链接才会生效：
-
-  scp -r offline-package offline-package-mount root@内网服务器IP:/data/
+【前置】方式 B 要求服务器已通过方式 A 部署：已有 mineru:3.4.4-upstream
+镜像 + 模型解压到 /data/mineru_models。本包只发源码 + 配置，不重复发
+镜像 / 模型。
 
 部署步骤:
   1. 阅读 README-mount-deploy.md
-  2. 首次安装：load 镜像 + 解压模型 + 放源码 + 启动
+  2. rsync 源码到 /data/mineru-src/mineru/ → 改 compose-mount.yaml → 启动
   3. 日常更新：rsync 源码 → restart（无需重打镜像）
 
 ================================================================

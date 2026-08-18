@@ -1,32 +1,31 @@
 # MinerU 3.4.4 源码挂载模式部署操作卡（方式 B）
 
 > **面向对象**：内网运维/开发人员
-> **适用场景**：需要**频繁更新代码**（跟踪 develop 分支），每次改代码不想重打 14GB 镜像
+> **预计耗时**：10-15 分钟
+> **前提**：服务器已通过**方式 A** 部署过——已有 `mineru:3.4.4-upstream` 镜像 + 模型已解压到 `/data/mineru_models`
+> **适用场景**：需要**频繁更新代码**（跟踪 develop 分支），改代码不重打镜像
 > **与方式 A 的区别**：方式 A 把代码打进镜像，改代码要重新构建+导出镜像；方式 B 把源码挂载进容器，改代码只需 `rsync + restart`。
 
 ---
 
 ## 一、物料清单
 
-方式 B 与方式 A **共用**基础镜像和模型，只需额外准备一份源码目录：
+方式 B **只发源码 + 配置**，不重复发镜像 / 模型（这两样服务器上已有）：
 
 ```
 offline-package-mount/
-├── mineru-3.4.4-upstream.tar.gz  ← 基础镜像（软链接 → ../offline-package/）
-├── mineru-models-3.4.4.tar.gz    ← 模型（软链接 → ../offline-package/）
 ├── compose-mount.yaml             ← 启动配置（含源码挂载）
 ├── mineru-prod-template.json      ← 配置文件模板
 ├── check_server_env.sh            ← 环境检查脚本
 ├── README-mount-deploy.md         ← 本文件
-└── mineru/                        ← 需要额外 rsync 的源码目录（不随包分发）
+└── MANIFEST-mount.txt             ← 物料清单
 ```
 
-> **传输注意**：两个 tar.gz 是软链接，指向 `../offline-package/`。传输时必须把 `offline-package/` 和 `offline-package-mount/` **两个目录一起传到同一父目录**（如 `/data/`），软链接才有效：
-> `scp -r offline-package offline-package-mount root@内网服务器IP:/data/`
+> 源码目录 `mineru/` 不随包分发，用 rsync 同步（见「第二步」）。
 
 ---
 
-## 二、首次安装（一次性，约 15-20 分钟）
+## 二、首次切换（服务器已用方式 A 部署过）
 
 ### 1. 环境检查
 
@@ -35,21 +34,9 @@ cd /data/offline-package-mount
 bash check_server_env.sh
 ```
 
-### 2. 导入基础镜像
+**重点看**：`mineru:3.4.4-upstream` 镜像是否存在。没有 → 先按方式 A 部署（见 `../offline-package/README-internal-deploy.md`）。
 
-```bash
-gunzip -c mineru-3.4.4-upstream.tar.gz | docker load
-docker images mineru:3.4.4-upstream   # 应看到镜像
-```
-
-### 3. 解压模型
-
-```bash
-mkdir -p /data/mineru_models
-tar xzf mineru-models-3.4.4.tar.gz -C /data/mineru_models
-```
-
-### 4. 放置源码（关键，方式 B 独有）
+### 2. 放源码（方式 B 独有）
 
 把最新的 `mineru/` 源码放到宿主机，作为挂载源：
 
@@ -61,24 +48,22 @@ rsync -avz --delete 开发机:/zhangbo/MinerU/mineru/ /data/mineru-src/mineru/
 # git clone <仓库> && cp -r MinerU/mineru /data/mineru-src/
 ```
 
-> 挂载后容器会**直接使用这份源码**，镜像里自带的旧代码被覆盖，因此镜像无需 bake 最新代码。
+> 挂载后容器会**直接使用这份源码**，覆盖镜像里自带的旧代码。
 
-### 5. 修改配置
+### 3. 修改配置
 
 ```bash
 cp mineru-prod-template.json /root/mineru.json
 # 确认 models-dir 两处路径为 /data/mineru_models/...（默认无需改）
 ```
 
-### 6. 修改 compose-mount.yaml
-
-至少要改 **3 处**：
+### 4. 修改 compose-mount.yaml（3 处）
 
 1. **GPU 编号**：`device_ids: ["0"]` → 你的 GPU
 2. **端口**：`ports: - "8000:8000"` 有冲突时改第一个数字
-3. **源码路径**：`- /data/mineru-src/mineru:...` 左半边改成实际源码路径（与第 4 步一致）
+3. **源码路径**：`- /data/mineru-src/mineru:...` 左半边改成实际源码路径（与第 2 步一致）
 
-### 7. 启动
+### 5. 启动
 
 ```bash
 mkdir -p /data/mineru_output
@@ -86,7 +71,7 @@ docker compose -f compose-mount.yaml up -d
 docker compose -f compose-mount.yaml logs -f   # 等出现 "Uvicorn running on..."
 ```
 
-### 8. 验证
+### 6. 验证
 
 ```bash
 curl http://localhost:8000/health        # 返回 {"status":"ok"}
@@ -136,5 +121,5 @@ curl http://localhost:8000/health
 
 ---
 
-> **方式 A（生产离线包）**：见 `README-internal-deploy.md`。
+> **方式 A（生产离线包）**：见 `../offline-package/README-internal-deploy.md`
 > **完整文档**：`deploy/mineru-3.4.4-offline-deployment-guide.md`
