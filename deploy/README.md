@@ -25,6 +25,7 @@
 | 包 | 构建教程 | 脚本 |
 |----|---------|------|
 | NVIDIA 方式 A | `build-offline-package.sh` 内注释 | [build-offline-package.sh](build-offline-package.sh) |
+| NVIDIA 方式 B | [offline-package-mount/README-mount-build.md](../offline-package-mount/README-mount-build.md) | `build-mount-src.sh` |
 | PPU 方式 A | [offline-package-ppu/README-ppu-build.md](../offline-package-ppu/README-ppu-build.md) | `build-ppu-fork.sh` |
 | PPU 方式 B | [offline-package-ppu-mount/README-ppu-mount-build.md](../offline-package-ppu-mount/README-ppu-mount-build.md) | `build-ppu-src.sh` |
 

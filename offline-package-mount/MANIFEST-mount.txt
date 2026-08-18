@@ -5,6 +5,7 @@
 
 | 文件名                          | 用途                        |
 |--------------------------------|----------------------------|
+| mineru-src-3.4.4.tar.gz       | 源码包（构建产物，解压后挂载）|
 | compose-mount.yaml             | 启动配置（含源码挂载）       |
 | mineru-prod-template.json      | 运行时配置模板（需修改路径） |
 | check_server_env.sh            | 内网服务器环境检查脚本        |
@@ -15,9 +16,12 @@
 镜像 + 模型解压到 /data/mineru_models。本包只发源码 + 配置，不重复发
 镜像 / 模型。
 
+【注意】mineru-src-3.4.4.tar.gz 是构建产物，已被 .gitignore 忽略、
+不进 git；由构建机执行 build-mount-src.sh 生成（见 README-mount-build.md）。
+
 部署步骤:
   1. 阅读 README-mount-deploy.md
-  2. rsync 源码到 /data/mineru-src/mineru/ → 改 compose-mount.yaml → 启动
-  3. 日常更新：rsync 源码 → restart（无需重打镜像）
+  2. 解压源码包到 /data/mineru-src/ → 改 compose-mount.yaml → 启动
+  3. 日常更新：换源码包 → restart（无需重打镜像）
 
 ================================================================

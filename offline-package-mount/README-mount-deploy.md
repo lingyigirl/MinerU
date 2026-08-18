@@ -4,7 +4,7 @@
 > **预计耗时**：10-15 分钟
 > **前提**：服务器已通过**方式 A** 部署过——已有 `mineru:3.4.4-upstream` 镜像 + 模型已解压到 `/data/mineru_models`
 > **适用场景**：需要**频繁更新代码**（跟踪 develop 分支），改代码不重打镜像
-> **与方式 A 的区别**：方式 A 把代码打进镜像，改代码要重新构建+导出镜像；方式 B 把源码挂载进容器，改代码只需 `rsync + restart`。
+> **与方式 A 的区别**：方式 A 把代码打进镜像，改代码要重新构建+导出镜像；方式 B 把源码挂载进容器，改代码只需换源码包 + restart。
 
 ---
 
@@ -14,14 +14,13 @@
 
 ```
 offline-package-mount/
+├── mineru-src-3.4.4.tar.gz       ← 源码包（解压后挂载）
 ├── compose-mount.yaml             ← 启动配置（含源码挂载）
 ├── mineru-prod-template.json      ← 配置文件模板
 ├── check_server_env.sh            ← 环境检查脚本
 ├── README-mount-deploy.md         ← 本文件
 └── MANIFEST-mount.txt             ← 物料清单
 ```
-
-> 源码目录 `mineru/` 不随包分发，用 rsync 同步（见「第二步」）。
 
 ---
 
@@ -36,16 +35,12 @@ bash check_server_env.sh
 
 **重点看**：`mineru:3.4.4-upstream` 镜像是否存在。没有 → 先按方式 A 部署（见 `../offline-package/README-internal-deploy.md`）。
 
-### 2. 放源码（方式 B 独有）
-
-把最新的 `mineru/` 源码放到宿主机，作为挂载源：
+### 2. 解压源码包（方式 B 独有）
 
 ```bash
 mkdir -p /data/mineru-src
-# 方式一：从开发机 rsync（推荐）
-rsync -avz --delete 开发机:/zhangbo/MinerU/mineru/ /data/mineru-src/mineru/
-# 方式二：从 git 仓库 clone 后拷贝
-# git clone <仓库> && cp -r MinerU/mineru /data/mineru-src/
+tar xzf /data/mineru-src-3.4.4.tar.gz -C /data/mineru-src
+# 得到 /data/mineru-src/mineru/，正好是 compose 挂载源
 ```
 
 > 挂载后容器会**直接使用这份源码**，覆盖镜像里自带的旧代码。
@@ -85,8 +80,8 @@ curl -X POST http://localhost:8000/file_parse -F "file=@/path/to/any.pdf" -o /tm
 改代码后**无需重打镜像**，三步即可生效：
 
 ```bash
-# 1. 同步最新源码（开发机 → 内网服务器）
-rsync -avz --delete 开发机:/zhangbo/MinerU/mineru/ /data/mineru-src/mineru/
+# 1. 收到新源码包后重新解压覆盖
+tar xzf /data/mineru-src-3.4.4.tar.gz -C /data/mineru-src
 
 # 2. 重启容器（源码挂载自动生效）
 docker compose -f compose-mount.yaml restart
@@ -95,7 +90,7 @@ docker compose -f compose-mount.yaml restart
 curl http://localhost:8000/health
 ```
 
-> 只改 `mineru/` 源码 → 只需 restart；改了 `pyproject.toml` 依赖 → 仍需重新构建镜像（回到方式 A 流程）。
+> 只改 `mineru/` 源码 → 换源码包 + restart；改了 `pyproject.toml` 依赖 → 仍需重新构建镜像（回到方式 A 流程）。
 
 ---
 
@@ -115,7 +110,7 @@ curl http://localhost:8000/health
 | 现象 | 可能原因 | 解决 |
 |------|---------|------|
 | 改的代码没生效 | 源码路径没挂对 / 没 restart | 确认 compose 源码路径与实际一致，`docker compose ... restart` |
-| 导入新模块报 ModuleNotFoundError | 新文件没同步 | `rsync --delete` 确保新增文件也同步过去 |
+| 导入新模块报 ModuleNotFoundError | 新文件没同步 | 重新解压源码包覆盖（`tar xzf` 会覆盖） |
 | 健康检查失败 | 模型还在加载 | 再等 1-2 分钟 |
 | `nvidia` 驱动错误 | Docker 无法访问 GPU | 安装 `nvidia-container-toolkit` |
 
