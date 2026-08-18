@@ -3310,6 +3310,49 @@ def _split_decimal_values(data: str, n_data: int) -> list[str]:
     return vals
 
 
+def _split_integer_quantity(
+    digits: str,
+    unit_prices: list[str],
+    amounts: list[str],
+) -> list[str]:
+    """用「金额 = 数量 × 单价」反推整数数量列的拆分。
+
+    VLM 将整数数量（无小数点，如 "3332"+"19197"→"333219197"）拼接为单个
+    纯数字串，无法按小数位数切分。单价（等精度）与金额（2 位小数）两列可
+    独立可靠拆分，故用每行 ``round(金额/单价)`` 反推数量，并双重校验：
+    （1）反推值 × 单价 ≈ 金额（容差 0.01 元或金额的 0.1%）；
+    （2）反推数量拼接后还原原始整数串。任一校验失败返回空列表，调用方
+    回退 OCR 重建（原则 4：双重约束保证必然正确，绝不硬猜）。
+
+    Args:
+        digits: 整数数量拼接串（仅数字，如 "333219197"）。
+        unit_prices: 已拆分的单价列表（长度 n_data）。
+        amounts: 已拆分的金额列表（长度 n_data）。
+
+    Returns:
+        反推出的数量字符串列表；无法可靠反推返回空列表。
+    """
+    if len(digits) < 2 or len(unit_prices) < 2 or len(amounts) != len(unit_prices):
+        return []
+    quantities: list[str] = []
+    for up, amt in zip(unit_prices, amounts):
+        try:
+            price = float(up)
+            amount = float(amt)
+            if price == 0:
+                return []
+            q = round(amount / price)
+        except (ValueError, OverflowError):
+            return []
+        tol = max(0.01, 0.001 * abs(amount))
+        if abs(q * price - amount) > tol:
+            return []
+        quantities.append(str(q))
+    if "".join(quantities) != digits:
+        return []
+    return quantities
+
+
 def _split_name_cell(data: str, n_data: int) -> tuple[list[str], str]:
     """拆分货物名称拼接单元格为 n_data 个服务名称 + 合计标签。
 
@@ -3824,12 +3867,24 @@ def _split_concatenated_row_deterministically(
     col_values: dict[int, list[str]] = {}
     summary_values: dict[int, str] = {}
     summary_name = ""
+    # [自定义] 整数数量（无小数点）待反推的 (列索引, 纯数字串)。数量列在单价/金额列
+    # 之前被遍历，无法当场反推，故先延迟，待步骤 4.25 单价/金额拆分完成后处理。
+    deferred_quantity: tuple[int, str] | None = None
     for vc, kw, data in parsed:
         if kw == "数量":
             vals = re.findall(r"\d+\.\d{2}", data)
-            if len(vals) != n_data:
-                return False
-            col_values[vc] = vals
+            if len(vals) == n_data:
+                col_values[vc] = vals
+            else:
+                # [自定义] 整数数量（无小数点，如 "3332"+"19197"→"333219197"）无法按
+                # 小数位数切分。延迟到单价/金额拆分后，用「金额 = 数量 × 单价」反推
+                # （原则 4：金额/单价两列可独立可靠拆分，反推 + 双重校验必然正确）。
+                digits = re.sub(r"[^\d]", "", data)
+                if digits and "." not in data and len(digits) >= n_data:
+                    deferred_quantity = (vc, digits)
+                    col_values[vc] = [""] * n_data  # 占位，4.25 步反推后覆盖
+                else:
+                    return False
         elif kw == "税率":
             vals = re.findall(r"\d+(?:\.\d+)?\s*%", data)
             if len(vals) != n_data:
@@ -3858,11 +3913,30 @@ def _split_concatenated_row_deterministically(
             if len(data) >= n_data and len(data) % n_data == 0:
                 k = len(data) // n_data
                 col_values[vc] = [data[i * k : (i + 1) * k] for i in range(n_data)]
+            elif 0 < len(data) < n_data and not any(ch.isdigit() for ch in data):
+                # [自定义] VLM 将多行相同单位合并为单个（如单位 "吨" 而非 "吨吨"），
+                # 复制到每行（原则 4：单位是列级属性，非数值且长度 < n_data 时
+                # 必然是「相同单位被折叠」，复制必然正确）。
+                col_values[vc] = [data] * n_data
             else:
                 col_values[vc] = [""] * n_data
         else:
             # 规格型号等：置空（发票常无此列值）
             col_values[vc] = [""] * n_data
+
+    # 4.25 [自定义] 反推整数数量（金额 = 数量 × 单价）
+    if deferred_quantity is not None:
+        vc_q, digits = deferred_quantity
+        price_vc = next((v for v, k, _ in parsed if k == "单价"), -1)
+        amount_vc = next((v for v, k, _ in parsed if k == "金额"), -1)
+        quantities = _split_integer_quantity(
+            digits,
+            col_values.get(price_vc, []),
+            col_values.get(amount_vc, []),
+        )
+        if len(quantities) != n_data:
+            return False
+        col_values[vc_q] = quantities
 
     # 4.5 [自定义] 从 rowspan 续行回填金额/税额合计 ¥ 值（原则 1 不多不少）
     # VLM 用 rowspan 布局表示货物区时，拼接行的金额/税额单元格无 ¥，合计放在

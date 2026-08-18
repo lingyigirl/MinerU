@@ -22,6 +22,7 @@ from mineru.utils.custom.table_utils import (
     _rebuild_merged_rows_from_ocr,
     _fill_empty_cells_from_ocr_grid,
     _split_concatenated_row_deterministically,
+    _split_integer_quantity,
 )
 
 
@@ -547,6 +548,79 @@ def test_split_concatenated_row_deterministically_removes_orphan_continuation():
     assert "rowspan" not in str(table), f"重建后不应残留 rowspan，实际 {str(table)!r}"
 
 
+def test_split_concatenated_row_deterministically_integer_quantity():
+    """确定性拆分：整数数量（无小数点）+ 单个单位「吨」应正确拆分。
+
+    回归保护：202310 专用发票 VLM 把数量 "3332"+"19197" 拼接为 "333219197"
+    （无小数点），单位两行「吨」折叠为单个「吨」。确定性拆分应：
+    - 用「金额 = 数量 × 单价」反推出整数数量 ["3332", "19197"]；
+    - 把单个「吨」复制到每行；
+    - 而非回退 OCR 重建（旧 OCR 重建把数量+单价合并为 "33321.40776710684"
+      并整体右移金额/税率列）。
+    """
+    table_html = """<table>
+      <tr><td colspan="2">货物或应税劳务、服务名称*水冰雪*1-居民生活*水冰雪*5-生产合计</td>
+          <td>规格型号</td><td>单位吨</td>
+          <td>数量333219197</td>
+          <td colspan="2">单价1.407767106842.11650466218</td>
+          <td>金额4690.6840630.54¥45321.22</td>
+          <td>税率3%3%</td><td>税额140.721218.92¥1359.64</td></tr>
+    </table>"""
+    soup = BeautifulSoup(table_html, "html.parser")
+    table = soup.find("table")
+    vlm_data, _ = _parse_vlm_table_structure(table.find_all("tr"))
+
+    ok = _split_concatenated_row_deterministically(soup, table, vlm_data, 0)
+
+    assert ok is True, "确定性拆分应成功"
+    text = table.get_text()
+    # 数量整数反推：3332 / 19197 各出现 1 次（不残留 "333219197" 原始拼接串）
+    assert text.count("3332") == 1, f"数量 3332 应恰好出现 1 次，实际 {text!r}"
+    assert text.count("19197") == 1, f"数量 19197 应恰好出现 1 次，实际 {text!r}"
+    assert "333219197" not in text, f"不应残留数量拼接串，实际 {text!r}"
+    # 单位「吨」复制到两行
+    assert text.count("吨") == 2, f"单位「吨」应复制为两行，实际 {text!r}"
+    # 其余列值保真
+    for expected in ("1.40776710684", "2.11650466218", "4690.68", "40630.54",
+                     "3%", "140.72", "1218.92", "¥45321.22", "¥1359.64"):
+        assert expected in text, f"确定性拆分丢失值 {expected!r}，实际 {text!r}"
+    # 不应残留 OCR 重建的错位值（数量+单价合并为单格）。注意 get_text() 会把相邻
+    # 单元格文本无分隔拼接，故「数量=3332 + 单价=1.40776710684」的扁平化文本会自然
+    # 出现 "33321.40776710684"；这里按「单格文本」判定，而非扁平化全文。
+    all_cell_texts = [c.get_text().strip() for c in table.find_all(["td", "th"])]
+    assert "33321.40776710684" not in all_cell_texts, \
+        f"数量+单价不应合并为单格，实际 {all_cell_texts!r}"
+    assert "191972.11650466218" not in all_cell_texts, \
+        f"数量+单价不应合并为单格，实际 {all_cell_texts!r}"
+
+
+def test_split_integer_quantity_rejects_unverifiable():
+    """_split_integer_quantity：算术不符或拼接不还原时应返回空列表（原则 4 绝不硬猜）。"""
+    # 正常：3332×1.40776710684=4690.68、19197×2.11650466218=40630.54
+    assert _split_integer_quantity(
+        "333219197",
+        ["1.40776710684", "2.11650466218"],
+        ["4690.68", "40630.54"],
+    ) == ["3332", "19197"]
+    # 单价顺序颠倒 → 反推值×单价≠金额 → 空列表
+    assert _split_integer_quantity(
+        "333219197",
+        ["2.11650466218", "1.40776710684"],
+        ["4690.68", "40630.54"],
+    ) == []
+    # 拼接串不还原（末位数字不一致）→ 空列表
+    assert _split_integer_quantity(
+        "333219198",
+        ["1.40776710684", "2.11650466218"],
+        ["4690.68", "40630.54"],
+    ) == []
+    # 单价/金额缺失或长度不符 → 空列表
+    assert _split_integer_quantity("333219197", [], ["4690.68"]) == []
+    assert _split_integer_quantity("333219197", ["1.40776710684"], ["4690.68"]) == []
+    # 单价为 0 → 空列表
+    assert _split_integer_quantity("12", ["0", "2.0"], ["4690.68", "40630.54"]) == []
+
+
 if __name__ == "__main__":
     test_equity_statement_label_only_rows_not_treated_as_header()
     test_simple_header_and_data()
@@ -563,4 +637,6 @@ if __name__ == "__main__":
     test_is_financial_statement_table()
     test_split_concatenated_row_deterministically_preserves_all_values()
     test_split_concatenated_row_deterministically_removes_orphan_continuation()
+    test_split_concatenated_row_deterministically_integer_quantity()
+    test_split_integer_quantity_rejects_unverifiable()
     print("✅ 所有 _detect_data_row_start / 稀疏门控 / OCR 重建 / 去重 回归测试通过")
