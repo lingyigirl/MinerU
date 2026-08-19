@@ -1,0 +1,60 @@
+# ============================================================
+# MinerU PPU（平头哥 T-Head）源码挂载模式 Docker Compose（方式 B·PPU 版）
+#
+# 与 NVIDIA 的 compose-mount.yaml 的区别：
+#   - 基础镜像是 PPU 专用镜像（mineru:ppu-vllm-latest），非 NVIDIA vLLM
+#   - 用 --device=/dev/alixpu 透传 PPU 加速卡（替代 NVIDIA 的 nvidia gpu 驱动）
+#   - privileged + shm_size 500g + host 网络（PPU vLLM 要求）
+#
+# 使用前修改:
+#   1. 源码路径 — 宿主机 fork mineru/ 目录（默认 /data/mineru-src/mineru）
+#      ← 由 build-ppu-src.sh 打包的 mineru-src-3.4.4.tar.gz 解压而来：
+#        mkdir -p /data/mineru-src && tar xzf mineru-src-3.4.4.tar.gz -C /data/mineru-src
+#   2. CUDA_VISIBLE_DEVICES — 指定 PPU 卡号（ppu-smi 查看）
+#   3. 数据/模型挂载 — /mnt、/datapool 与服务器实际路径一致（来自 V2.txt）
+#   4. 输出目录 — MINERU_API_OUTPUT_ROOT 落到已挂载的 /datapool 下（持久化）
+#
+# 构建 PPU 基础镜像（一次性）:
+#   docker build --network=host -t mineru:ppu-vllm-latest -f docker/china/ppu.Dockerfile .
+# 启动:
+#   docker compose -f compose-mount-ppu.yaml up -d
+# 更新代码:
+#   重新解压 mineru-src-3.4.4.tar.gz → docker compose -f compose-mount-ppu.yaml restart
+# ============================================================
+services:
+  mineru-api:
+    image: mineru:ppu-vllm-latest
+    container_name: mineru-ppu
+    restart: always
+    privileged: true                 # PPU 设备访问需要
+    network_mode: host               # host 网络，服务直接监听宿主机 8000
+    ipc: host
+    shm_size: "500g"                 # PPU vLLM 需要的大共享内存
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    devices:
+      - "/dev/alixpu:/dev/alixpu"
+      - "/dev/alixpu_ctl:/dev/alixpu_ctl"
+    environment:
+      MINERU_MODEL_SOURCE: local
+      MINERU_BACKEND: vlm-vllm-async-engine   # PPU 上 vLLM 异步引擎
+      CUDA_VISIBLE_DEVICES: "0"              # ← 指定 PPU 卡号（ppu-smi 查看）
+      MINERU_API_OUTPUT_ROOT: /datapool/mineru_output   # 输出落到已挂载的 /datapool 下（持久化）
+      MINERU_LOG_FILE_ENABLE: "false"
+
+    volumes:
+      # ---- PPU vLLM 需要 docker.sock（容器内再调度） ----
+      - /var/run/docker.sock:/var/run/docker.sock
+      # ---- 数据/模型挂载（与 V2.txt 服务器一致，按实际路径改） ----
+      - /mnt:/mnt
+      - /datapool:/datapool
+      # ---- 源码挂载（关键）：覆盖镜像内 pip 安装的 mineru 包 ----
+      # 左半边 /data/mineru-src/mineru 来自 mineru-src-3.4.4.tar.gz（build-ppu-src.sh 产物）
+      # 右半边路径需与 PPU 镜像实际安装位置一致，先在容器内确认：
+      #   docker run --rm mineru:ppu-vllm-latest python3 -c "import mineru; print(mineru.__file__)"
+      - /data/mineru-src/mineru:/usr/local/lib/python3.12/dist-packages/mineru
+    command:
+      mineru-api
+      --host 0.0.0.0
+      --port 8000

@@ -24,6 +24,7 @@ IMAGE_NAME="${IMAGE_NAME:-mineru:3.4.4-upstream}"
 MODEL_SOURCE="${MODEL_SOURCE:-/zhangbo/mineru_models}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${1:-${PROJECT_ROOT}/offline-package}"
+FORCE_BUILD="${FORCE_BUILD:-0}"     # 1=强制重建镜像（只改 mineru/ 源码时 Dockerfile/pyproject 时间不变，需手动强制）
 
 # ---- 颜色 ----
 RED='\033[0;31m'
@@ -90,6 +91,12 @@ if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${IMAGE_NAME}$"
     else
         log "源文件有更新，需要重建镜像"
     fi
+fi
+
+# 强制重建开关
+if [ "${FORCE_BUILD}" = "1" ]; then
+    log "FORCE_BUILD=1，强制重建镜像"
+    NEED_BUILD=true
 fi
 
 if $NEED_BUILD; then

@@ -1,0 +1,47 @@
+# ============================================================
+# MinerU PPU（平头哥 T-Head）方式 A Docker Compose（烤代码进镜像）
+#
+# 与 compose-mount-ppu.yaml（方式 B）的区别：
+#   - 镜像用 fork 烤入的 mineru:ppu-fork-3.4.4（非 mineru:ppu-vllm-latest）
+#   - 无源码挂载卷（代码已在镜像里，更新需重打镜像）
+#
+# 使用前修改:
+#   1. CUDA_VISIBLE_DEVICES — 指定 PPU 卡号（ppu-smi 查看）
+#   2. 数据/模型挂载 — /mnt、/datapool 与服务器实际路径一致（来自 V2.txt）
+#   3. 输出目录 — MINERU_API_OUTPUT_ROOT 落到已挂载的 /datapool 下
+#
+# 启动:
+#   docker compose -f compose-ppu.yaml up -d
+# ============================================================
+services:
+  mineru-api:
+    image: mineru:ppu-fork-3.4.4
+    container_name: mineru-ppu
+    restart: always
+    privileged: true                 # PPU 设备访问需要
+    network_mode: host               # host 网络，服务直接监听宿主机 8000
+    ipc: host
+    shm_size: "500g"                 # PPU vLLM 需要的大共享内存
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    devices:
+      - "/dev/alixpu:/dev/alixpu"
+      - "/dev/alixpu_ctl:/dev/alixpu_ctl"
+    environment:
+      MINERU_MODEL_SOURCE: local
+      MINERU_BACKEND: vlm-vllm-async-engine   # PPU 上 vLLM 异步引擎
+      CUDA_VISIBLE_DEVICES: "0"              # ← 指定 PPU 卡号（ppu-smi 查看）
+      MINERU_API_OUTPUT_ROOT: /datapool/mineru_output   # 输出落到已挂载的 /datapool 下（持久化）
+      MINERU_LOG_FILE_ENABLE: "false"
+
+    volumes:
+      # ---- PPU vLLM 需要 docker.sock（容器内再调度） ----
+      - /var/run/docker.sock:/var/run/docker.sock
+      # ---- 数据/模型挂载（与 V2.txt 服务器一致，按实际路径改） ----
+      - /mnt:/mnt
+      - /datapool:/datapool
+    command:
+      mineru-api
+      --host 0.0.0.0
+      --port 8000

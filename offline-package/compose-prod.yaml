@@ -14,7 +14,7 @@
 # ============================================================
 services:
   mineru-api:
-    image: mineru:3.4.4
+    image: mineru:3.4.4-upstream
     container_name: mineru-api
     restart: always
     ports:
@@ -59,7 +59,7 @@ services:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout: 10s
-      start-period: 180s
+      start_period: 180s
       retries: 3
     # ---- 日志轮转（防止占满磁盘） ----
     logging:

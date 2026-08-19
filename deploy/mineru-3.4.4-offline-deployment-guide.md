@@ -903,7 +903,7 @@ tar czf mineru-backup-$(date +%Y%m%d).tar.gz \
 | 文档            | 路径                                                                    |
 | --------------- | ----------------------------------------------------------------------- |
 | 升级指南        | `agents_logs/edits/2026-08-03_mineru-3.2.0-to-3.4.4-upgrade-guide.md` |
-| Docker 升级实战 | `docs/docker-image-upgrade-guide.md`                                  |
+| Docker 升级实战 | `deploy/docker-image-upgrade-guide.md`                                  |
 | 架构说明        | `docs/zh/dev/架构说明.md`                                             |
 | API 接口说明    | `docs/zh/dev/接口说明.md`                                             |
 | 服务器检查脚本  | `deploy/check_server_env.sh`                                          |

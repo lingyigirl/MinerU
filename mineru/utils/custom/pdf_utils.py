@@ -9,17 +9,49 @@ from mineru.utils.pdf_image_tools import (
     DEFAULT_PDF_IMAGE_DPI,
     image_rotate,
     load_images_from_pdf_core,
-    pdf_images_to_pdf_bytes,
 )
+
+
+def _images_to_pdf_bytes_with_dpi(images_list: list, dpi: int) -> bytes:
+    """将修正后的 PIL 图像合成为带 DPI 元数据的 PDF。
+
+    PIL 默认 save(format="PDF") 时按 1px=1pt（72 DPI）处理，导致 dpi 渲染的
+    高清图存出的 PDF 页面尺寸被放大（像素数 = 页尺寸，源页面尺寸被破坏）。
+    通过传入 resolution=dpi 写入正确的 DPI 元数据，使页面尺寸 =
+    像素 / dpi * 72，与源页面一致，同时图像像素保持 dpi 分辨率不降采样。
+
+    Args:
+        images_list: 形如 [{"img_pil": PIL.Image}, ...] 的修正后图像列表。
+        dpi: 渲染 DPI，用于写入 PDF 元数据（页面尺寸据此换算）。
+
+    Returns:
+        合成的 PDF 字节串；列表为空时返回 b""。
+    """
+    from io import BytesIO
+
+    pil_images = [img_dict["img_pil"].convert("RGB") for img_dict in images_list]
+    if not pil_images:
+        return b""
+
+    pdf_bytes_io = BytesIO()
+    pil_images[0].save(
+        pdf_bytes_io,
+        format="PDF",
+        save_all=True,
+        append_images=pil_images[1:],
+        resolution=float(dpi),
+    )
+    return pdf_bytes_io.getvalue()
 
 
 def generate_rotation_corrected_pdf(pdf_bytes: bytes, dpi: int = DEFAULT_PDF_IMAGE_DPI) -> bytes:
     """将 PDF 所有页面渲染并做朝向检测+旋转修正，合成为一个方向正确的 PDF。
 
     流程：
-    1. pypdfium2 逐页渲染为 PIL Image
-    2. image_rotate() 对每页做 4 方向分类 + 旋转修正（含混合朝向页面的局部修正）
-    3. 将修正后的所有页面合成为单 PDF
+    1. pypdfium2 逐页渲染为 PIL Image（保持 dpi 分辨率，不降采样）
+    2. image_rotate() 对每页做 4 方向分类 + 旋转修正
+    3. 将修正后的所有页面合成单 PDF，写入 resolution=dpi 元数据，
+       使页面尺寸与源 PDF 一致，同时图像像素保持 dpi 分辨率不降采样
 
     注意：此函数会用 pypdfium2 打开文档，调用者需确保 pdfium_guard 锁可用。
     """
@@ -55,7 +87,7 @@ def generate_rotation_corrected_pdf(pdf_bytes: bytes, dpi: int = DEFAULT_PDF_IMA
             )
 
     try:
-        return pdf_images_to_pdf_bytes(images_list)
+        return _images_to_pdf_bytes_with_dpi(images_list, dpi)
     except Exception as exc:
         logger.warning(
             f"旋转修正PDF——图片合成PDF失败（{len(images_list)}张修正后图片）: {exc}"

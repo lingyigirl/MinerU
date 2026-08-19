@@ -556,71 +556,26 @@ def append_pdf_bytes(new_images_list: list[dict], accumulated_pdf_bytes: bytes |
     return _merge_pdf_bytes(accumulated_pdf_bytes, current_pdf_bytes)
 
 
-def _correct_sub_regions_in_page(pil_img: Image.Image, cls_model) -> Image.Image:
-    """Correct locally rotated regions in a mixed-orientation page."""
-    np_img = np.asarray(pil_img)
-    h, w = np_img.shape[:2]
-    mid = h // 2
-    top_np = np_img[:mid, :, :]
-    bottom_np = np_img[mid:, :, :]
-    top_label = cls_model.predict_direct(top_np)
-    bottom_label = cls_model.predict_direct(bottom_np)
-    if top_label == "0" and bottom_label == "0":
-        return pil_img
-
-    result = pil_img.copy()
-
-    def _get_pil_angle(label):
-        if label == "270": return -90
-        elif label == "90": return 90
-        elif label == "180": return 180
-        return 0
-
-    def _correct_region(x1, y1, x2, y2, label):
-        crop = pil_img.crop((x1, y1, x2, y2))
-        angle = _get_pil_angle(label)
-        rotated = crop.rotate(angle, expand=True)
-        target_w, target_h = x2 - x1, y2 - y1
-        rotated = rotated.resize((target_w, target_h), Image.LANCZOS)
-        nonlocal result
-        result.paste(rotated, (x1, y1))
-
-    if top_label != "0":
-        _correct_region(0, 0, w, mid, top_label)
-    if bottom_label != "0":
-        _correct_region(0, mid, w, h, bottom_label)
-    return result
-
-
 def image_rotate(image_dict):
-    """Detect and rotate a page image using ONNX orientation classifier.
+    """使用 ONNX 朝向分类器对整页做朝向检测并旋转修正。
 
-    使用 PaddleOrientationClsModel（基于 ONNX 的图像特征分类器）对整页做朝向检测。
-    能处理混合朝向页面（上半部分和下半部分方向不同）。
+    仅做整页旋转，不做页内上下半页拆分。
 
     [自定义] 上游从 PaddleOrientationClsModel 切换到 MineruTableOrientationClsModel
     后，image_rotate 未同步更新。MineruTableOrientationClsModel 是表格朝向模型，
     基于 OCR 竖排文字检测，对整页图片始终返回 "0"。此处使用 PaddleOrientationClsModel
     的 predict_direct() 直接做 ONNX 图像分类，正确处理整页朝向。
+
+    注意：曾实现"混合朝向"页内局部修正（上下半页拆分），但目录页等点状引导线
+    内容在半页裁剪下使分类器置信度接近随机（argmax 误判为 180°），导致半页被
+    错误翻转。已移除，仅保留整页旋转。
     """
     ng_img = image_dict['img_pil']
     cls_model = _get_orientation_cls_model()
 
     rotate_label = cls_model.predict_direct(ng_img)
 
-    np_img = np.asarray(ng_img)
-    h_img, w_img = np_img.shape[:2]
-    top_label = cls_model.predict_direct(np_img[:h_img // 2, :, :])
-    bottom_label = cls_model.predict_direct(np_img[h_img // 2:, :, :])
-
-    if top_label != "0" or bottom_label != "0":
-        if top_label != bottom_label or (top_label != "0" and rotate_label != top_label):
-            ng_img = _correct_sub_regions_in_page(ng_img, cls_model)
-            rotate_label = None
-    else:
-        rotate_label = None
-
-    if rotate_label is not None:
+    if rotate_label != "0":
         ng_img = cls_model.rotate_pil_image(ng_img, rotate_label)
 
     image_dict['img_pil'] = ng_img

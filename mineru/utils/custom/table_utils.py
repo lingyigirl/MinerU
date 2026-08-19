@@ -13,6 +13,45 @@ from typing import Optional
 from bs4 import BeautifulSoup, NavigableString, Tag
 from loguru import logger
 
+# ============================================================================
+# 发票处理函数地图（维护索引）
+# ============================================================================
+# 本模块与增值税发票后处理相关的函数分属两个阶段，共用多套关键词常量：
+#
+# 【阶段B：内容生成钩子】入口 _format_embedded_html（vlm_middle_json_mkcontent.py），
+# 按固定顺序串行调用（序号即钩子顺序）：
+#   1. split_merged_table_cells        全行/局部合并单元格拆分（:26）
+#   2. split_summary_from_data_cell    数据行内嵌「合计」拆分 + rowspan 处理（:1022）
+#   3. extract_column_header_prefixes  表头前缀提取 / ¥ 对齐（:2386）
+#   4. normalize_invoice_table         发票专用规范化入口（:2149），内部依次：
+#        _normalize_vat_invoice_columns  8 列签名归一化（名称/单价 colspan 2→1，:2036）
+#        _format_summary_row_colspan     合计行连续空单元格合并（:1684）
+#        _infer_missing_values_in_table  缺失税率推断（默认关闭，:1752）
+#   5. fix_summary_row_yen_position    合计行 ¥/￥ 值列对齐（:2218）
+#   6. split_info_cell_multiline       购买方/销售方信息多行拆分（:1875）
+#
+# 【阶段A：Hybrid OCR 补充】入口 finalize_middle_json
+# （hybrid_model_output_to_middle_json.py）：
+#   supplement_vlm_table_cells_with_ocr  VLM 表格空单元格 OCR 补充 / 拼接行确定性重建（:4384）
+#   supplement_empty_table_cells         通用空单元格 OCR 补充（:2723）
+#
+# 【发票检测与归一化】
+#   _is_invoice_table                发票表级检测（≥3 关键词，:2579）
+#   _normalize_vat_invoice_columns   8 列签名收拢（专用/普通发票，:2036）
+#   _is_structurally_sparse_table / _is_financial_statement_table  反向门控（:2634/:2660）
+#
+# 【共享常量】（关键词集合语义有重叠，维护时注意同步）
+#   _INVOICE_HEADER_KEYWORDS        通用发票表头关键词（:17）
+#   _SPLIT_SUMMARY_KEYWORDS         合计/小计/总计摘要关键词（:1019）
+#   _INVOICE_DETECTION_KEYWORDS     发票检测关键词（:2573）
+#   _INVOICE_DATA_COLUMN_KEYWORDS   数据列关键词（:3126）
+#   _NUMERIC_COLUMN_KEYWORDS        数值列关键词（:3168）
+#   _VAT_INVOICE_NAME_LABELS        货物区名称列标签（:1975）
+#   _VAT_INVOICE_COLUMN_SIGNATURE   8 列签名（除名称外 7 列，:1978）
+#   _VAT_INVOICE_ROW_LABELS         非货物区行级标签（:1981）
+#
+# 注：行号为维护时的近似值，以 grep 实际位置为准；本索引只标注职责与调用链。
+
 # 常见发票表头关键词集合（用于识别合并单元格文本中的表头部分）
 _INVOICE_HEADER_KEYWORDS = {
     "项目名称", "货物或应税劳务、服务名称", "规格型号", "单位", "数量",
@@ -448,9 +487,11 @@ def _classify_tokens(
             in_data_section = True
             data_tokens.append(token)
         else:
-            # 无法分类的不明 token，跳过
-            logger.debug(f"无法分类的 token: {token}，跳过")
-            continue
+            # 无法明确分类的 token（非表头关键词、也非数值），
+            # 可能是发票中的非数值数据（如"免税"、"***"等），作为数据保留
+            in_data_section = True
+            data_tokens.append(token)
+            logger.debug(f"无法明确分类的 token: '{token}'，作为数据保留")
 
     if not header_tokens:
         return [], None
@@ -461,15 +502,29 @@ def _classify_tokens(
 def _strip_header_prefix(token: str) -> Optional[dict]:
     """检查 token 是否以已知表头关键词开头，若匹配则剥离。
 
+    VLM 对纵向排版的表头（如「数量」「单价」上下两字）会输出为「数 量」、
+    「单 价」（关键词内部含空格），此时直接前缀匹配会失败。因此先按原文本
+    直接前缀匹配（保留数据值内部空格），失败时再用去除全部空白后的紧凑文本
+    匹配，容忍关键词内部空格（与 _match_data_column_keyword 保持一致）。
+
     Args:
         token: 待检查的 token。
 
     Returns:
         {"header": 表头关键词, "data": 剩余文本} 或 None。
     """
+    # 紧凑文本：去除全部空白，用于容忍关键词内部空格（如「数 量」→「数量」）
+    compact = "".join(token.split())
     for header in sorted(_INVOICE_HEADER_KEYWORDS, key=len, reverse=True):
+        # 直接前缀匹配（保留数据值内部空格）
         if token.startswith(header) and len(token) > len(header):
             data = token[len(header):].strip()
+            if data:
+                return {"header": header, "data": data}
+        # 关键词内部含空格（如「数 量1622」→「数量」+「1622」），
+        # 仅在紧凑文本与原文不同且紧凑文本能前缀匹配时才用紧凑文本
+        if compact != token and compact.startswith(header) and len(compact) > len(header):
+            data = compact[len(header):].strip()
             if data:
                 return {"header": header, "data": data}
     return None
@@ -486,7 +541,9 @@ def _strip_leading_punctuation(token: str) -> str:
     Returns:
         去除开头标点后的 token。
     """
-    return re.sub(r'^[.,;:!?。，、；：！？·•\-–—]+', '', token).strip() or token
+    # 仅去除表格竖线误识别的残留符号（单个 "."），保留有意义的标点
+    cleaned = re.sub(r'^\.(?=[^.\d])', '', token).strip()
+    return cleaned or token
 
 
 def _merge_split_keywords(tokens: list[str]) -> list[str]:
@@ -668,9 +725,9 @@ def _fix_embedded_summary(
     else:
         values[0] = "合计"
 
-    # 清空"合计"原位置和中间的空列
-    for i in range(1, n_cols):
-        if i not in target_slots:
+    # 清空已被移动到目标列的数值的原位置（仅清空被移动过的数值，保留其余内容）
+    for i in range(total_idx, n_cols):
+        if i not in target_slots and values[i] in summary_numbers:
             values[i] = ""
 
     return values
@@ -1033,6 +1090,11 @@ def split_summary_from_data_cell(html: str) -> str:
     modified = False
     for table in soup.find_all("table"):
         try:
+            # [自定义] 仅对发票表格执行合计/小计拆分。
+            # 财务报表等通用表格中的「流动资产合计」「负债合计」「所有者权益合计」
+            # 等是合法的会计科目行标签，结尾虽含「合计」但不应拆分。
+            if not _is_invoice_table(table):
+                continue
             _split_summary_rows_in_table(soup, table)
             modified = True  # 内部无异常即认为可能已修改
         except Exception:
@@ -1184,6 +1246,14 @@ def _split_summary_rows_in_table(soup: BeautifulSoup, table: Tag) -> None:
         if summary_cell_idx is None:
             continue
 
+        # 合计已在第一列（标准位置），跳过空值模式
+        # VLM 多行格式输出的干净合计行（合计在列0），结构已正确，
+        # 不需要重组。合计行缺少的 ¥ 值由后续 fix_summary_row_yen_position 负责填充。
+        # 仅当 summary_cell_idx != 0 时才需要空值模式的列位置调整
+        # （如 OCR 重建从 VLM 拼接格中拆分出的合计）。
+        if summary_cell_idx == 0:
+            continue
+
         # 查找前一行是否有数值数据
         if row_idx == 0:
             continue
@@ -1294,7 +1364,6 @@ def _strip_summary_keyword(text: str, keyword: str) -> str:
     if m:
         return text[:m.start()].rstrip()
     return text
-    return text
 
 
 def _insert_summary_row_after(
@@ -1333,11 +1402,16 @@ def _insert_summary_row_after(
         if col_idx == 0:
             # 第一列放置摘要标签
             td.string = summary_label
-        elif _is_data_value(cell_val):
-            # 数值列复制数据值
-            td.string = cell_val
+        elif "¥" in cell_val or "￥" in cell_val:
+            # 从单元格中提取所有 ¥/￥ 前缀的金额值
+            yen_values = re.findall(r'[¥￥][\d.,]+', cell_val)
+            td.string = " ".join(yen_values) if yen_values else ""
+            # 注意：此处不清理源数据行中的 ¥ 值。
+            # ¥ 值的完整移动（从数据行提取 → 按 colspan 展开列索引
+            # 放置到合计行）由下游 extract_column_header_prefixes() 统一处理，
+            # 该函数拥有正确的 colspan 展开逻辑。
         else:
-            # 非数值列留空
+            # 其余列留空
             td.string = ""
         summary_tr.append(td)
 
@@ -1429,11 +1503,24 @@ def _handle_summary_split_with_rowspan(
     next_row = data_row.find_next_sibling("tr")
     next_cells = next_row.find_all(["td", "th"]) if next_row else []
 
+    copied_count = 0
     for idx, (cell_idx, _eff_col) in enumerate(non_rowspan_cols):
         if idx < len(next_cells) and cell_idx < len(data_cells):
-            data_cells[cell_idx].string = next_cells[idx].get_text().strip()
+            # 仅当 ¥ 行对应格非空时才覆盖，避免用空值清空数据行已识别的值
+            # （如「数 量\n1622」拆出的 1622 被 ¥ 行为空的对应格覆盖为空）
+            val = next_cells[idx].get_text().strip()
+            if val:
+                data_cells[cell_idx].string = val
+                copied_count += 1
 
     if next_row:
+        # 验证所有非空 next_cells 值都已被复制，未复制的记录日志
+        total_next_vals = len([c for c in next_cells if c.get_text().strip()])
+        if copied_count < total_next_vals:
+            logger.warning(
+                f"¥行删除前：{total_next_vals} 个非空值中仅复制了 {copied_count} 个，"
+                f"可能存在内容丢失"
+            )
         next_row.decompose()
 
     # 5. 创建合计行——从合并后的数据行取值
@@ -1714,6 +1801,8 @@ def _infer_missing_values_in_table(
         soup: BeautifulSoup 对象。
         table: <table> Tag。
     """
+    import os
+
     rows = table.find_all("tr")
     if len(rows) < 2:
         return
@@ -1790,8 +1879,12 @@ def _infer_missing_values_in_table(
             continue
 
         # 计算税率并填充
+        # [自定义] 环境变量 MINERU_INFER_MISSING_TABLE_VALUES 控制是否启用推断填充
+        # 默认关闭——推断值不是识别结果，违反"输出不多不少"原则
+        if not os.getenv("MINERU_INFER_MISSING_TABLE_VALUES", "").lower() in ("1", "true", "yes"):
+            continue
         computed_rate = round(tax_val / amount_val * 100)
-        # 仅当税率在合理范围内（0-20% 或精确匹配如 13/9/6/3）才填充
+        # 仅当税率在合理范围内（2~20%）才填充
         if 2 <= computed_rate <= 20:
             rate_str = f"{computed_rate}%"
             if rate_col < len(cells):
@@ -1811,8 +1904,10 @@ def _infer_missing_values_in_table(
 # 信息单元格中可识别为行分隔点的字段标签正则
 # 在"名称:"之后出现的这些标签前插入 <br/> 实现多行拆分
 # (统一社会信用代码/)?纳税人识别号 兼容有无"统一社会信用代码/"前缀的两种情况
+# (纳税人)?识别号: 兼容 VLM 将"纳税人"遗漏的缩写情况
+# (地)?址、电话: 兼容 VLM 将"地"遗漏的缩写情况
 _INFO_LINE_BREAK_RE = re.compile(
-    r'(?<=.)(?:(统一社会信用代码/)?纳税人识别号:|地址、电话:|开户行及账号:)'
+    r'(?<=.)(?:(统一社会信用代码/)?(纳税人)?识别号:|(地)?址、电话:|开户行及账号:)'
 )
 
 
@@ -1861,8 +1956,9 @@ def split_info_cell_multiline(html: str) -> str:
         if td.find("br"):
             continue
 
-        # 必须包含"名称:"才可能是发票信息单元格
-        if not text.startswith("名称:"):
+        # 必须包含购买方/销售方信息标签才可能是发票信息单元格
+        # 兼容 VLM 输出缩写的 "称:"（缺"名"字）的情况
+        if not (text.startswith("名称:") or text.startswith("称:")):
             continue
 
         # 在字段标签前插入 <br/> 实现分行的同时保留所有字段内容
@@ -1912,6 +2008,181 @@ def _has_significant_rowspan(html: str) -> bool:
         if table.find(attrs={"rowspan": True}):
             return True
     return False
+
+
+# 增值税发票货物区「名称」列标签（专用/普通发票共用的首列表头）。
+_VAT_INVOICE_NAME_LABELS = ("货物或应税劳务、服务名称", "项目名称")
+
+# 增值税发票货物区 8 列签名中除名称列外的 7 列，用于完整签名校验。
+_VAT_INVOICE_COLUMN_SIGNATURE = ("规格型号", "单位", "数量", "单价", "金额", "税率", "税额")
+
+# 非货物区行的行级标签（收拢列数时应保留其 colspan，不压缩）。
+_VAT_INVOICE_ROW_LABELS = ("价税合计", "购买方", "销售方", "密码区", "备注")
+
+
+def _is_vat_invoice_row_label(text: str) -> bool:
+    """判断单元格文本是否为非货物区行的行级标签。
+
+    非货物区行（购买方/销售方/价税合计）中的窄标签列（如「购买方」「价税合计
+    (大写)」）即使 colspan>1 也不应收拢，否则会破坏标签列的宽度。标签通常短小
+    且命中 _VAT_INVOICE_ROW_LABELS 或以其中某标签开头（兼容「价税合计(大写)」）。
+
+    Args:
+        text: 单元格文本（未 strip）。
+
+    Returns:
+        True 表示该文本为行级标签。
+    """
+    t = "".join(text.split())
+    if not t:
+        return False
+    return any(t == k or t.startswith(k) for k in _VAT_INVOICE_ROW_LABELS)
+
+
+def _shrink_row_to_cols(cells: list[Tag], target_cols: int) -> None:
+    """将非货物区行收拢到 target_cols，每轮对每个非标签宽单元格各减 1 列。
+
+    增值税发票中购买方/销售方/价税合计行与货物区共享同一总列数，但 VLM 对这些
+    行的宽内容块过分割（信息 5 列、密码/备注内容 3 列、大写金额 8 列）。本函数
+    每轮对每个 colspan≥2 且非行级标签的单元格各减 1 列，直至总和 ≤ target_cols，
+    使冗余列被各宽内容块均匀吸收；行级标签列（如「价税合计(大写)」colspan=2）
+    保持不变。
+
+    Args:
+        cells: 一行中的单元格列表。
+        target_cols: 目标列数。
+    """
+    while True:
+        total = sum(int(c.get("colspan", 1)) for c in cells)
+        if total <= target_cols:
+            return
+        shrinkable = [
+            c for c in cells
+            if int(c.get("colspan", 1)) >= 2
+            and not _is_vat_invoice_row_label(c.get_text())
+        ]
+        if not shrinkable:
+            # 无标签外可缩单元格，避免死循环，保持原样
+            return
+        # 若全部各减 1 会低于 target，则只对前 (total-target) 个宽单元格减 1
+        to_shrink = shrinkable
+        if total - len(shrinkable) < target_cols:
+            to_shrink = shrinkable[: total - target_cols]
+        for c in to_shrink:
+            c["colspan"] = str(int(c.get("colspan", 1)) - 1)
+
+
+def _normalize_vat_invoice_columns(soup: BeautifulSoup, table: Tag) -> None:
+    """将 VLM 过分割为 10 列的增值税发票货物区收拢为 8 列。
+
+    必然正确条件：表格为发票样式，且存在一个 TH 表头行，其首列文本 ∈
+    {货物或应税劳务、服务名称, 项目名称} 且 colspan == 2，「单价」列
+    colspan == 2，且该行完整包含 8 列关键词签名（名称|规格型号|单位|数量|
+    单价|金额|税率|税额）。此时 VLM 把「名称」「单价」两个单列宽列误判为
+    colspan=2，产出 10 列，本函数收拢为 8 列。
+
+    变换：
+    1. 货物区行（名称列与单价列位置均有 colspan≥2 的单元格）：
+       把名称列、单价列 colspan 2→1。
+    2. 其余行（购买方/销售方/价税合计）：把 colspan 总和收拢到目标列数，
+       均匀缩减宽内容块。
+
+    匹配失败（非 8 列签名或名称/单价 colspan 非 2）时保持原样。
+
+    Args:
+        soup: BeautifulSoup 对象。
+        table: <table> Tag。
+    """
+    rows = table.find_all("tr")
+    if len(rows) < 2:
+        return
+
+    # 1. 定位货物区表头行（TH 行），校验 8 列签名 + 名称/单价过分割
+    header_row = None
+    unit_price_idx = -1
+    name_start_col = 0
+    unit_price_start_col = 0
+    header_total_cols = 0
+    for row in rows:
+        th_cells = row.find_all("th")
+        if not th_cells:
+            continue
+        texts = [c.get_text().strip() for c in th_cells]
+        # 名称列必须为首列，且 colspan == 2
+        if not texts or texts[0] not in _VAT_INVOICE_NAME_LABELS:
+            continue
+        if int(th_cells[0].get("colspan", 1)) != 2:
+            continue
+        # 单价列 colspan == 2
+        unit_price_idx = next(
+            (i for i, t in enumerate(texts) if t == "单价"), -1
+        )
+        if unit_price_idx < 0 or int(th_cells[unit_price_idx].get("colspan", 1)) != 2:
+            continue
+        # 完整 8 列签名（除名称外其余 7 列必须齐全）
+        if not set(_VAT_INVOICE_COLUMN_SIGNATURE).issubset(set(texts)):
+            continue
+        header_row = row
+        # 计算名称/单价列起始列号与表头总列数
+        col = 0
+        for i, th in enumerate(th_cells):
+            if i == 0:
+                name_start_col = col
+            if i == unit_price_idx:
+                unit_price_start_col = col
+            col += int(th.get("colspan", 1))
+        header_total_cols = col
+        break
+
+    if header_row is None:
+        return
+
+    # 收拢后目标列数 = 表头总列数 -（名称多余列 + 单价多余列）
+    name_cell = header_row.find_all("th")[0]
+    unit_price_cell = header_row.find_all("th")[unit_price_idx]
+    collapse_amount = (int(name_cell.get("colspan", 1)) - 1) + (
+        int(unit_price_cell.get("colspan", 1)) - 1
+    )
+    target_cols = header_total_cols - collapse_amount
+
+    modified = False
+    for row in rows:
+        cells = row.find_all(["td", "th"])
+        if not cells:
+            continue
+        # 计算每个单元格的起始列号与 colspan
+        spans = []
+        col = 0
+        for c in cells:
+            cs = int(c.get("colspan", 1))
+            spans.append((c, col, cs))
+            col += cs
+        # 判断是否为货物区行：名称列与单价列位置均有 colspan≥2 的单元格
+        name_cell_hit = None
+        unit_price_cell_hit = None
+        for c, s, cs in spans:
+            if name_cell_hit is None and s == name_start_col and cs >= 2:
+                name_cell_hit = c
+            if unit_price_cell_hit is None and s == unit_price_start_col and cs >= 2:
+                unit_price_cell_hit = c
+        if name_cell_hit is not None and unit_price_cell_hit is not None:
+            # 货物区行：名称/单价 colspan 收拢为 1
+            if int(name_cell_hit.get("colspan", 1)) != 1:
+                name_cell_hit["colspan"] = "1"
+                modified = True
+            if int(unit_price_cell_hit.get("colspan", 1)) != 1:
+                unit_price_cell_hit["colspan"] = "1"
+                modified = True
+        elif col > target_cols:
+            # 非货物区行：收拢到目标列数
+            _shrink_row_to_cols(cells, target_cols)
+            modified = True
+
+    if modified:
+        logger.info(
+            f"增值税发票 8 列归一化：表头 {header_total_cols} 列收拢为 "
+            f"{target_cols} 列（名称/单价 colspan 2→1）"
+        )
 
 
 def normalize_invoice_table(html: str) -> str:
@@ -1966,6 +2237,9 @@ def normalize_invoice_table(html: str) -> str:
                 continue
 
             logger.debug("检测到发票表格，执行发票专用规范化")
+            # 8 列签名归一化（名称/单价 colspan 2→1）必须先于合计行格式化，
+            # 否则收拢改变了列索引后，合计行 ¥ 对齐依赖的列位置会错位。
+            _normalize_vat_invoice_columns(soup, table)
             # 合计行格式化
             _format_summary_row_colspan(soup, table)
             # 缺失值推断
@@ -1975,6 +2249,360 @@ def normalize_invoice_table(html: str) -> str:
             logger.exception(
                 "处理发票表格规范化时出错，跳过此表格"
             )
+            continue
+
+    return str(soup)
+
+
+def fix_summary_row_yen_position(html: str) -> str:
+    """修正所有发票表格中合计行的 ¥/￥ 值列位置。
+
+    VLM 输出或 normalize_invoice_table 处理后，合计行中的 ¥/￥ 值
+    可能被放在错误的展开列位置。此函数用 TH 行的 colspan 结构
+    重建合计行，将 ¥ 值按顺序对齐到“金额”和“税额”列。
+
+    此函数应在 normalize_invoice_table 之后调用，
+    因为 normalize_invoice_table 会调整 colspan 结构。
+
+    Args:
+        html: 表格 HTML 字符串。
+
+    Returns:
+        处理后的 HTML 字符串。
+    """
+    if not html or not isinstance(html, str):
+        return html
+    if "<table" not in html.lower():
+        return html
+
+    from bs4 import BeautifulSoup
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        logger.warning("BeautifulSoup 解析表格 HTML 失败，跳过 ¥ 位置修正")
+        return html
+
+    for table in soup.find_all("table"):
+        try:
+            _fix_summary_row_yen_for_th_table(table, soup)
+        except Exception:
+            logger.exception("fix_summary_row_yen_position 处理单个表格时出错，跳过")
+            continue
+
+    return str(soup)
+
+
+def _fix_summary_row_yen_for_th_table(
+    table: Tag,
+    soup: BeautifulSoup,
+) -> None:
+    """修正已有 <th> 行的发票表格中合计行的 ¥ 值列位置。
+
+    VLM 直接输出的发票表格可能已有完整的 <th> 表头行，
+    但合计行中的 ¥ 值可能被放在错误的展开列位置
+    （如 colspan=5 的"合计"后 ¥ 值堆在隨后的物理列，而非"金额"列）。
+
+    此函數用 TH 行的 colspan 结构重建合计行，
+    将 ¥ 值按顺序对齐到"金额"和"税额"列。
+
+    Args:
+        table: BeautifulSoup 的 <table> 标签。
+        soup: BeautifulSoup 对象。
+    """
+    rows = table.find_all("tr")
+
+    # 1. 找到 TH 行并构建展开列标签
+    header_tr = None
+    for row in rows:
+        if row.find("th"):
+            header_tr = row
+            break
+    if header_tr is None:
+        return
+
+    th_cells = header_tr.find_all("th")
+    if len(th_cells) < 3:
+        return
+
+    # 构建展开后的列标签列表
+    expanded_headers: list[str] = []
+    for th in th_cells:
+        colspan = int(th.get("colspan", 1))
+        label = th.get_text().strip()
+        for _ in range(colspan):
+            expanded_headers.append(label)
+
+    # 找到"金额"和"税额"列的展开索引
+    amount_cols = [i for i, h in enumerate(expanded_headers) if h == "金额"]
+    tax_cols = [i for i, h in enumerate(expanded_headers) if h == "税额"]
+
+    if not amount_cols and not tax_cols:
+        # 非发票表格（无金额/税额列），跳过
+        return
+
+    # 2. 找到合计行
+    summary_row = None
+    for row in rows:
+        cells = row.find_all("td")
+        if not cells:
+            continue
+        first_text = cells[0].get_text().strip()
+        if first_text in ("合计", "合"):
+            summary_row = row
+            break
+    if summary_row is None:
+        return
+
+    # 3. 提取合计行中的 ¥/￥ 值（保持原始顺序）
+    yen_values: list[str] = []
+    for td in summary_row.find_all("td"):
+        text = td.get_text().strip()
+        for m in re.finditer(r'[¥￥][\d.,]+', text):
+            yen_values.append(m.group())
+
+    if not yen_values:
+        return
+
+    # 4. 用 TH 行的 colspan 结构重建合计行
+    summary_row.clear()
+    for th in th_cells:
+        new_td = soup.new_tag("td")
+        colspan = th.get("colspan")
+        if colspan:
+            new_td["colspan"] = colspan
+        summary_row.append(new_td)
+
+    rebuilt_cells = summary_row.find_all("td")
+    # 全部清空
+    for td in rebuilt_cells:
+        td.string = ""
+
+    # 第一列放"合计"
+    if rebuilt_cells:
+        rebuilt_cells[0].string = "合计"
+
+    # 5. 将 ¥ 值放置到正确列
+    # ¥ 值按顺序：[金额¥, 税额¥] 或 [金额¥] 或 [金额¥, 税额¥, 金额¥2, ...]
+    # 先建立目标列列表（交替：先金额后税额）
+    target_pairs = []
+    max_len = max(len(amount_cols), len(tax_cols))
+    for i in range(max_len):
+        if i < len(amount_cols):
+            target_pairs.append(amount_cols[i])
+        if i < len(tax_cols):
+            target_pairs.append(tax_cols[i])
+
+    for yi, yen_val in enumerate(yen_values):
+        if yi >= len(target_pairs):
+            logger.warning(
+                f"合计行 ¥ 值数量({len(yen_values)})超过目标列数({len(target_pairs)})，"
+                f"第 {yi+1} 个 ¥ 值 {yen_val} 无法放置"
+            )
+            break
+        target_expanded = target_pairs[yi]
+
+        # 展开列索引 → 物理列索引
+        phys_idx = 0
+        expanded_so_far = 0
+        for ci, td in enumerate(rebuilt_cells):
+            cs = int(td.get("colspan", 1))
+            if expanded_so_far + cs > target_expanded:
+                phys_idx = ci
+                break
+            expanded_so_far += cs
+
+        if phys_idx < len(rebuilt_cells):
+            rebuilt_cells[phys_idx].string = yen_val
+
+    logger.info(
+        f"合计行¥位置修复(已有TH): ¥值={yen_values}, "
+        f"金额列展开={amount_cols}, 税额列展开={tax_cols}, "
+        f"目标={target_pairs[:len(yen_values)]}"
+    )
+
+
+def extract_column_header_prefixes(html: str) -> str:
+    """提取发票表格数据单元格中内嵌的列标题前缀到 <th> 表头行。
+
+    处理 VLM 输出中列标题与数据值无空格拼接的场景：
+    - "单位吨" → 提取 "单位" 到 <th>，数据行保留 "吨"
+    - "数量5203" → 提取 "数量" 到 <th>，数据行保留 "5203"
+    - "金额4942.85¥4942.85" → 提取 "金额" 到 <th>，数据行保留 "4942.85¥4942.85"
+
+    与 strip_column_header_prefixes（删除前缀）不同，此函数保留全部识别内容。
+
+    已有 <th> 行的表格（如 VLM 直接输出的发票表），跳过前缀提取，
+    但会修复合计行中 ¥ 值的列位置（VLM 可能将 ¥ 值放在错误的展开列）。
+
+    [自定义] 此函数由 _format_embedded_html 管道调用。
+    上游合并时此模块仅需保留，无需修改。
+
+    Args:
+        html: 表格 HTML 字符串。
+
+    Returns:
+        处理后的 HTML 字符串。
+    """
+    if not html or not isinstance(html, str):
+        return html
+    if "<table" not in html.lower():
+        return html
+
+    from bs4 import BeautifulSoup
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        logger.warning("BeautifulSoup 解析表格 HTML 失败，跳过列标题提取")
+        return html
+
+    for table in soup.find_all("table"):
+        try:
+            # 已有 <th> 的表：跳过后面的前缀提取，但需修复合计行 ¥ 值列位置
+            if table.find("th"):
+                _fix_summary_row_yen_for_th_table(table, soup)
+                continue
+
+            rows = table.find_all("tr")
+            if len(rows) < 2:
+                continue
+
+            # 用 _INVOICE_DATA_COLUMN_KEYWORDS 检测拼接行
+            # 跳过首行（购买方/销售方信息行），从第2行开始找
+            data_row = None
+            for row in rows:
+                cells = row.find_all("td")
+                if len(cells) < 3:
+                    continue
+                # 检测是否有 ≥2 个单元格以列关键词开头且有后缀数据
+                concat_cells = 0
+                for td in cells:
+                    text = td.get_text().strip()
+                    if not text:
+                        continue
+                    m = _match_data_column_keyword(text)
+                    if m and m[1]:
+                        concat_cells += 1
+                if concat_cells >= 2:
+                    data_row = row
+                    break
+
+            if data_row is None:
+                continue
+
+            # 提取标题前缀构建 TH 行，剥离数据行前缀
+            cells = data_row.find_all("td")
+            header_labels: list[str] = []
+            for td in cells:
+                text = td.get_text().strip()
+                colspan = int(td.get("colspan", 1))
+                label = ""
+                data = text
+                m = _match_data_column_keyword(text)
+                if m:
+                    label, data = m
+                # 按 colspan 展开：每个物理列一个 header_label（用于对齐）
+                for _ in range(colspan):
+                    header_labels.append(label if _ == 0 else "")
+                if colspan > 1 and label:
+                    label = ""  # 清空避免后续重复使用
+                td.string = data
+
+            # 插入 TH 行（仅当有 ≥2 个有效标签时）
+            valid_labels = [l for l in header_labels if l]
+            if len(valid_labels) >= 2:
+                header_tr = soup.new_tag("tr")
+                for label in header_labels:
+                    th = soup.new_tag("th")
+                    th.string = label
+                    header_tr.append(th)
+                data_row.insert_before(header_tr)
+                logger.debug(
+                    f"提取列标题前缀到 TH 行：{len(valid_labels)} 个标签，"
+                    f"标签={valid_labels[:4]}..."
+                )
+
+                # 清理其余所有行中残留的列标题前缀
+                # （如 split_summary_from_data_cell 创建的合计行复制了原始拼接文本）
+                for row in table.find_all("tr"):
+                    for td in row.find_all("td"):
+                        text = td.get_text().strip()
+                        if not text:
+                            continue
+                        m = _match_data_column_keyword(text)
+                        if m and m[1] and _is_data_value(m[1]):
+                            td.string = m[1]
+
+                # 从数据行单元格中提取 ¥/￥ 金额值并移至合计行
+                # 避免 ¥ 值在数据行和合计行重复出现
+                yen_map: dict[int, str] = {}  # {expanded_col_index: yen_value}
+                all_rows = table.find_all("tr")
+                for row in all_rows:
+                    if row.find("th"):
+                        continue  # 跳过 TH 行
+                    # 跳过价税合计/大写行和合计行本身
+                    row_texts = [c.get_text() for c in row.find_all("td")]
+                    if any("价税合计" in t or "大写" in t for t in row_texts):
+                        continue
+                    if row_texts and row_texts[0] == "合计":
+                        continue  # 跳过合计行自身，避免从其中重复提取 ¥
+                    cells = row.find_all("td")
+                    expanded_idx = 0  # 按 colspan 展开后的列索引
+                    for ci, td in enumerate(cells):
+                        text = td.get_text().strip()
+                        colspan = int(td.get("colspan", 1))
+                        yen_match = re.search(r'[¥￥][\d.,]+', text) if text else None
+                        if yen_match:
+                            yen_val = yen_match.group()
+                            # 从单元格中移除 ¥ 值
+                            cleaned = (text[:yen_match.start()] + text[yen_match.end():]).strip()
+                            td.string = cleaned if cleaned else ""
+                            # 记录 ¥ 值及其展开后的列索引
+                            yen_map[expanded_idx] = yen_val
+                        expanded_idx += colspan
+
+                if yen_map:
+                    # 查找或创建合计行
+                    summary_row = None
+                    for row in all_rows:
+                        cells_text = [c.get_text().strip() for c in row.find_all("td")]
+                        if cells_text and cells_text[0] == "合计":
+                            summary_row = row
+                            break
+
+                    if summary_row is None:
+                        summary_row = soup.new_tag("tr")
+                        # 插入到数据行之后（TH 行是倒数第二个之前）
+                        data_rows = [r for r in all_rows if not r.find("th")]
+                        if len(data_rows) >= 2:
+                            data_rows[0].insert_after(summary_row)
+                        elif data_rows:
+                            data_rows[0].insert_after(summary_row)
+
+                    # 用 TH 行的结构重建合计行（确保 colspan 对齐）
+                    summary_row.clear()
+                    ref_cells = header_tr.find_all("th")
+                    for th in ref_cells:
+                        new_td = soup.new_tag("td")
+                        colspan = th.get("colspan")
+                        if colspan:
+                            new_td["colspan"] = colspan
+                        summary_row.append(new_td)
+
+                    # 在合计行第一列放"合计"标签，按展开列索引放 ¥ 值
+                    summary_cells = summary_row.find_all("td")
+                    # 先全部清空
+                    for sc in summary_cells:
+                        sc.string = ""
+                    if summary_cells:
+                        summary_cells[0].string = "合计"
+                    for expanded_ci, yen_val in yen_map.items():
+                        if expanded_ci < len(summary_cells):
+                            summary_cells[expanded_ci].string = yen_val
+
+        except Exception:
+            logger.exception("extract_column_header_prefixes 处理单个表格时出错，跳过")
             continue
 
     return str(soup)
@@ -2037,6 +2665,59 @@ def _is_invoice_table(table: Tag) -> bool:
             match_count += 1
 
     return match_count >= 3
+
+
+_SPARSE_EMPTY_RATIO_THRESHOLD = 0.3
+
+
+def _is_structurally_sparse_table(table: Tag) -> bool:
+    """判断表格是否为结构性稀疏表（如财务报表、征信报告）。
+
+    这类表格的空单元格是合法留白（矩阵稀疏），非 VLM 遗漏。
+    且表头不含"金额/税额/数量/单价"等关键词，列类型全部归为 "text"，
+    _fill_empty_cells_from_ocr_grid 的类型匹配退化为"任意文本填任意空列"，
+    会灌入表头文字/行标签，产生重复内容。因此跳过 OCR 补充。
+
+    Args:
+        table: BeautifulSoup <table> Tag。
+
+    Returns:
+        True 表示空单元格占比过高，判定为结构性稀疏。
+    """
+    tds = table.find_all("td")
+    if not tds:
+        return False
+    empty_count = sum(1 for c in tds if not c.get_text().strip())
+    return (empty_count / len(tds)) > _SPARSE_EMPTY_RATIO_THRESHOLD
+
+
+# 财务报表表头标记：中国标准化财务报表含「行次」（会企03表现金流量表）或
+# 「附注编号」（会企01/02表资产负债表/利润表，附注编号列标注科目对应附注）。
+_FINANCIAL_STATEMENT_MARKERS = {"行次", "附注编号"}
+
+
+def _is_financial_statement_table(table: Tag) -> bool:
+    """判断表格是否为财务报表样式（表头含「行次」或「附注编号」列）。
+
+    中国标准化财务报表含「行次」列（会企03表现金流量表）或「附注编号」列
+    （会企01/02表资产负债表/利润表），用于标注科目/项目的行号或对应附注编号。
+    这类表格的空单元格是合法留白（未发生业务的行次/金额为空或「-」），非 VLM
+    遗漏；VLM 对结构化报表的识别已足够准确。若对其做 OCR 补充，会因 OCR 行对齐
+    错位把截断标签/合并数字/单字噪声灌进空列（原则 4：信任上游正确输出，
+    不过度后处理）。
+
+    Args:
+        table: BeautifulSoup <table> Tag。
+
+    Returns:
+        是否为财务报表样式表格。
+    """
+    # 仅看前 3 行（表头区域），去除空白后匹配「行次」或「附注编号」标记
+    for tr in table.find_all("tr")[:3]:
+        for cell in tr.find_all(["td", "th"]):
+            if "".join(cell.get_text().split()) in _FINANCIAL_STATEMENT_MARKERS:
+                return True
+    return False
 
 
 def _has_colspan_mismatch(html: str) -> bool:
@@ -2183,7 +2864,8 @@ def _build_ocr_text_grid(
 
             cx = sum(xs) / len(xs)
             cy = sum(ys) / len(ys)
-            items.append((cx, cy, text.strip()))
+            box_height = max(ys) - min(ys)
+            items.append((cx, cy, box_height, text.strip()))
         except (IndexError, TypeError, ValueError):
             continue
 
@@ -2194,14 +2876,18 @@ def _build_ocr_text_grid(
     items.sort(key=lambda it: it[1])
 
     # 按 y 坐标相似度聚类分行
-    # 同一行的文字具有接近的 y 坐标（差异 < 10 像素）
-    # 不同行的文字有显著不同的 y 坐标
-    Y_TOLERANCE = 10.0
+    # 同一行的文字具有接近的 y 坐标，不同行的文字有显著不同的 y 坐标。
+    # 使用自适应阈值：以 OCR 文本框高度的中位数估算行高，同一行文字
+    # 中心点 y 差异通常不超过行高的一半。固定 10px 对图像缩放不敏感
+    # （大图会过度拆分、小图会过度合并），自适应阈值更稳健。
+    heights = [it[2] for it in items]
+    median_height = sorted(heights)[len(heights) // 2]
+    y_tolerance = max(4.0, min(median_height * 0.6, 30.0))
     rows = []
     current_row = [items[0]]
     for item in items[1:]:
         current_avg_y = sum(it[1] for it in current_row) / len(current_row)
-        if abs(item[1] - current_avg_y) <= Y_TOLERANCE:
+        if abs(item[1] - current_avg_y) <= y_tolerance:
             current_row.append(item)
         else:
             rows.append(current_row)
@@ -2212,7 +2898,7 @@ def _build_ocr_text_grid(
     grid = []
     for row in rows:
         row.sort(key=lambda it: it[0])
-        grid.append([it[2] for it in row])
+        grid.append([it[3] for it in row])
 
     return grid
 
@@ -2264,10 +2950,12 @@ def _parse_vlm_table_structure(rows: list[Tag]) -> tuple[list[list[str]], list[l
 def _detect_data_row_start(rows: list[Tag], vlm_data: list[list[str]]) -> int:
     """检测数据行起始位置。
 
-    规则：
+    表头是表格开头的连续块。规则：
     1. 含 <th> 的行视为表头。
     2. 含 <img> 的行视为数据行（含手写/签章图片），不参与表头扩展。
-    3. 全短标签行（<15 字且非数据值）视为类表头。
+    3. 含数值的行视为数据行，终止表头扩展——表头不含裸数值
+       （"2022年度"因含"年度"二字，_is_data_value 判为 False）。
+    4. 全短标签行（<15 字且非数据值）仅在表头块内视为类表头。
 
     Args:
         rows: <tr> 标签列表。
@@ -2286,6 +2974,12 @@ def _detect_data_row_start(rows: list[Tag], vlm_data: list[list[str]]) -> int:
         else:
             cells = row.find_all("td")
             texts = [c.get_text().strip() for c in cells]
+            # 含数值 → 已进入数据区，终止表头判定。
+            # 防止"数值列本为空的标签数据行"（如所有者权益变动表中间的
+            # "加:会计政策变更""1.提取盈余公积"等）被误判为表头，
+            # 导致 data_row_start 一路推进到表格末尾行。
+            if any(_is_data_value(t) for t in texts if t):
+                break
             if texts and all(
                 len(t) < 15 and not _is_data_value(t)
                 for t in texts if t
@@ -2315,6 +3009,7 @@ def _normalize_for_matching(text: str) -> str:
         "２": "2", "３": "3", "４": "4", "５": "5",
         "６": "6", "７": "7", "８": "8", "９": "9",
         " ": " ", "　": " ",
+        "￥": "¥",   # OCR 全角人民币符号 → VLM 半角
     }
     result = text
     for full, half in full_to_half.items():
@@ -2449,6 +3144,1203 @@ def _get_fillable_columns(
     return fillable
 
 
+def _count_ocr_data_rows(ocr_grid: list[list[str]]) -> int:
+    """统计 OCR 网格中包含数据值的行数。
+
+    数据值判定：至少含一个 _is_data_value 返回 True 的单元格。
+
+    Args:
+        ocr_grid: OCR 识别文字网格。
+
+    Returns:
+        数据行数量。
+    """
+    return sum(
+        1 for row in ocr_grid
+        if any(_is_data_value(cell) for cell in row)
+    )
+
+
+# 发票明细列关键词（仅数据行，不含购买方/销售方等摘要标签）
+_INVOICE_DATA_COLUMN_KEYWORDS = {
+    "项目名称", "货物或应税劳务、服务名称", "规格型号", "单位",
+    "数量", "单价", "金额", "税率", "税额", "税率/征收率",
+}
+
+
+def _match_data_column_keyword(text: str) -> tuple[str, str] | None:
+    """识别文本开头的发票数据列关键词，容忍关键词内部空格。
+
+    VLM 对纵向排版的表头（如"数量""单价"上下两字）会输出为"数 量"、
+    "单 价"（关键词内部含空格）。先按原文本直接前缀匹配（保留数据值内
+    空格），失败时再用去除全部空白后的紧凑文本匹配。
+
+    Args:
+        text: 单元格文本（已 strip）。
+
+    Returns:
+        (keyword, data) 元组；未匹配返回 None。data 为去除关键词前缀后的
+        剩余文本（空字符串表示纯关键词单元格）。
+    """
+    compact = "".join(text.split())
+    for kw in sorted(_INVOICE_DATA_COLUMN_KEYWORDS, key=len, reverse=True):
+        # 纯关键词单元格（如独立的"规格型号"）
+        if text == kw:
+            return kw, ""
+        # 直接前缀匹配（如"单位吨"→"单位"+"吨"）
+        if text.startswith(kw) and len(text) > len(kw):
+            rest = text[len(kw):].strip()
+            if rest:
+                return kw, rest
+        # 关键词内部含空格（如"数 量5203"→"数量"+"5203"）
+        if compact != text and compact.startswith(kw) and len(compact) > len(kw):
+            rest = compact[len(kw):].strip()
+            if rest:
+                return kw, rest
+    return None
+
+
+# 发票数值列关键词：用于判断 VLM 拼接列是否为数值列。
+# 与 _is_data_value（仅识别纯数字/¥/% token）不同，此集合从"列语义"出发，
+# 能正确识别 "金额4071.26¥37744.85"、"税率3%3%"、"税 额122.14¥1132.35"
+# 这类"列关键词 + 拼接数值"单元格为数值列。
+_NUMERIC_COLUMN_KEYWORDS = {"数量", "单价", "金额", "税率", "税额"}
+
+
+def _is_numeric_column(text: str) -> bool:
+    """判断单元格文本是否为发票数值列（数量/单价/金额/税率/税额）。
+
+    基于列关键词前缀判断，而非 _is_data_value 的数值 token 判断。
+    _is_data_value 无法识别拼接单元格（如 "金额4071.26¥37744.85" 因含 ¥
+    返回 False、"税率3%3%" 因含 % 返回 False、"税 额122.14..." 因含空格
+    返回 False），导致这些列被误判为非数值列，类型匹配失效。
+
+    Args:
+        text: 单元格文本（已 strip）。
+
+    Returns:
+        True 表示该列为数值列。
+    """
+    m = _match_data_column_keyword(text.strip())
+    return m is not None and m[0] in _NUMERIC_COLUMN_KEYWORDS
+
+
+def _try_split_concatenated_numbers(text: str, num_parts: int = 2) -> list[str]:
+    """尝试拆分 OCR 中因间距过近而合并的连续数值。
+
+    VLM/OCR 将相邻列的两个数值合并为一个字符串（如 "5203.001.40776667307"
+    实际是数量 "5203.00" + 单价 "1.40776667307"）。
+
+    策略：利用小数位数启发式——第一个数值通常有 0-2 位小数
+    （数量/金额），第二个数值可以有多位小数（单价/税率）。
+
+    Args:
+        text: 合并的数值字符串。
+        num_parts: 期望拆分的份数。
+
+    Returns:
+        拆分后的数值列表；若无法拆分则返回 [text]。
+    """
+    if not text or num_parts < 2:
+        return [text] if text else []
+
+    # 尝试不同小数位数：2位 → 1位 → 0位
+    for frac_digits in (2, 1, 0):
+        pat = re.compile(
+            rf'(\d+(?:\.\d{{{frac_digits}}})?)(\d+\.\d+.*)'
+            if frac_digits > 0
+            else r'(\d+)(\d+\.\d+.*)'
+        )
+        m = pat.match(text.strip())
+        if m:
+            first = m.group(1)
+            rest = m.group(2)
+            # 验证：第一部分和第二部分都应像数值
+            if _is_data_value(first) and _is_data_value(rest):
+                parts = [first]
+                for i in range(num_parts - 2):
+                    sub = _try_split_concatenated_numbers(rest, num_parts - 1)
+                    if len(sub) > 1:
+                        parts.extend(sub[:-1])
+                        rest = sub[-1]
+                        break
+                parts.append(rest)
+                return parts
+
+    return [text]
+
+
+def _split_decimal_values(data: str, n_data: int) -> list[str]:
+    """按等精度拆分多小数位拼接数值（如单价）。
+
+    单价等列的小数位数固定（如 11 位），拼接如
+    "1.407766251722.11650471401" 实际是两个等精度数值。以最后一个小数
+    点后的位数作为统一小数位数，按此切分各数值的整数/小数边界。
+
+    Args:
+        data: 拼接的十进制数值文本。
+        n_data: 期望的数值个数。
+
+    Returns:
+        拆分后的数值列表；无法可靠拆分返回空列表。
+    """
+    if not data or n_data < 2:
+        return []
+    # [自定义] 剔除值间空白（如 "1.78640768223\n1.11650431565" 中的 \n）。
+    # 本函数只接受 \d+\.\d+ 纯数值，空白无语义，剔除后按等精度切分不受影响。
+    data = re.sub(r"\s+", "", data)
+    dots = [i for i, ch in enumerate(data) if ch == "."]
+    if len(dots) != n_data:
+        return []
+    frac_len = len(data) - dots[-1] - 1
+    if frac_len < 1:
+        return []
+    vals: list[str] = []
+    start = 0
+    for i, dot in enumerate(dots):
+        end = dot + 1 + frac_len if i < n_data - 1 else len(data)
+        # 非末值：切分边界必须落在下一个小数点之前（整数部分为空/越界即不合理）
+        if i < n_data - 1 and end >= dots[i + 1]:
+            return []
+        val = data[start:end]
+        if not re.fullmatch(r"\d+\.\d+", val):
+            return []
+        vals.append(val)
+        start = end
+    return vals
+
+
+def _split_integer_quantity(
+    digits: str,
+    unit_prices: list[str],
+    amounts: list[str],
+) -> list[str]:
+    """用「金额 = 数量 × 单价」反推整数数量列的拆分。
+
+    VLM 将整数数量（无小数点，如 "3332"+"19197"→"333219197"）拼接为单个
+    纯数字串，无法按小数位数切分。单价（等精度）与金额（2 位小数）两列可
+    独立可靠拆分，故用每行 ``round(金额/单价)`` 反推数量，并双重校验：
+    （1）反推值 × 单价 ≈ 金额（容差 0.01 元或金额的 0.1%）；
+    （2）反推数量拼接后还原原始整数串。任一校验失败返回空列表，调用方
+    回退 OCR 重建（原则 4：双重约束保证必然正确，绝不硬猜）。
+
+    Args:
+        digits: 整数数量拼接串（仅数字，如 "333219197"）。
+        unit_prices: 已拆分的单价列表（长度 n_data）。
+        amounts: 已拆分的金额列表（长度 n_data）。
+
+    Returns:
+        反推出的数量字符串列表；无法可靠反推返回空列表。
+    """
+    if len(digits) < 2 or len(unit_prices) < 2 or len(amounts) != len(unit_prices):
+        return []
+    quantities: list[str] = []
+    for up, amt in zip(unit_prices, amounts):
+        try:
+            price = float(up)
+            amount = float(amt)
+            if price == 0:
+                return []
+            q = round(amount / price)
+        except (ValueError, OverflowError):
+            return []
+        tol = max(0.01, 0.001 * abs(amount))
+        if abs(q * price - amount) > tol:
+            return []
+        quantities.append(str(q))
+    if "".join(quantities) != digits:
+        return []
+    return quantities
+
+
+def _split_name_cell(data: str, n_data: int) -> tuple[list[str], str]:
+    """拆分货物名称拼接单元格为 n_data 个服务名称 + 合计标签。
+
+    VAT 发票货物名称形如 "*品类*序号-名称"（品类如"水冰雪""劳务"），
+    多行明细会拼接为 "*水冰雪*1-居民生活*水冰雪*5-生产合 计"。以
+    "*品类*" 段落为单位拆分服务名称，末尾的"合计/小计"识别为合计标签。
+
+    Args:
+        data: 拼接的名称文本。
+        n_data: 期望的数据行数。
+
+    Returns:
+        (names, summary) 元组；names 长度不等于 n_data 时返回 ([], "")。
+    """
+    summary = ""
+    m = re.search(r"(合\s*计|小\s*计)\s*$", data)
+    if m:
+        summary = "合计"
+        data = data[: m.start()].strip()
+    names = re.findall(r"\*[^*]+\*[^*]+", data)
+    if len(names) != n_data:
+        return [], ""
+    return names, summary
+
+
+def _has_concatenated_data_cells(vlm_data: list[list[str]]) -> bool:
+    """检测 VLM 表格行中是否存在值拼接的单元格。
+
+    对每一行，检查是否有 ≥2 个单元格满足任一条件：
+    1. 以发票明细列关键词开头 + 含 ≥2 个显著数值（位数≥2）
+    2. 以发票明细列关键词开头 + 数字总位数 ≥8
+       （如 "1810518105"→10位，正常单值"18105"→5位，拼接信号）
+
+    不使用"合计"关键词检测——"合计"嵌入在货物名称末尾是正常场景，
+    应由 split_summary_from_data_cell 处理，而非触发 OCR 行重建。
+
+    Args:
+        vlm_data: 展开后的 VLM 文本网格。
+
+    Returns:
+        True 表示至少有一行存在拼接。
+    """
+    import re
+
+    for row_texts in vlm_data:
+        concat_cells = 0
+        for text in row_texts:
+            if not text or not text.strip():
+                continue
+            norm_t = _normalize_for_matching(text).replace(" ", "")
+            starts_with_keyword = any(
+                norm_t.startswith(_normalize_for_matching(kw).replace(" ", ""))
+                for kw in _INVOICE_DATA_COLUMN_KEYWORDS
+            )
+            if not starts_with_keyword:
+                continue
+            # 条件1：含 ≥2 个显著数值（位数≥2）
+            nums = [n for n in re.findall(r'\d+\.?\d*', text) if len(n) >= 2]
+            if len(nums) >= 2:
+                concat_cells += 1
+                continue
+            # 条件2：单元格中数值总位数 ≥8
+            # （如 "1810518105"=10位，正常单值"18105"=5位，"5203.0030088.00"=15位）
+            all_digits = re.sub(r'[^\d]', '', text)
+            if len(all_digits) >= 8:
+                concat_cells += 1
+        if concat_cells >= 2:
+            return True
+    return False
+
+
+def _find_ocr_header_row(ocr_grid: list[list[str]]) -> int:
+    """在 OCR 网格中定位表头行。
+
+    返回第一个匹配 ≥2 个发票特征关键词的行的索引。
+    若未找到，返回 0（视第一行为表头）。
+
+    Args:
+        ocr_grid: OCR 识别文字网格。
+
+    Returns:
+        表头行索引。
+    """
+    for i, row in enumerate(ocr_grid):
+        matches = sum(
+            1 for cell in row
+            if cell.strip() in _INVOICE_HEADER_KEYWORDS
+        )
+        if matches >= 2:
+            return i
+
+    # 回退：若全文含"价税合计"，取它之前的行
+    for i, row in enumerate(ocr_grid):
+        all_text = " ".join(row)
+        if "价税合计" in all_text:
+            return max(0, i - 2)
+    return 0
+
+
+def _merge_split_header_chars(ocr_header: list[str]) -> list[str]:
+    """合并 OCR 表头中被拆分的单个中文字符。
+
+    PaddleOCR 在小图片上可能将多字符标签（如"金额"、"税额"、"单价"）
+    检测为独立的单个字符。此函数尝试合并相邻的单个中文字符，
+    仅当合并结果在 _INVOICE_HEADER_KEYWORDS 中时才会合并。
+
+    Args:
+        ocr_header: OCR 表头行的单元格文本列表。
+
+    Returns:
+        合并后的表头列表，长度可能小于输入。
+    """
+    if not ocr_header:
+        return ocr_header
+
+    def _is_single_cjk(c: str) -> bool:
+        """判断是否为单个 CJK（中日韩统一表意文字）字符。"""
+        return (
+            len(c) == 1
+            and ('一' <= c <= '鿿' or '㐀' <= c <= '䶿')
+        )
+
+    result: list[str] = []
+    skip_next = False
+    for i, cell in enumerate(ocr_header):
+        if skip_next:
+            skip_next = False
+            continue
+
+        stripped = cell.strip() if cell else ""
+
+        # 尝试与下一个单元格合并（仅当两个都是单个中文字符）
+        if _is_single_cjk(stripped) and i + 1 < len(ocr_header):
+            next_cell = ocr_header[i + 1].strip() if ocr_header[i + 1] else ""
+            if _is_single_cjk(next_cell):
+                candidate = stripped + next_cell
+                if candidate in _INVOICE_HEADER_KEYWORDS:
+                    result.append(candidate)
+                    skip_next = True
+                    continue
+
+        result.append(stripped)
+
+    return result
+
+
+def _map_ocr_cols_to_vlm_cols(
+    ocr_header: list[str],
+    vlm_data_row: list[str],
+) -> dict:
+    """将 OCR 表头列映射到 VLM 数据行的对应列。
+
+    通过去空格 + 全角转半角后的文本子串匹配建立映射。
+    仅映射在 _INVOICE_HEADER_KEYWORDS 中的 OCR 表头。
+
+    Args:
+        ocr_header: OCR 表头行的单元格文本列表。
+        vlm_data_row: VLM 拼接数据行的单元格文本列表。
+
+    Returns:
+        {ocr_col_idx: vlm_col_idx} 映射字典。
+    """
+    def _norm(text: str) -> str:
+        """去空格 + 全角转半角规范化。"""
+        return _normalize_for_matching(text).replace(" ", "")
+
+    mapping: dict[int, int] = {}
+    used_vlm: set[int] = set()
+
+    for oc, ocr_hdr in enumerate(ocr_header):
+        if not ocr_hdr or ocr_hdr not in _INVOICE_HEADER_KEYWORDS:
+            continue
+        ocr_norm = _norm(ocr_hdr)
+        if not ocr_norm:
+            continue
+        for vc, vlm_text in enumerate(vlm_data_row):
+            if vc in used_vlm:
+                continue
+            vlm_norm = _norm(vlm_text)
+            if ocr_norm in vlm_norm or vlm_norm in ocr_norm:
+                mapping[oc] = vc
+                used_vlm.add(vc)
+                break
+
+    return mapping
+
+
+def _fix_ocr_summary_row_yen_position(
+    new_rows: list[Tag],
+    template_cells: list[Tag],
+    ocr_header: list[str],
+    ocr_header_labels: list[str],
+    col_map: dict[int, int],
+    soup: BeautifulSoup,
+    ocr_data_rows: list[list[str]] | None = None,
+) -> None:
+    """修复 OCR 重建表格中合计行的 ¥ 值列位置。
+
+    OCR 网格中的合计行（首列为"合计"/"合"）在经过模板列匹配后，
+    ¥ 值可能被分配到错误的列——模板列文本匹配对 ¥ 值不感知列语义，
+    会将 "￥57689.91" 匹配到包含该子串的任意模板列文本中。
+
+    此函数重建合计行的 colspan 结构以匹配模板列布局，
+    然后将 ¥ 值放置到正确的数值列（"金额"列、"税额"列）。
+
+    Args:
+        new_rows: OCR 重建后的所有行（会被原地修改）。
+        template_cells: VLM 拼接行的物理单元格模板。
+        ocr_header: OCR 表头行的单元格文本列表。
+        ocr_header_labels: OCR 表头中在 _INVOICE_HEADER_KEYWORDS 内的标签。
+        col_map: OCR 列索引到 VLM 列索引的映射。
+        soup: BeautifulSoup 对象。
+        ocr_data_rows: OCR 数据行网格（含合计行），用于从 OCR 原始合计行提取 ¥ 值。
+            当 VLM 金额单元格漏掉金额合计时，步骤 4 的文本匹配会丢弃该 ¥ 值，
+            此参数使本函数能回退到完整的 OCR 合计行（按 x 排序，¥ 顺序为
+            [金额¥, 税额¥]）。为 None 或未找到合计行时回退到重建行提取。
+    """
+    # 构建展开后的列标题列表（如 expanded_headers[7] = "金额"）
+    expanded_headers: list[str] = []
+    for vc, orig in enumerate(template_cells):
+        colspan = int(orig.get("colspan", 1))
+        # 确定该物理列对应的标签
+        label = ""
+        vlm_tpl_norm = _normalize_for_matching(
+            orig.get_text().strip()
+        ).replace(" ", "")
+        for oc_hdr in ocr_header_labels:
+            hdr_norm = _normalize_for_matching(oc_hdr).replace(" ", "")
+            if hdr_norm and vlm_tpl_norm and (
+                hdr_norm in vlm_tpl_norm or vlm_tpl_norm in hdr_norm
+            ):
+                label = oc_hdr
+                break
+        if not label:
+            for oc, mapped_vc in col_map.items():
+                if mapped_vc == vc and oc < len(ocr_header):
+                    candidate = ocr_header[oc].strip()
+                    if candidate in _INVOICE_HEADER_KEYWORDS:
+                        label = candidate
+                        break
+        for _ in range(colspan):
+            expanded_headers.append(label)
+
+    # 找到"金额"和"税额"列的展开索引
+    amount_expanded_cols = [
+        i for i, h in enumerate(expanded_headers) if h == "金额"
+    ]
+    tax_expanded_cols = [
+        i for i, h in enumerate(expanded_headers) if h == "税额"
+    ]
+
+    # 优先从 OCR 原始合计行提取 ¥ 值。VLM 可能漏掉金额合计（如消防发票），
+    # 步骤 4 会因此丢弃该 ¥ 值；OCR 合计行按 x 排序，¥ 值顺序为 [金额¥, 税额¥]。
+    ocr_summary_yen: list[str] = []
+    if ocr_data_rows:
+        for orow in ocr_data_rows:
+            if not orow or orow[0].strip() not in ("合计", "合"):
+                continue
+            for c in orow:
+                for m in re.finditer(r'[¥￥][\d.,]+', c):
+                    ocr_summary_yen.append(m.group())
+            break
+
+    logger.info(
+        f"OCR合计行¥位置修复: expanded_headers={expanded_headers}, "
+        f"金额列={amount_expanded_cols}, 税额列={tax_expanded_cols}, "
+        f"new_rows数={len(new_rows)}"
+    )
+
+    for row in new_rows:
+        cells = row.find_all("td")
+        if not cells:
+            continue
+        first_text = cells[0].get_text().strip()
+        logger.info(
+            f"OCR合计行¥位置修复: 检查行 first_text='{first_text}', "
+            f"cells数={len(cells)}"
+        )
+        if first_text not in ("合计", "合"):
+            continue
+
+        # 提取合计行所有 ¥/￥ 值：优先用 OCR 原始合计行（完整），
+        # 回退到重建行文本（OCR 未识别到合计行或未含 ¥ 时）
+        yen_values = list(ocr_summary_yen)
+        if not yen_values:
+            for td in cells:
+                text = td.get_text().strip()
+                for m in re.finditer(r'[¥￥][\d.,]+', text):
+                    yen_values.append(m.group())
+
+        if not yen_values:
+            continue
+
+        # 重建行结构：用模板列的 colspan 创建单元格
+        row.clear()
+        for orig in template_cells:
+            new_td = soup.new_tag("td")
+            cs = orig.get("colspan")
+            if cs:
+                new_td["colspan"] = cs
+            row.append(new_td)
+
+        rebuilt_cells = row.find_all("td")
+        for td in rebuilt_cells:
+            td.string = ""
+
+        # 放置"合计"标签到第一列
+        rebuilt_cells[0].string = "合计"
+
+        # 找到每个 ¥ 值对应的展开列索引并放置
+        # ¥ 值顺序通常为 [金额¥值, 税额¥值]
+        for yi, yen_val in enumerate(yen_values):
+            if yi == 0 and amount_expanded_cols:
+                target_expanded = amount_expanded_cols[0]
+            elif yi == 1 and tax_expanded_cols:
+                target_expanded = tax_expanded_cols[0]
+            elif yi < len(amount_expanded_cols):
+                target_expanded = amount_expanded_cols[yi]
+            else:
+                continue
+
+            # 展开列索引 → 物理列索引
+            phys_idx = 0
+            expanded_so_far = 0
+            for ci, td in enumerate(rebuilt_cells):
+                cs = int(td.get("colspan", 1))
+                if expanded_so_far + cs > target_expanded:
+                    phys_idx = ci
+                    break
+                expanded_so_far += cs
+
+            if phys_idx < len(rebuilt_cells):
+                rebuilt_cells[phys_idx].string = yen_val
+
+        logger.info(
+            f"OCR合计行¥位置修复: ¥值={yen_values}, "
+            f"金额列展开索引={amount_expanded_cols}, "
+            f"税额列展开索引={tax_expanded_cols}"
+        )
+
+
+def _reconstruction_preserves_vlm_values(
+    template_cells: list[Tag],
+    new_rows: list[Tag],
+) -> bool:
+    """校验 OCR 重建是否保留了 VLM 拼接单元格中的全部数值（原则 1/4/10）。
+
+    值保真校验：VLM 拼接行虽将多行合并为单行，但其数值（数量/单价/金额/
+    税率/税额）通常完整且正确。OCR 网格因 y 聚类误差可能丢失或错位这些
+    数值。本函数比较重建前后数值的总"数字位数"：
+    - 丢失整段数值（如丢失 "15910.00" 7 位、"2.11650471401" 12 位）时，
+      数字总数显著下降；
+    - 数字位数对拼接不敏感（"2892.0015910.00" 无论按何种方式拆分，
+      总位数恒为 13），因此比"数值个数"更稳健。
+
+    Args:
+        template_cells: VLM 拼接行的物理单元格（含 colspan）。
+        new_rows: OCR 重建后的行（含表头行，表头无数字不影响比较）。
+
+    Returns:
+        True 表示重建保留了 VLM 数值，可安全替换；False 表示存在值丢失。
+    """
+    def _digit_count(text: str) -> int:
+        return sum(1 for ch in text if ch.isdigit())
+
+    vlm_digits = sum(_digit_count(c.get_text()) for c in template_cells)
+    rebuilt_digits = sum(
+        _digit_count(c.get_text())
+        for row in new_rows
+        for c in row.find_all(["td", "th"])
+    )
+
+    if vlm_digits == 0:
+        # VLM 拼接行不含任何数字，无值可丢失，直接放行
+        return True
+
+    # 允许 OCR 识别过程中的少量位数损失（如漏掉结尾 ".00"），
+    # 但丢失整段数值（一个 5 位数量即 5 位以上）应判定为丢失。
+    # 阈值 5%：数字位数损失超过 5% 即视为存在值丢失，放弃重建。
+    return rebuilt_digits >= vlm_digits * 0.95
+
+
+def _remove_orphaned_summary_continuation_row(
+    cont_row: Tag,
+    concat_has_rowspan: bool,
+    new_rows: list[Tag],
+) -> None:
+    """删除 VLM 拼接行被重建后遗留的 rowspan 续行（原始合计 ¥ 行）。
+
+    VLM 将发票「金额/税额」列的合计值放在拼接行的 rowspan 续行中
+    （如 <tr><td>¥34552.25</td><td>¥1036.57</td></tr>）。重建拼接行时
+    只替换拼接行本身，续行被遗留，形成孤立重复的合计 ¥ 行（违反原则 1）。
+
+    删除条件（原则 4 强约束，全部满足才删除，否则保持原样）：
+    1. 拼接行含 rowspan≥2 的单元格（续行的前提）；
+    2. 续行所有非空单元格均为 ¥/￥ 数值（无其它文本）；
+    3. 续行的 ¥ 数值已被重建新行保留（规范化后比对，避免丢值）。
+
+    注意：拼接行在调用本函数前已被 decompose()，bs4 的 decompose() 会清空
+    子节点，故 rowspan 信息需由调用方在 decompose 之前捕获后经
+    ``concat_has_rowspan`` 传入，而非在此处读取拼接行 Tag。
+
+    Args:
+        cont_row: 待判定/删除的续行。
+        concat_has_rowspan: 拼接行在 decompose 前是否含 rowspan≥2 的单元格。
+        new_rows: 重建后的新行（含合计行），用于校验 ¥ 值是否已保留。
+    """
+    # 条件 1：拼接行须含 rowspan（否则不存在续行）
+    if not concat_has_rowspan:
+        return
+    # 条件 2：续行须为「仅含 ¥/￥ 数值与空单元格」的合计行
+    yen_values: list[str] = []
+    for c in cont_row.find_all(["td", "th"]):
+        text = c.get_text().strip()
+        if not text:
+            continue
+        if not re.fullmatch(r"[¥￥][\d.,]+", text):
+            return  # 含非 ¥ 文本（如「免税」「3%」）→ 非续行，不删
+        yen_values.append(_normalize_for_matching(text).replace(",", ""))
+    if not yen_values:
+        return  # 纯空行，保守不删
+    # 条件 3：续行 ¥ 值须已被重建新行保留（否则删除会丢值，违反原则 1）
+    rebuilt_text = _normalize_for_matching(
+        "".join(c.get_text() for r in new_rows for c in r.find_all(["td", "th"]))
+    ).replace(",", "")
+    if any(v not in rebuilt_text for v in yen_values):
+        return  # 值未保留（如 OCR 漏识别合计行），不删
+    cont_row.decompose()
+
+
+def _split_concatenated_row_deterministically(
+    soup: BeautifulSoup,
+    table: Tag,
+    vlm_data: list[list[str]],
+    data_row_start: int,
+) -> bool:
+    """确定性拆分 VLM 拼接行（不依赖 OCR，避免 OCR 行聚类不确定性）。
+
+    当 VLM 将多行发票明细合并为单行且数值完整时，直接用 VLM 拼接值按
+    "数据行数 N" 拆回多行（原则 4：信任 VLM 完整正确值；原则 5：以 N
+    为强约束）。N 从数量列（≤2 位小数金额值个数）确定，回退税率列。
+    逐列用关键词对应的规则拆分；任一列无法可靠拆分则整体返回 False，
+    回退 OCR 重建。拆分后保留拼接行模板列的 colspan，并插入表头行。
+
+    Args:
+        soup: BeautifulSoup 对象。
+        table: <table> Tag。
+        vlm_data: 展开后的 VLM 文本网格。
+        data_row_start: VLM 数据行起始索引。
+
+    Returns:
+        True 表示已确定性拆分并替换原拼接行。
+    """
+    rows = table.find_all("tr")
+
+    # 1. 定位拼接行（含 ≥2 个数值拼接单元格）
+    concat_row_idx = -1
+    for vi in range(max(0, data_row_start), len(rows)):
+        concat_count = 0
+        for t in [c.get_text().strip() for c in rows[vi].find_all(["td", "th"])]:
+            if not t:
+                continue
+            m = _match_data_column_keyword(t)
+            if m is None or not m[1]:
+                continue
+            if m[0] in _NUMERIC_COLUMN_KEYWORDS:
+                if (
+                    len([n for n in re.findall(r"\d+\.?\d*", m[1]) if len(n) >= 2]) >= 2
+                    or len(re.sub(r"[^\d]", "", m[1])) >= 8
+                ):
+                    concat_count += 1
+        if concat_count >= 2:
+            concat_row_idx = vi
+            break
+    if concat_row_idx < 0:
+        return False
+
+    template_cells = rows[concat_row_idx].find_all(["td", "th"])
+    if not template_cells:
+        return False
+
+    # 2. 解析每列关键词与拼接数据
+    parsed: list[tuple[int, str, str]] = []
+    for vc, cell in enumerate(template_cells):
+        text = cell.get_text().strip()
+        m = _match_data_column_keyword(text)
+        if m is not None:
+            parsed.append((vc, m[0], m[1].strip()))
+        else:
+            parsed.append((vc, "", text))
+
+    # 3. 确定数据行数 N（优先数量列，其次税率列）
+    n_data = 0
+    for _, kw, data in parsed:
+        if kw == "数量":
+            vals = re.findall(r"\d+\.\d{2}", data)
+            if vals:
+                n_data = len(vals)
+                break
+    if n_data < 2:
+        for _, kw, data in parsed:
+            if kw == "税率":
+                vals = re.findall(r"\d+(?:\.\d+)?\s*%", data)
+                if vals:
+                    n_data = len(vals)
+                    break
+    if n_data < 2:
+        logger.debug("确定性拆分无法确定数据行数 N，跳过")
+        return False
+
+    # 4. 逐列拆分
+    col_values: dict[int, list[str]] = {}
+    summary_values: dict[int, str] = {}
+    summary_name = ""
+    # [自定义] 整数数量（无小数点）待反推的 (列索引, 纯数字串)。数量列在单价/金额列
+    # 之前被遍历，无法当场反推，故先延迟，待步骤 4.25 单价/金额拆分完成后处理。
+    deferred_quantity: tuple[int, str] | None = None
+    for vc, kw, data in parsed:
+        if kw == "数量":
+            vals = re.findall(r"\d+\.\d{2}", data)
+            if len(vals) == n_data:
+                col_values[vc] = vals
+            else:
+                # [自定义] 整数数量（无小数点，如 "3332"+"19197"→"333219197"）无法按
+                # 小数位数切分。延迟到单价/金额拆分后，用「金额 = 数量 × 单价」反推
+                # （原则 4：金额/单价两列可独立可靠拆分，反推 + 双重校验必然正确）。
+                digits = re.sub(r"[^\d]", "", data)
+                if digits and "." not in data and len(digits) >= n_data:
+                    deferred_quantity = (vc, digits)
+                    col_values[vc] = [""] * n_data  # 占位，4.25 步反推后覆盖
+                else:
+                    return False
+        elif kw == "税率":
+            vals = re.findall(r"\d+(?:\.\d+)?\s*%", data)
+            if len(vals) != n_data:
+                return False
+            col_values[vc] = vals
+        elif kw == "单价":
+            vals = _split_decimal_values(data, n_data)
+            if len(vals) != n_data:
+                return False
+            col_values[vc] = vals
+        elif kw in ("金额", "税额"):
+            yen = re.findall(r"[¥￥][\d.,]+", data)
+            data_no_yen = re.sub(r"[¥￥][\d.,]+", "", data)
+            vals = re.findall(r"\d+\.\d{2}", data_no_yen)
+            if len(vals) != n_data or len(yen) > 1:
+                return False
+            col_values[vc] = vals
+            summary_values[vc] = yen[0] if yen else ""
+        elif kw in ("项目名称", "货物或应税劳务、服务名称"):
+            names, summary = _split_name_cell(data, n_data)
+            if len(names) != n_data:
+                return False
+            col_values[vc] = names
+            summary_name = summary or "合计"
+        elif kw == "单位":
+            if len(data) >= n_data and len(data) % n_data == 0:
+                k = len(data) // n_data
+                col_values[vc] = [data[i * k : (i + 1) * k] for i in range(n_data)]
+            elif 0 < len(data) < n_data and not any(ch.isdigit() for ch in data):
+                # [自定义] VLM 将多行相同单位合并为单个（如单位 "吨" 而非 "吨吨"），
+                # 复制到每行（原则 4：单位是列级属性，非数值且长度 < n_data 时
+                # 必然是「相同单位被折叠」，复制必然正确）。
+                col_values[vc] = [data] * n_data
+            else:
+                col_values[vc] = [""] * n_data
+        else:
+            # 规格型号等：置空（发票常无此列值）
+            col_values[vc] = [""] * n_data
+
+    # 4.25 [自定义] 反推整数数量（金额 = 数量 × 单价）
+    if deferred_quantity is not None:
+        vc_q, digits = deferred_quantity
+        price_vc = next((v for v, k, _ in parsed if k == "单价"), -1)
+        amount_vc = next((v for v, k, _ in parsed if k == "金额"), -1)
+        quantities = _split_integer_quantity(
+            digits,
+            col_values.get(price_vc, []),
+            col_values.get(amount_vc, []),
+        )
+        if len(quantities) != n_data:
+            return False
+        col_values[vc_q] = quantities
+
+    # 4.5 [自定义] 从 rowspan 续行回填金额/税额合计 ¥ 值（原则 1 不多不少）
+    # VLM 用 rowspan 布局表示货物区时，拼接行的金额/税额单元格无 ¥，合计放在
+    # 紧随其后的续行（如 <tr><td>¥34552.25</td><td>¥1036.57</td></tr>）。
+    # 仅在续行是「纯 ¥ 数值」且 ¥ 数量等于金额/税额列数时回填，否则保持原样。
+    cont_row = rows[concat_row_idx + 1] if concat_row_idx + 1 < len(rows) else None
+    if cont_row is not None:
+        cont_nonempty = [
+            c.get_text().strip()
+            for c in cont_row.find_all(["td", "th"])
+            if c.get_text().strip()
+        ]
+        if cont_nonempty and all(
+            re.fullmatch(r"[¥￥][\d.,]+", t) for t in cont_nonempty
+        ):
+            yen_cols = [vc for vc, kw, _ in parsed if kw in ("金额", "税额")]
+            if len(cont_nonempty) == len(yen_cols):
+                for vc, y in zip(yen_cols, cont_nonempty):
+                    if not summary_values.get(vc):
+                        summary_values[vc] = y
+
+    # 5. 构建 N 个数据行 + 1 个合计行（沿用模板列 colspan）
+    # [自定义] 只复制 colspan、丢弃 rowspan：rowspan 是 VLM 拼接行「自身 + 续行
+    # 占两视觉行」的标记，这里已把拼接行与续行拆成 N 个独立物理行，续行 ¥ 也已在
+    # 步骤 4.5 回填并删除，故新行不应再携带 rowspan（否则渲染成 rowspan=N 的坏表）。
+    new_rows: list[Tag] = []
+    for i in range(n_data):
+        tr = soup.new_tag("tr")
+        for vc, orig in enumerate(template_cells):
+            td = soup.new_tag("td")
+            for attr in ("colspan",):
+                if orig.get(attr):
+                    td[attr] = orig[attr]
+            td.string = col_values.get(vc, [""] * n_data)[i]
+            tr.append(td)
+        new_rows.append(tr)
+
+    summary_tr = soup.new_tag("tr")
+    for vc, orig in enumerate(template_cells):
+        td = soup.new_tag("td")
+        for attr in ("colspan",):
+            if orig.get(attr):
+                td[attr] = orig[attr]
+        if vc in summary_values and summary_values[vc]:
+            td.string = summary_values[vc]
+        elif parsed[vc][1] in ("项目名称", "货物或应税劳务、服务名称"):
+            td.string = summary_name
+        else:
+            td.string = ""
+        summary_tr.append(td)
+    new_rows.append(summary_tr)
+
+    # 6. 插入表头行（用拼接行模板列 + 关键词标签，保留 colspan、丢弃 rowspan）
+    header_tr = soup.new_tag("tr")
+    for vc, orig in enumerate(template_cells):
+        th = soup.new_tag("th")
+        for attr in ("colspan",):
+            if orig.get(attr):
+                th[attr] = orig[attr]
+        kw = parsed[vc][1]
+        th.string = kw if kw else orig.get_text().strip()
+        header_tr.append(th)
+    new_rows.insert(0, header_tr)
+
+    # 7. 替换原拼接行
+    prev = rows[concat_row_idx - 1] if concat_row_idx > 0 else None
+    concat_row = rows[concat_row_idx]
+    # [自定义] 捕获 rowspan（bs4 的 decompose() 会清空子节点，须在其之前读取）
+    concat_has_rowspan = any(
+        int(c.get("rowspan", 1)) >= 2
+        for c in concat_row.find_all(["td", "th"])
+    )
+    concat_row.decompose()
+    # [自定义] 删除拼接行的 rowspan 续行（原始合计 ¥ 行），
+    # 避免重建后残留孤立重复行（如 <tr><td>¥34552.25</td><td>¥1036.57</td></tr>）。
+    # 复用 OCR 重建路径的 _remove_orphaned_summary_continuation_row：三条件
+    # （含 rowspan + 续行纯 ¥ + 值已被新合计行保留）全满足才删，否则保持原样。
+    if concat_row_idx + 1 < len(rows):
+        _remove_orphaned_summary_continuation_row(
+            rows[concat_row_idx + 1], concat_has_rowspan, new_rows
+        )
+    if prev is not None:
+        target = prev
+        for tr in reversed(new_rows):
+            target.insert_after(tr)
+    else:
+        first = table.find("tr")
+        if first is not None:
+            for tr in reversed(new_rows):
+                first.insert_before(tr)
+        else:
+            for tr in new_rows:
+                table.append(tr)
+
+    logger.info(f"确定性拆分 VLM 拼接行：{n_data} 数据行 + 1 合计行")
+    return True
+
+
+def _rebuild_merged_rows_from_ocr(
+    soup: BeautifulSoup,
+    table: Tag,
+    ocr_grid: list[list[str]],
+    vlm_data: list[list[str]],
+    vlm_cells: list[list[Tag]],
+    data_row_start: int,
+) -> bool:
+    """用 OCR 网格重建被 VLM 合并的数据行。
+
+    当 VLM 将多行数据合并为单个 <tr> 时，此函数使用 OCR 网格
+    （由 PaddleOCR 按视觉 y 坐标聚类生成）作为真实行结构来重建。
+
+    算法：
+    1. 在 OCR 网格中定位表头行和数据行
+    2. 建立 OCR 列到 VLM 列的映射
+    3. 为每个 OCR 数据行创建独立的 <tr>
+    4. 替换原 VLM 拼接行
+
+    Args:
+        soup: BeautifulSoup 对象。
+        table: <table> Tag。
+        ocr_grid: OCR 识别文字网格。
+        vlm_data: 展开后的 VLM 文本网格。
+        vlm_cells: 展开后的 VLM Tag 网格。
+        data_row_start: VLM 数据行起始索引。
+
+    Returns:
+        True 表示重建成功。
+    """
+    rows = table.find_all("tr")
+    if data_row_start >= len(rows):
+        return False
+
+    # 1. 定位 OCR 表头和数据行
+    header_row_idx = _find_ocr_header_row(ocr_grid)
+    if header_row_idx >= len(ocr_grid) - 1:
+        logger.debug(
+            f"OCR 网格中未找到有效的表头行（header_row_idx={header_row_idx}, "
+            f"ocr_grid_len={len(ocr_grid)}），跳过重建"
+        )
+        return False
+
+    # 数据行：表头之后到"价税合计"/"合计"之前
+    ocr_data_rows: list[list[str]] = []
+    for i in range(header_row_idx + 1, len(ocr_grid)):
+        row_text = " ".join(ocr_grid[i])
+        if "价税合计" in row_text or (
+            len(ocr_data_rows) > 0 and "合计" in row_text
+            and not any(_is_data_value(c) for c in ocr_grid[i] if c != "合计")
+        ):
+            break
+        ocr_data_rows.append(ocr_grid[i])
+
+    if not ocr_data_rows:
+        logger.debug(f"OCR 网格中未找到数据行（header_row_idx={header_row_idx}, ocr_grid_len={len(ocr_grid)}），跳过重建")
+        return False
+
+    # 2. 建立 OCR 列 → VLM 列映射
+    ocr_header = ocr_grid[header_row_idx]
+    # [自定义] 合并 OCR 表头中被拆分的单个中文字符
+    # 小图片上 PaddleOCR 可能将"金额"/"税额"/"单价"等标签
+    # 拆分为独立字符（如"金"+"额"），合并后便于后续列映射和标签匹配。
+    ocr_header = _merge_split_header_chars(ocr_header)
+    # 使用拼接行的原始单元格文本（不展开 colspan）做列匹配
+    concat_row_cells = rows[data_row_start].find_all(["td", "th"])
+    # 如果 data_row_start 未指向拼接行，则查找真正的拼接行
+    for vi in range(max(0, data_row_start), len(rows)):
+        row_texts_raw = [c.get_text().strip() for c in rows[vi].find_all(["td", "th"])]
+        concat_count = 0
+        for t in row_texts_raw:
+            if not t:
+                continue
+            norm_t = _normalize_for_matching(t).replace(" ", "")
+            if any(norm_t.startswith(_normalize_for_matching(kw).replace(" ", ""))
+                   for kw in _INVOICE_DATA_COLUMN_KEYWORDS):
+                nums = [n for n in re.findall(r'\d+\.?\d*', t) if len(n) >= 2]
+                if len(nums) >= 2:
+                    concat_count += 1
+        if concat_count >= 2:
+            concat_row_cells = rows[vi].find_all(["td", "th"])
+            break
+    vlm_row_texts = [c.get_text().strip() for c in concat_row_cells]
+    col_map = _map_ocr_cols_to_vlm_cols(ocr_header, vlm_row_texts)
+
+    if len(col_map) < 3:
+        logger.debug(
+            f"OCR 列映射不足（{len(col_map)} 列），跳过重建。"
+            f"OCR表头={ocr_header[:8]}，VLM行文本={[t[:30] for t in vlm_row_texts[:8]]}"
+        )
+        return False
+
+    # 3. 获取拼接行的单元格模板（保留 colspan/rowspan）
+    template_cells = concat_row_cells
+    if not template_cells:
+        return False
+
+    # 4. 为每个 OCR 数据行创建新 <tr>
+    # OCR 网格行列数不均（空列被压缩），不依赖 col_map 索引，
+    # 而是逐 OCR 单元格与 VLM 模板列做文本/类型匹配
+    new_rows: list[Tag] = []
+    for ocr_row in ocr_data_rows:
+        new_tr = soup.new_tag("tr")
+        # 记录已使用的 OCR 单元格（避免重复分配到多列）
+        used_ocr: set[int] = set()
+        # 预拆分队列：(ocr_cell_index, split_part_index, value) — 用于直接填充后续列
+        pending_splits: list[tuple[int, int, str]] = []
+
+        for vc in range(len(template_cells)):
+            new_td = soup.new_tag("td")
+            orig = template_cells[vc]
+            for attr in ("colspan", "rowspan"):
+                if orig.get(attr):
+                    new_td[attr] = orig[attr]
+
+            cell_text = ""
+            vlm_tpl_text = orig.get_text().strip()
+            vlm_tpl_norm = _normalize_for_matching(vlm_tpl_text).replace(" ", "")
+            vlm_is_num_col = _is_numeric_column(vlm_tpl_text)
+
+            # 优先使用预拆分的值（上一列拆分出的后续值）
+            if pending_splits:
+                _, _, split_val = pending_splits.pop(0)
+                cell_text = split_val
+            else:
+                # 找最佳匹配的 OCR 单元格
+                best_oc = -1
+                for oc, ocr_cell in enumerate(ocr_row):
+                    if oc in used_ocr:
+                        continue
+                    ocr_cell = ocr_cell.strip()
+                    if not ocr_cell:
+                        continue
+                    ocr_norm = _normalize_for_matching(ocr_cell).replace(" ", "")
+
+                    # 精准匹配：OCR 文本在 VLM 模板文本中（或反过来）
+                    if ocr_norm and (ocr_norm in vlm_tpl_norm or vlm_tpl_norm in ocr_norm):
+                        best_oc = oc
+                        break
+
+                # 若文本未匹配，用类型匹配：数值 OCR → 数值 VLM 列
+                # ¥ 前缀值（如 "￥71006.01"）仅通过文本匹配分配，
+                # 不通过类型匹配，以避免被先遍历到的数值列抢先占用
+                if best_oc < 0 and vlm_is_num_col:
+                    for oc, ocr_cell in enumerate(ocr_row):
+                        if oc in used_ocr:
+                            continue
+                        ocr_stripped = ocr_cell.strip()
+                        if not _is_data_value(ocr_stripped):
+                            continue
+                        if ocr_stripped.startswith('￥') or ocr_stripped.startswith('¥'):
+                            continue
+                        best_oc = oc
+                        break
+
+                if best_oc >= 0:
+                    cell_text = ocr_row[best_oc].strip()
+                    used_ocr.add(best_oc)
+                    # 若该 OCR 文本含多个拼接数值且匹配的 VLM 列是数值列，
+                    # 尝试拆分并预填后续列
+                    if vlm_is_num_col:
+                        nums_in_text = [n for n in re.findall(r'\d+\.?\d*', cell_text) if len(n) >= 2]
+                        # 统计后续连续数值列数
+                        next_num_cols = 0
+                        for nvc in range(vc + 1, len(template_cells)):
+                            nvl_text = template_cells[nvc].get_text().strip()
+                            if _is_numeric_column(nvl_text):
+                                next_num_cols += 1
+                            else:
+                                break
+                        if len(nums_in_text) >= 2 and next_num_cols >= 1:
+                            parts = _try_split_concatenated_numbers(cell_text, min(1 + next_num_cols, len(nums_in_text)))
+                            if len(parts) > 1:
+                                cell_text = parts[0]
+                                for pi in range(1, len(parts)):
+                                    pending_splits.append((best_oc, pi, parts[pi]))
+
+            new_td.string = cell_text
+            new_tr.append(new_td)
+        new_rows.append(new_tr)
+
+    # 提取 OCR 表头标签（供后续步骤 4.5 和步骤 5 共用）
+    ocr_header_labels = [
+        h for h in ocr_header
+        if h.strip() in _INVOICE_HEADER_KEYWORDS
+    ]
+
+    # 4.5 修复 OCR 重建表格中合计行的 ¥ 值列位置
+    # OCR 行中的合计行（首列为"合计"）经过模板列匹配后，
+    # ¥ 值可能被分配到错误的列（模板列文本匹配对 ¥ 值不感知列语义）。
+    # 需要按 TH 行的 colspan 结构重建合计行，将 ¥ 值对齐到正确列。
+    _fix_ocr_summary_row_yen_position(
+        new_rows, template_cells, ocr_header, ocr_header_labels,
+        col_map, soup, ocr_data_rows,
+    )
+
+    # 4.6 值保真校验：OCR 重建不得丢失 VLM 拼接单元格中已有的数值
+    # （原则 1/4/10）。若重建丢失了 VLM 数值（如数量 "15910.00"），
+    # 放弃重建、保留 VLM 原始拼接输出，交由下游确定性拆分处理。
+    if not _reconstruction_preserves_vlm_values(template_cells, new_rows):
+        logger.warning(
+            "OCR 重建丢失 VLM 拼接数值，放弃重建、保留 VLM 原始拼接行"
+        )
+        return False
+
+    # 5. 在 VLM 拼接行之前插入 OCR 表头行
+    # OCR 表头来自 ocr_grid[header_row_idx] 中在 _INVOICE_HEADER_KEYWORDS 里的标签
+    if ocr_header_labels and len(ocr_header_labels) >= 3:
+        # 用 col_map 将 OCR 表头标签映射到 VLM 列位置
+        header_tr = soup.new_tag("tr")
+        for vc in range(len(template_cells)):
+            th = soup.new_tag("th")
+            orig = template_cells[vc]
+            for attr in ("colspan", "rowspan"):
+                if orig.get(attr):
+                    th[attr] = orig[attr]
+            # 查找映射到此 VLM 列的 OCR 表头标签
+            label = ""
+            vlm_tpl_text = orig.get_text().strip()
+            vlm_tpl_norm = _normalize_for_matching(vlm_tpl_text).replace(" ", "")
+            for oc_hdr in ocr_header_labels:
+                hdr_norm = _normalize_for_matching(oc_hdr).replace(" ", "")
+                if hdr_norm and vlm_tpl_norm and (hdr_norm in vlm_tpl_norm or vlm_tpl_norm in hdr_norm):
+                    label = oc_hdr
+                    break
+            # 若未匹配，用 col_map 索引
+            if not label:
+                for oc, mapped_vc in col_map.items():
+                    if mapped_vc == vc and oc < len(ocr_header):
+                        candidate = ocr_header[oc].strip()
+                        if candidate in _INVOICE_HEADER_KEYWORDS:
+                            label = candidate
+                            break
+            th.string = label
+            header_tr.append(th)
+        new_rows.insert(0, header_tr)
+        logger.debug(f"已插入 OCR 表头行：{len(ocr_header_labels)} 个标签")
+
+    # 6. 替换原 VLM 拼接行
+    # 找出被拼接的行（含多个以发票明细列关键词开头且含≥2个数值的单元格）
+    concat_row_idx = None
+    for vi in range(max(0, data_row_start), len(rows)):
+        row_texts = vlm_data[vi] if vi < len(vlm_data) else []
+        concat_count = 0
+        for t in row_texts:
+            if not t:
+                continue
+            norm_t = _normalize_for_matching(t).replace(" ", "")
+            starts_with_kw = any(
+                norm_t.startswith(_normalize_for_matching(kw).replace(" ", ""))
+                for kw in _INVOICE_DATA_COLUMN_KEYWORDS
+            )
+            if starts_with_kw:
+                nums = [n for n in re.findall(r'\d+\.?\d*', t) if len(n) >= 2]
+                if len(nums) >= 2:
+                    concat_count += 1
+        if concat_count >= 2:
+            concat_row_idx = vi
+            break
+
+    if concat_row_idx is None:
+        concat_row_idx = data_row_start  # 回退
+
+    # 保存插入点（拼接行之前的那一行）
+    insertion_point = rows[concat_row_idx - 1] if concat_row_idx > 0 else None
+
+    # 删除拼接行
+    concat_row = rows[concat_row_idx]
+    # [自定义] 删除拼接行的 rowspan 续行（VLM 原始合计 ¥ 行），
+    # 避免重建后残留孤立重复行（如 <tr><td>¥34552.25</td><td>¥1036.57</td></tr>）。
+    # 仅当续行是纯 ¥ 值且该值已被新合计行保留时删除（原则 1 不多不少）。
+    # 注意：bs4 的 decompose() 会清空子节点，须在其之前捕获 rowspan 信息。
+    concat_has_rowspan = any(
+        int(c.get("rowspan", 1)) >= 2
+        for c in concat_row.find_all(["td", "th"])
+    )
+    concat_row.decompose()
+    if concat_row_idx + 1 < len(rows):
+        _remove_orphaned_summary_continuation_row(
+            rows[concat_row_idx + 1], concat_has_rowspan, new_rows
+        )
+
+    # 在插入点之后插入新行
+    if insertion_point is not None:
+        target = insertion_point
+        for new_tr in reversed(new_rows):
+            target.insert_after(new_tr)
+    else:
+        # 没有前一行（表格第一行），插入到表格开头
+        table_tag = table
+        first = table_tag.find("tr")
+        if first:
+            for new_tr in reversed(new_rows):
+                first.insert_before(new_tr)
+        else:
+            for new_tr in new_rows:
+                table_tag.append(new_tr)
+
+    logger.info(
+        f"OCR 网格重建表格行：将 {len(rows) - data_row_start} 行 VLM 数据行 "
+        f"替换为 {len(new_rows)} 行 OCR 数据行 "
+        f"（OCR 表头行={header_row_idx}，列映射={len(col_map)}）"
+    )
+    return True
+
+
 def _fill_empty_cells_from_ocr_grid(
     soup: BeautifulSoup,
     table: Tag,
@@ -2485,6 +4377,31 @@ def _fill_empty_cells_from_ocr_grid(
     # 2. 检测数据行起始（含 <img> 的行终止表头扩展）
     data_row_start = _detect_data_row_start(rows, vlm_data)
 
+    # [自定义] 检测 VLM 行合并并用 OCR 网格重建
+    # 仅对发票表格执行，避免影响其他类型表格
+    # 合并上游时注意：此 hook 只依赖本模块内部函数
+    try:
+        if _is_invoice_table(table) and _has_concatenated_data_cells(vlm_data):
+            logger.info(
+                f"检测到 VLM 行合并：OCR 数据行={_count_ocr_data_rows(ocr_grid)}, "
+                f"VLM 数据行={len(vlm_data) - data_row_start}，"
+                f"优先确定性拆分，失败则回退 OCR 网格重建"
+            )
+            # 原则 4：VLM 拼接值完整正确时，直接按数据行数 N 确定性拆回多行，
+            # 避免 OCR 行聚类的非确定性导致丢值（如丢失 "15910.00"）。
+            if _split_concatenated_row_deterministically(
+                soup, table, vlm_data, data_row_start
+            ):
+                return True  # 拆分成功，跳过空单元格填充
+            if _rebuild_merged_rows_from_ocr(
+                soup, table, ocr_grid, vlm_data, vlm_cells, data_row_start
+            ):
+                return True  # 重建成功，跳过空单元格填充
+    except Exception:
+        logger.exception(
+            "OCR 网格重建失败，回退到空单元格填充逻辑"
+        )
+
     # 3. 使用标签锚点将 OCR 行对齐到 VLM 数据行
     ocr_pool = _align_ocr_to_vlm_rows(ocr_grid, vlm_data, data_row_start)
 
@@ -2495,6 +4412,17 @@ def _fill_empty_cells_from_ocr_grid(
     modified = False
     filled_cell_ids = set()  # 记录已填充的 Tag id，处理 colspan 重复引用
 
+    # 预计算「表头/分区标题」规范化文本集（data_row_start 之前），供跨行去重：
+    # 顶部标题（如「流动资产:」）虽在另一行，也属 VLM 已含的标签，OCR 读到全角
+    # 变体时不应复制进数据行空列。仅对表头行做跨行去重，数据行之间不互相去重，
+    # 以保留「吨/免税」等可合法重复出现的值被放置进漏识别单元格的能力（原则 1）。
+    vlm_header_norm = {
+        _normalize_for_matching(t)
+        for row in vlm_data[:data_row_start]
+        for t in row
+        if t
+    }
+
     for vlm_row_idx in range(data_row_start, len(vlm_data)):
         vlm_row = vlm_data[vlm_row_idx]
         vlm_tag_row = vlm_cells[vlm_row_idx]
@@ -2502,11 +4430,37 @@ def _fill_empty_cells_from_ocr_grid(
         # 收集该 VLM 行对应的 OCR 文本（过滤已在 VLM 中存在的标签）
         ocr_texts = ocr_pool.get(vlm_row_idx, [])
         ocr_new: list[tuple[str, str]] = []
+        # 本行 VLM 单元格的规范化文本（去重比对用，全角/半角标点一致）
+        vlm_row_norms = [_normalize_for_matching(vt) for vt in vlm_row if vt]
         for ot in ocr_texts:
-            # 跳过已在 VLM 行中精确匹配的值
-            if any(ot == vt for vt in vlm_row if vt):
-                continue
             item_type = _classify_ocr_item_type(ot)
+            if item_type == "text":
+                ot_norm = _normalize_for_matching(ot)
+                # 文本（标签）：同行或表头行已含该标签即视为重复，不做填充——
+                # 只"放置"新增信息，不复制已有信息（原则 1）。
+                # 仅查同行 + 表头，不查其它数据行，避免误伤可重复出现的值。
+                # 去重分两级：
+                # ① 规范化后精确相等（覆盖全角/半角标点差异）；
+                # ② 较长文本（≥4 字）的子串匹配——OCR 常截断 VLM 标签或丢失
+                #    序号前缀，如「、经营活动产生的现金流量：」是
+                #    「一、经营活动产生的现金流量:」去掉「一、」的截断重复。
+                #    仅对较长文本启用，避免误伤「吨」「免税」等短值。
+                if ot_norm in vlm_row_norms:
+                    continue
+                if len(ot_norm) >= 4 and any(
+                    ot_norm in vt_norm for vt_norm in vlm_row_norms
+                ):
+                    continue
+                if ot_norm in vlm_header_norm:
+                    continue
+                if len(ot_norm) >= 4 and any(
+                    ot_norm in ht_norm for ht_norm in vlm_header_norm
+                ):
+                    continue
+            else:
+                # 数值/税率：仅与同行精确比对去重（数值可合法重复出现）
+                if any(ot == vt for vt in vlm_row if vt):
+                    continue
             ocr_new.append((ot, item_type))
 
         if not ocr_new:
@@ -2702,7 +4656,20 @@ def supplement_vlm_table_cells_with_ocr(
                         cell.find("img") is not None
                         for cell in table.find_all("td")
                     )
-                    if not has_empty and not has_img:
+                    # 发票表格即使无空单元格也需 OCR，
+                    # 用于检测和纠正 VLM 的多行拼接问题
+                    is_invoice = _is_invoice_table(table)
+                    if not has_empty and not has_img and not is_invoice:
+                        continue
+                    # 结构性稀疏表格（如财务报表、征信报告）的空单元格是合法留白，
+                    # 非 VLM 遗漏，不应做 OCR 填充（否则会因列类型退化为全 "text" 而把
+                    # 表头文字/行标签误填进空列，产生重复内容）。发票与含 <img> 的表格除外。
+                    if _is_structurally_sparse_table(table) and not has_img and not is_invoice:
+                        continue
+                    # [自定义] 财务报表样式表格（表头含「行次」）即使非稀疏（密集报表，
+                    # 大量「-」占位）其空单元格也是合法留白。OCR 行对齐错位会灌入
+                    # 截断标签/合并数字/单字噪声，故跳过 OCR 补充。发票与含 <img> 表格除外。
+                    if _is_financial_statement_table(table) and not has_img and not is_invoice:
                         continue
                 except Exception:
                     continue

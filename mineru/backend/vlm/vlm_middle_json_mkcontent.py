@@ -79,6 +79,16 @@ def _format_embedded_html(html, img_buket_path):
             f"split_summary_from_data_cell 执行失败，将使用先前结果: {exc}"
         )
 
+    # [自定义] VLM 表格 HTML 后处理：提取数据单元格中内嵌的列标题到 TH 行
+    # 将 "单位吨"→<th>单位</th>+<td>吨</td>，保留全部识别内容
+    try:
+        from mineru.utils.custom.table_utils import extract_column_header_prefixes
+        formatted = extract_column_header_prefixes(formatted)
+    except Exception as exc:
+        logger.warning(
+            f"extract_column_header_prefixes 执行失败，将使用先前结果: {exc}"
+        )
+
     # [自定义] VLM 表格 HTML 后处理：发票表格 colspan 规范化、缺失值推断
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
@@ -87,6 +97,17 @@ def _format_embedded_html(html, img_buket_path):
     except Exception as exc:
         logger.warning(
             f"normalize_invoice_table 执行失败，将使用先前结果: {exc}"
+        )
+
+    # [自定义] VLM 表格 HTML 后处理：修复合计行 ¥ 值列位置
+    # normalize_invoice_table 可能调整 colspan 导致 ¥ 值列错位，
+    # 此步骤在 colspan 规范化后重新将 ¥ 值对齐到"金额"和"税额"列。
+    try:
+        from mineru.utils.custom.table_utils import fix_summary_row_yen_position
+        formatted = fix_summary_row_yen_position(formatted)
+    except Exception as exc:
+        logger.warning(
+            f"fix_summary_row_yen_position 执行失败，将使用先前结果: {exc}"
         )
 
     # [自定义] VLM 表格 HTML 后处理：购买方/销售方信息行内多行拆分
