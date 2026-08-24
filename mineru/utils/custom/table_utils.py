@@ -3041,6 +3041,8 @@ def _align_ocr_to_vlm_rows(
     Returns:
         {vlm_row_idx: [ocr_text, ...]} 映射。
     """
+    from mineru.utils.custom.matcher import text_similarity
+
     vlm_nrows = len(vlm_data)
     ocr_pool: dict[int, list[str]] = {
         vi: [] for vi in range(data_row_start, vlm_nrows)
@@ -3066,9 +3068,13 @@ def _align_ocr_to_vlm_rows(
                     continue
                 ot_norm = _normalize_for_matching(ot)
                 for vt_norm in vlm_norm[vi]:
-                    if vt_norm and (ot_norm in vt_norm or vt_norm in ot_norm):
-                        # 匹配长度加权：越长匹配越可靠
-                        score += min(len(ot_norm), len(vt_norm))
+                    if not vt_norm:
+                        continue
+                    # 用 OCR 容错的文本相似度替代纯子串包含，
+                    # 容忍形近字/空格等细微差异（ISWM 的文本分量）
+                    sim = text_similarity(ot_norm, vt_norm)
+                    if sim >= 0.5:
+                        score += sim * min(len(ot_norm), len(vt_norm))
             if score > best_score:
                 best_score = score
                 best_row = vi
