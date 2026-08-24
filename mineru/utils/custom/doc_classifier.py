@@ -326,6 +326,51 @@ def _compute_image_coverage_ratio(
         return 0.0
 
 
+def _detect_table_lines_ratio(
+    preview_images: list[dict],
+    sample_indices: list[int],
+) -> float:
+    """检测表格线密度（横/竖线像素占比），用于视觉上区分密集表格。
+
+    用 cv2 形态学（横/竖线结构核）提取表格框线，返回线像素占比。
+    表格线是 STRUCTURED_TABLE 的强视觉信号，可弥补纯关键词分类
+    对「嵌入文本少但表格线密集」的扫描表格识别不足。
+
+    Args:
+        preview_images: 已渲染的预览图片列表。
+        sample_indices: 采样页索引。
+
+    Returns:
+        表格线像素占比（0.0 ~ 1.0）。
+    """
+    try:
+        import cv2
+        import numpy as np
+
+        ratios = []
+        for idx in sample_indices:
+            if idx >= len(preview_images):
+                continue
+            gray = np.asarray(preview_images[idx]["img_pil"].convert("L"))
+            h, w = gray.shape
+            # 大津二值化（线为前景）
+            _, binary = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+            )
+            # 横线核（长条水平）+ 竖线核（长条垂直）
+            h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, w // 15), 1))
+            v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, h // 15)))
+            horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+            vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+            lines = cv2.add(horizontal, vertical)
+            ratio = float(np.count_nonzero(lines) / lines.size)
+            ratios.append(ratio)
+        return float(np.mean(ratios)) if ratios else 0.0
+    except Exception:
+        logger.warning("表格线密度计算失败")
+        return 0.0
+
+
 def classify_document(
     pdf_bytes: bytes,
     quality: Optional[DocumentQuality] = None,
@@ -406,10 +451,14 @@ def classify_document(
         # 特征 4: OCR 难度（复用 S0 结果）
         ocr_difficulty = quality.ocr_difficulty if quality else "low"
 
+        # 特征 5: 表格线密度（cv2 形态学检测横/竖线，视觉上区分密集表格）
+        table_lines_ratio = _detect_table_lines_ratio(preview_images, sample_indices)
+
         logger.debug(
             f"文档分类特征: kvp_count={kvp_count}, table_kw={table_kw_count}, "
             f"repeating_kvp={repeating_kvp_count}, "
             f"stamp={has_stamp}, image_cov={image_coverage:.2%}, "
+            f"table_lines={table_lines_ratio:.3%}, "
             f"ocr_diff={ocr_difficulty}, pages={page_count}"
         )
 
@@ -420,6 +469,8 @@ def classify_document(
                 doc_type = DocType.FORM_KVP  # 短文档 + 印章/高覆盖率 → 票据
             elif page_count == 1 and image_coverage > 0.15:
                 doc_type = DocType.FORM_KVP  # 单页 + 中等覆盖率 → 可能表单
+            elif table_lines_ratio > 0.005:
+                doc_type = DocType.STRUCTURED_TABLE  # 表格线密集 → 扫描表格
             elif table_kw_count >= 5:
                 doc_type = DocType.STRUCTURED_TABLE
             else:
@@ -466,7 +517,10 @@ def classify_document(
                 # 多页文档（≥3 页）不应仅凭 KVP 关键词就判定为表单，
                 # 金融报告、对账单等虽术语密集但本质是表格报告，走 DOCUMENT_PARSE
                 doc_type = DocType.FORM_KVP
-            elif table_kw_count >= 5 and kvp_count < 3:
+            elif (table_kw_count >= 5 and kvp_count < 3) or (
+                table_lines_ratio > 0.005 and table_kw_count >= 3 and kvp_count < 3
+            ):
+                # 表格关键词多，或表格线密集 + 中等关键词 → 密集表格
                 doc_type = DocType.STRUCTURED_TABLE
             else:
                 doc_type = DocType.DOCUMENT_PARSE
