@@ -3070,11 +3070,16 @@ def _align_ocr_to_vlm_rows(
                 for vt_norm in vlm_norm[vi]:
                     if not vt_norm:
                         continue
-                    # 用 OCR 容错的文本相似度替代纯子串包含，
-                    # 容忍形近字/空格等细微差异（ISWM 的文本分量）
-                    sim = text_similarity(ot_norm, vt_norm)
-                    if sim >= 0.5:
-                        score += sim * min(len(ot_norm), len(vt_norm))
+                    # 子串包含（短 cell 嵌在长 OCR 文本中）给完整分；
+                    # 否则用文本相似度容忍形近字/空格等细微差异（ISWM 文本分量）。
+                    # 注意不能用 text_similarity 完全替代子串：difflib 长度归一化
+                    # 会让「短 cell 是长 OCR 文本的子串」得分极低（<0.5）而漏配。
+                    if ot_norm in vt_norm or vt_norm in ot_norm:
+                        score += min(len(ot_norm), len(vt_norm))
+                    else:
+                        sim = text_similarity(ot_norm, vt_norm)
+                        if sim >= 0.5:
+                            score += sim * min(len(ot_norm), len(vt_norm))
             if score > best_score:
                 best_score = score
                 best_row = vi
