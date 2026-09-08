@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 
 from mineru.utils.custom.table_utils import (
     _detect_data_row_start,
+    _align_ocr_to_vlm_rows,
     _parse_vlm_table_structure,
     _is_structurally_sparse_table,
     _is_financial_statement_table,
@@ -621,6 +622,30 @@ def test_split_integer_quantity_rejects_unverifiable():
     assert _split_integer_quantity("12", ["0", "2.0"], ["4690.68", "40630.54"]) == []
 
 
+def test_align_ocr_to_vlm_rows_concatenated_data_row():
+    """OCR 将数据行读成单个拼接文本时，应仍对齐到数据行而非误落到其它行。
+
+    回归：text_similarity 完全替代子串匹配后，短 cell 嵌在长 OCR 文本中
+    得分极低（difflib 长度归一化），导致拼接数据行被误灌进「客户签章」行。
+    """
+    vlm_data = [
+        ["产品名称", "开户日", "起息日", "存期", "到期日", "利率", "到期利息", "密码", "操作员"],
+        ["整存整取-新", "20240531", "20240531", "二年", "20250531", "2.550000%", "261,127", "09 是", "390189"],
+        ["客户签章 ____ 签发日 2024年05月31日"],
+    ]
+    ocr_grid = [
+        ["整存整取-新 20240531 20240531 二年 20200531 2.550000%261,1270是 390189"],
+        ["客户签章. 签发日2024年05月31日"],
+    ]
+    pool = _align_ocr_to_vlm_rows(ocr_grid, vlm_data, data_row_start=1)
+    assert "整存整取-新 20240531" in pool.get(1, [""])[0], (
+        f"拼接数据行应映射到数据行(1)，实际 {pool}"
+    )
+    assert "客户签章. 签发日" in pool.get(2, [""])[0], (
+        f"客户签章 OCR 应映射到客户签章行(2)，实际 {pool}"
+    )
+
+
 if __name__ == "__main__":
     test_equity_statement_label_only_rows_not_treated_as_header()
     test_simple_header_and_data()
@@ -639,4 +664,5 @@ if __name__ == "__main__":
     test_split_concatenated_row_deterministically_removes_orphan_continuation()
     test_split_concatenated_row_deterministically_integer_quantity()
     test_split_integer_quantity_rejects_unverifiable()
+    test_align_ocr_to_vlm_rows_concatenated_data_row()
     print("✅ 所有 _detect_data_row_start / 稀疏门控 / OCR 重建 / 去重 回归测试通过")

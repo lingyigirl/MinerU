@@ -177,6 +177,48 @@ def _box_distance(
     return math.sqrt((dx * x_weight) ** 2 + dy ** 2)
 
 
+def _box_distance_v2(
+    box_a: dict,
+    box_b: dict,
+    x_weight: float = 0.3,
+    mode: str = "label_above",
+) -> float:
+    """优化版加权空间距离（v2）。
+
+    相对 :func:`_box_distance` 的两点改进：
+    1. X 重叠比衰减——两框 X 重叠越大，距离越近（最多衰减 50%），
+       利用位置信息而非仅中心距。
+    2. 策略感知的垂直偏移惩罚——按配对模式对不合预期的垂直落差加罚分。
+
+    Args:
+        box_a, box_b: 两个 box。
+        x_weight: 基础 X 方向权重。
+        mode: 配对模式（"label_above"=策略C / "value_above"=策略D / "same_row"=策略E）。
+
+    Returns:
+        加权距离（含重叠衰减与策略惩罚）。
+    """
+    dx = abs(box_a["cx"] - box_b["cx"])
+    dy = abs(box_a["cy"] - box_b["cy"])
+    base_dist = math.sqrt((dx * x_weight) ** 2 + dy ** 2)
+
+    # 1. X 重叠比衰减（重叠越多距离越小，最多衰减 50%）
+    x_overlap = _x_overlap_ratio(box_a, box_b)
+    base_dist *= 1.0 - x_overlap * 0.5
+
+    # 2. 策略感知的垂直偏移惩罚
+    if mode in ("label_above", "value_above"):
+        # 期望值在标签附近（20~80px 落差），过近/过远都惩罚
+        if dy < 5 or dy > 80:
+            base_dist += 100.0
+    elif mode == "same_row":
+        # 期望同水平行，垂直偏差超 10px 重罚
+        if dy > 10:
+            base_dist += 200.0
+
+    return base_dist
+
+
 def _x_overlap_ratio(box_a: dict, box_b: dict) -> float:
     """计算两个 box 的 X 范围重叠比例。"""
     overlap = min(box_a["x2"], box_b["x2"]) - max(box_a["x1"], box_b["x1"])
@@ -184,6 +226,56 @@ def _x_overlap_ratio(box_a: dict, box_b: dict) -> float:
         return 0.0
     span = max(box_a["x2"] - box_a["x1"], box_b["x2"] - box_b["x1"])
     return overlap / span if span > 0 else 0.0
+
+
+def _merge_multiline_values(
+    values: list[dict],
+    x_overlap_threshold: float = 0.7,
+    max_dy: float = 50.0,
+) -> list[dict]:
+    """合并 OCR 拆分的多行值框。
+
+    长字段（地址、单位名称等）常被 OCR 拆成多行独立文本框，本函数把
+    「垂直相邻 + X 高度重叠」的值框合并为单个值框（文本空格拼接 + bbox 取并集），
+    避免后续空间配对把同一字段的各行错配给不同标签。
+
+    Args:
+        values: 值框列表（含 text/cx/cy/x1/y1/x2/y2）。
+        x_overlap_threshold: X 重叠比阈值。
+        max_dy: 最大垂直间距（像素）。
+
+    Returns:
+        合并后的值框列表（未合并的原样保留）。
+    """
+    if len(values) < 2:
+        return values
+
+    sorted_values = sorted(values, key=lambda b: (b["cy"], b["cx"]))
+    merged: list[dict] = []
+    i = 0
+    while i < len(sorted_values):
+        cur = dict(sorted_values[i])
+        j = i + 1
+        while j < len(sorted_values):
+            nxt = sorted_values[j]
+            dy = abs(nxt["cy"] - cur["cy"])
+            if dy >= max_dy:
+                break
+            if _x_overlap_ratio(cur, nxt) < x_overlap_threshold:
+                break  # 不重叠：后续更远，终止当前合并链，nxt 作为下一个簇起点
+            # 合并文本 + bbox（取并集）
+            cur["text"] = cur["text"] + " " + nxt["text"]
+            cur["x1"] = min(cur["x1"], nxt["x1"])
+            cur["y1"] = min(cur["y1"], nxt["y1"])
+            cur["x2"] = max(cur["x2"], nxt["x2"])
+            cur["y2"] = max(cur["y2"], nxt["y2"])
+            cur["cx"] = (cur["x1"] + cur["x2"]) / 2
+            cur["cy"] = (cur["y1"] + cur["y2"]) / 2
+            cur["bbox"] = (cur["x1"], cur["y1"], cur["x2"], cur["y2"])
+            j += 1
+        merged.append(cur)
+        i = j
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +504,150 @@ def _normalize_bbox(
     ]
 
 
+def _pair_form_layout(
+    labels: list[dict],
+    values: list[dict],
+    compiled_labels: list[tuple[re.Pattern, str]],
+    kvp: dict[str, Any],
+    kvp_bboxes: dict[str, dict[str, Any]],
+    paired_value_indices: set[int],
+) -> int:
+    """策略 D：表单布局配对（值在上，标签在下）。
+
+    识别「值填入格子、标签在格子下方」的布局（银行申请表等）。
+    对每个未配对标签，在其上方找 X 对齐、垂直最近的值框。
+
+    配对规则（对应设计文档 §4.3）：
+    1. 仅考虑 y 中心在标签上方的值框 (val.cy < lbl.cy)
+    2. X 方向需有足够重叠: _x_overlap_ratio > 0.3
+    3. 垂直距离 > 80px 的值框排除
+    4. 取垂直距离最近者
+
+    Args:
+        labels: 标签框列表（含 matched_label）。
+        values: 值框列表。
+        compiled_labels: 编译后的标签正则列表。
+        kvp: 结果字典（原地修改）。
+        kvp_bboxes: bbox 记录字典（原地修改）。
+        paired_value_indices: 已被占用的值框索引集合（原地修改）。
+
+    Returns:
+        成功配对的字段数。
+    """
+    paired = 0
+    for lbl in labels:
+        label_name = lbl["matched_label"]
+        if label_name in kvp:
+            continue
+
+        best_vi = -1
+        best_dist = float("inf")
+        for vi, val in enumerate(values):
+            if vi in paired_value_indices:
+                continue
+            # 值必须在标签上方
+            if val["cy"] >= lbl["cy"]:
+                continue
+            # X 方向需有足够重叠
+            if _x_overlap_ratio(lbl, val) <= 0.3:
+                continue
+            # 垂直距离超过 80px 排除
+            if lbl["cy"] - val["cy"] > 80:
+                continue
+            dist = _box_distance_v2(lbl, val, mode="value_above")
+            if dist < best_dist:
+                best_dist = dist
+                best_vi = vi
+
+        if best_vi < 0:
+            continue
+
+        val_text = values[best_vi]["text"]
+        if _is_label_modifier(val_text, compiled_labels):
+            continue
+        kvp[label_name] = val_text
+        kvp_bboxes[label_name] = {
+            "merged_bbox": _merge_bboxes(
+                _box_to_list(lbl), _box_to_list(values[best_vi])
+            )
+        }
+        paired_value_indices.add(best_vi)
+        paired += 1
+        logger.debug(f"表单布局配对(D): '{label_name}' ← '{val_text[:30]}'")
+    return paired
+
+
+def _pair_same_row(
+    labels: list[dict],
+    values: list[dict],
+    compiled_labels: list[tuple[re.Pattern, str]],
+    kvp: dict[str, Any],
+    kvp_bboxes: dict[str, dict[str, Any]],
+    paired_value_indices: set[int],
+) -> int:
+    """策略 E：同行左右配对（标签左，值右）。
+
+    识别同一水平行内「标签在左、值在右」的模式（如合同/表格行）。
+
+    配对规则（对应设计文档 §4.4）：
+    1. 仅考虑同水平行的值框 (|dy| < 10px)
+    2. 值在标签右侧 (lbl.cx < val.cx)
+    3. 水平距离 > 300px 排除
+    4. 取水平距离最近者
+
+    Args:
+        labels: 标签框列表（含 matched_label）。
+        values: 值框列表。
+        compiled_labels: 编译后的标签正则列表。
+        kvp: 结果字典（原地修改）。
+        kvp_bboxes: bbox 记录字典（原地修改）。
+        paired_value_indices: 已被占用的值框索引集合（原地修改）。
+
+    Returns:
+        成功配对的字段数。
+    """
+    paired = 0
+    for lbl in labels:
+        label_name = lbl["matched_label"]
+        if label_name in kvp:
+            continue
+
+        best_vi = -1
+        best_dx = float("inf")
+        for vi, val in enumerate(values):
+            if vi in paired_value_indices:
+                continue
+            # 同水平行（容差 10px）
+            if abs(lbl["cy"] - val["cy"]) >= 10:
+                continue
+            # 值在标签右侧
+            if val["cx"] <= lbl["cx"]:
+                continue
+            dx = val["cx"] - lbl["cx"]
+            if dx > 300:
+                continue
+            if dx < best_dx:
+                best_dx = dx
+                best_vi = vi
+
+        if best_vi < 0:
+            continue
+
+        val_text = values[best_vi]["text"]
+        if _is_label_modifier(val_text, compiled_labels):
+            continue
+        kvp[label_name] = val_text
+        kvp_bboxes[label_name] = {
+            "merged_bbox": _merge_bboxes(
+                _box_to_list(lbl), _box_to_list(values[best_vi])
+            )
+        }
+        paired_value_indices.add(best_vi)
+        paired += 1
+        logger.debug(f"同行左右配对(E): '{label_name}' ← '{val_text[:30]}'")
+    return paired
+
+
 def _pair_kvp(
     boxes: list[dict],
     compiled_labels: list[tuple[re.Pattern, str]],
@@ -421,8 +657,11 @@ def _pair_kvp(
     配对策略（按优先级）：
     A. "标签：值" 冒号分隔 → 直接解析
     B. "标签值" 无分隔符拼接 → 正则拆分
+    多行值聚合 → 合并 OCR 拆分的多行值框
     C0. 网格预拆分 → 宽值框按标签列边界比例拆分
     C. 空间最近邻配对 → 标签找最近的未匹配值
+    D. 表单布局配对 → 值在上、标签在下
+    E. 同行左右配对 → 标签左、值右
 
     同时记录每个字段的 bbox 信息（label_bbox + value_bbox），
     供下游 middle_json 生成独立 span。
@@ -487,6 +726,9 @@ def _pair_kvp(
             if not is_noise:
                 values.append(box)
 
+    # ---- 多行值聚合（在空间配对之前，合并 OCR 拆分的多行值框） ----
+    values = _merge_multiline_values(values)
+
     # ---- C0: 网格预拆分（在空间配对之前，防止合并值被错误抢走） ----
     # 检测宽值框跨越多个标签列，按列比例拆分为各字段的独立值
     _pre_split_grid_values(labels, values, kvp, kvp_bboxes)
@@ -544,6 +786,16 @@ def _pair_kvp(
             )
         }
         paired_value_indices.add(best_vi)
+
+    # ---- D: 表单布局配对（值在上，标签在下） ----
+    _pair_form_layout(
+        labels, values, compiled_labels, kvp, kvp_bboxes, paired_value_indices
+    )
+
+    # ---- E: 同行左右配对（标签左，值右） ----
+    _pair_same_row(
+        labels, values, compiled_labels, kvp, kvp_bboxes, paired_value_indices
+    )
 
     # 将 bbox 信息注入结果
     kvp["_kvp_bboxes"] = kvp_bboxes

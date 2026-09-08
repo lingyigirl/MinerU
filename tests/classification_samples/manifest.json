@@ -1,0 +1,11 @@
+{
+  "description": "S0/S1 分类器样本库 manifest。path 为仓库相对路径（PDF 位于 data/ 下，未纳入 git）；expected 为 DocType.value（form_kvp / structured_table / document_parse）。样本库作为分类准确率回归基准，新增样本时补充此文件。",
+  "samples": [
+    {"path": "data/定期存单_test.pdf", "expected": "form_kvp"},
+    {"path": "data/29491d71-736f-4779-88a4-0f47d7400e73/uploads/202305水费.pdf", "expected": "document_parse"},
+    {"path": "data/a3e0f6b7-bcbc-47c5-add7-7e5d0513bb68/uploads/202310水费.pdf", "expected": "document_parse"},
+    {"path": "data/6177c378-785a-46f9-8e9a-c4b0c09b94fc/uploads/杨逢春征信.pdf", "expected": "structured_table"},
+    {"path": "data/5884796f-a0a7-4f66-a1e9-5396b0e3ee2a/uploads/采购合同_腾飞集团(2).pdf", "expected": "document_parse"},
+    {"path": "data/6d527c41-c6f5-4a67-afeb-593ddc97c5bf/uploads/商铺租赁合同.pdf", "expected": "document_parse"}
+  ]
+}
