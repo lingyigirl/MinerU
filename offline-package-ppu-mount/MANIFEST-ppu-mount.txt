@@ -10,7 +10,8 @@
 | MANIFEST-ppu-mount.txt            | 本文件                            |
 | check_server_env.sh               | 服务器环境检查（先跑，看镜像版本）|
 | mineru-src-3.4.4.tar.gz           | 源码包（构建产物，gitignore）     |
-| compose-mount-ppu.yaml            | 启动配置（含源码挂载）            |
+| compose-mount-ppu.yaml            | 启动配置（含源码挂载；含可选模型挂载注释）|
+| mineru.json                      | 模型路径配置模板（可选，见 README 可选扩展）|
 | README-ppu-mount-build.md         | 打包源码教程（构建机专用，不随包分发）|
 | build-ppu-src.sh                  | 打包 fork 源码 tar.gz（构建机）   |
 

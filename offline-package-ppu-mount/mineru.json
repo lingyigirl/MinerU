@@ -1,0 +1,7 @@
+{
+    "_说明": "可选的外部模型路径配置模板。默认不需此文件：镜像已内置模型并自带 /root/mineru.json。只有用宿主机模型替换镜像内置模型时才需要挂载本文件到 /root/mineru.json，且必须同时把宿主机 modelscope 缓存目录挂到容器 /mnt/models（目录需含 OpenDataLab/ 嵌套结构）。models-dir 下是容器内路径，不是宿主机路径。",
+    "models-dir": {
+        "pipeline": "/mnt/models/OpenDataLab/PDF-Extract-Kit-1___0",
+        "vlm": "/mnt/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B"
+    }
+}
