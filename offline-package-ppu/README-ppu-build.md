@@ -20,6 +20,8 @@ docker build --network=host -t mineru:ppu-vllm-latest -f docker/china/ppu.Docker
 
 > 该步联网 `pip install 'mineru[core]>=3.0.0'`（解析到 3.4.4）+ `mineru-models-download` 下模型，耗时十几分钟~几十分钟。基础镜像重建过一次后，后续更新只需重跑步骤 2。
 
+> ⚠️ **OriCls 模型缺口已修复**：`docker/china/ppu.Dockerfile` 当前版本已在 `mineru-models-download` 后额外下载 `models/OriCls/*`（上游下载列表缺失该模型）。如果使用 2026-09-08 之前构建的旧基础镜像，OriCls 仍然缺失→部署人员见 `README-ppu-deploy.md` 的「遇到问题？」表。
+
 > ⚠️ **不能用服务器旧镜像做 FROM**（如 2 月 `mineru0210.tar`）：薄层 COPY 只换代码不换依赖，旧镜像缺 `pdftext`/`magika`/`mineru-vl-utils`，烤出来仍会 `import` 报错。
 
 ## 步骤 2：薄层 COPY fork 源码 + 导出 tar.gz

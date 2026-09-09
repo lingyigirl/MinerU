@@ -143,6 +143,33 @@ else
 fi
 
 # ============================================================
+# 5b. OriCls 模型检查（镜像内 + 宿主机模型包）
+# ============================================================
+ORCLS_REL="hub/models/OpenDataLab/PDF-Extract-Kit-1___0/models/OriCls/paddle_orientation_classification/PP-LCNet_x1_0_doc_ori.onnx"
+ORCLS_IN_IMG="/root/.cache/modelscope/${ORCLS_REL}"
+
+if docker image inspect "${BASE_IMAGE}" &> /dev/null; then
+    if docker run --rm "${BASE_IMAGE}" test -e "${ORCLS_IN_IMG}" 2>/dev/null; then
+        print_info "${BASE_IMAGE} 含 OriCls 模型"
+        check_pass "${BASE_IMAGE} 含 OriCls 模型（无需挂载模型包）"
+    else
+        print_info "${BASE_IMAGE} 缺 OriCls 模型"
+        check_warn "${BASE_IMAGE} 缺 OriCls 模型 → 需解压模型包并挂载（见 README 第二步/第四步）"
+        # 宿主机模型包是否已解压
+        FOUND_HOST=0
+        for MP in /data/mineru_models/${ORCLS_REL} /zhangbo/mineru_models/${ORCLS_REL}; do
+            if [ -f "${MP}" ]; then
+                check_pass "宿主机模型已就位: ${MP}"
+                FOUND_HOST=1
+            fi
+        done
+        if [ "${FOUND_HOST}" -eq 0 ]; then
+            check_warn "未发现宿主机模型包解压结果（请确认已执行 README 第二步）"
+        fi
+    fi
+fi
+
+# ============================================================
 # 6. 数据 / 输出路径
 # ============================================================
 print_header "6. 数据 / 输出路径"

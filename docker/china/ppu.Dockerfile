@@ -26,5 +26,15 @@ RUN python3 -m pip install -U pip -i https://mirrors.aliyun.com/pypi/simple && \
 # Download models and update the configuration file
 RUN /bin/bash -c "mineru-models-download -s modelscope -m all"
 
+# 补齐 OriCls 模型（上游 mineru-models-download -m all 列表缺失该模型，
+# 详见 mineru/cli/models_download.py:68-76 model_paths 列表）
+RUN python3 -c "
+from modelscope import snapshot_download
+snapshot_download(
+    'OpenDataLab/PDF-Extract-Kit-1.0',
+    allow_patterns=['models/OriCls/*', 'models/OriCls/*/*'],
+)
+"
+
 # Set the entry point to activate the virtual environment and run the command line tool
 ENTRYPOINT ["/bin/bash", "-c", "export MINERU_MODEL_SOURCE=local && exec \"$@\"", "--"]

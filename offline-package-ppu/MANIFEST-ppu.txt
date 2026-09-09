@@ -14,9 +14,10 @@
 | README-ppu-build.md               | 构建教程（构建机专用，不随包分发）|
 | ppu-fork.Dockerfile               | 烤代码 Dockerfile（构建机）       |
 | build-ppu-fork.sh                 | 构建 + 导出镜像 tar.gz（构建机）  |
+| docker/china/ppu.Dockerfile        | 基础镜像构建文件（构建机，含 OriCls 补下载）|
 
-【分发说明】部署人员只需要前 5 项；README-ppu-build.md / ppu-fork.Dockerfile /
-build-ppu-fork.sh 是构建机专用，不随包分发到服务器。
+【分发说明】部署人员只需要前 5 项；README-ppu-build.md / ppu-fork.Dockerfile / build-ppu-fork.sh /
+docker/china/ppu.Dockerfile 是构建机专用，不随包分发到服务器。
 
 【注意】mineru-ppu-fork-3.4.4.tar.gz 是构建产物，已被 .gitignore 忽略、
 不进 git；由构建机执行 build-ppu-fork.sh 生成（先重建基础镜像，见

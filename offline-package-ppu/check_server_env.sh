@@ -143,6 +143,23 @@ else
 fi
 
 # ============================================================
+# 5b. 镜像内 OriCls 模型（部署前确认，缺了解析会报错）
+# ============================================================
+ORCLS_PATH="/root/.cache/modelscope/hub/models/OpenDataLab/PDF-Extract-Kit-1___0/models/OriCls/paddle_orientation_classification/PP-LCNet_x1_0_doc_ori.onnx"
+
+for IMG in "${BASE_IMAGE}" "mineru:ppu-fork-3.4.4"; do
+    if docker image inspect "${IMG}" &> /dev/null; then
+        if docker run --rm "${IMG}" test -e "${ORCLS_PATH}" 2>/dev/null; then
+            print_info "${IMG} 含 OriCls 模型"
+            check_pass "${IMG} 含 OriCls 模型（方向分类模型齐全）"
+        else
+            print_info "${IMG} 缺 OriCls 模型"
+            check_warn "${IMG} 缺 OriCls 模型（2026-09-08 前构建的旧镜像；补齐见 README-ppu-deploy.md「镜像缺 OriCls 怎么办」）"
+        fi
+    fi
+done
+
+# ============================================================
 # 6. 数据 / 输出路径
 # ============================================================
 print_header "6. 数据 / 输出路径"
