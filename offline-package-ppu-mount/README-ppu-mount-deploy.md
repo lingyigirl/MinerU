@@ -4,15 +4,22 @@
 > **预计耗时**：10-15 分钟
 > **前提**：服务器基础镜像 `mineru:ppu-vllm-latest` 内 mineru **已是 3.4.4**；已收到物料包
 
+**两种部署方式**：本项目提供两套部署方案，由构建人员按需选择，部署人员按收到的物料包对号入座即可：
+
+| 方式                       | 目录                           | 做法                                                           | 物料特征                      |
+| -------------------------- | ------------------------------ | -------------------------------------------------------------- | ----------------------------- |
+| **方式 B（本文件）** | `offline-package-ppu-mount/` | 源码从宿主机挂载进容器（替换镜像内代码）。镜像不动，只替换代码 | 有`mineru-src-3.4.4.tar.gz` |
+| 方式 A                     | `offline-package-ppu/`       | 把源码烤进镜像，重打一个新镜像。镜像自带代码和模型，开箱即用   | 无 tar.gz，有新的镜像 TAG     |
+
 ---
 
 ## 术语速查（T-Head / alixpu / ppu-smi 是同一个硬件）
 
-| 名字 | 含义 |
-|---|---|
-| T-Head（平头哥） | 阿里芯片子公司，这块 PPU 卡的厂商 / 平台名 |
-| `/dev/alixpu` | 这块卡在 Linux 下的设备节点名（ali=阿里，xpu=加速器） |
-| `ppu-smi` | T-Head 平台的加速卡状态查看工具（对应 `nvidia-smi`） |
+| 名字             | 含义                                                  |
+| ---------------- | ----------------------------------------------------- |
+| T-Head（平头哥） | 阿里芯片子公司，这块 PPU 卡的厂商 / 平台名            |
+| `/dev/alixpu`  | 这块卡在 Linux 下的设备节点名（ali=阿里，xpu=加速器） |
+| `ppu-smi`      | T-Head 平台的加速卡状态查看工具（对应`nvidia-smi`） |
 
 **指定卡 vs 查看卡**：`ppu-smi` 只**查看**卡状态 / 哪张空闲；`CUDA_VISIBLE_DEVICES` **指定**用哪张卡（PPU 走 CUDA 模拟层）。流程：先 `ppu-smi` 看空闲卡号 → 填进 compose 的 `CUDA_VISIBLE_DEVICES`。
 
@@ -70,24 +77,30 @@ fi
 
 ---
 
-## 第三步：确认挂载目标路径
+## 第三步：确认源码挂载的目标路径
+
+容器内 mineru 包安装路径即源码挂载的"右半边"：
 
 ```bash
 docker run --rm mineru:ppu-vllm-latest python3 -c "import mineru; print(mineru.__file__)"
-# 一般输出 .../dist-packages/mineru/__init__.py，父目录即挂载目标
+# 输出 /usr/local/lib/python3.12/dist-packages/mineru/__init__.py
+# 父目录 /usr/local/lib/python3.12/dist-packages/ 即源码挂载的容器侧路径
 ```
+
+> 模型挂载的容器侧路径是固定的 `/root/.cache/modelscope`（镜像内置 mineru.json 已指向），不需要确认。
 
 ---
 
 ## 第四步：改 compose-mount-ppu.yaml（3~4 处）
 
 1. `CUDA_VISIBLE_DEVICES` → 卡号（`ppu-smi` 看）
-2. 源码挂载左半边 → 与第二步解压路径一致（默认 `/data/mineru-src/mineru`）
+2. 源码挂载（宿主机侧路径）→ 与第二步源码解压路径一致（默认 `/data/mineru-src/mineru`）
 3. `/mnt`、`/datapool` → 服务器实际路径
-4. **如果同时解压了模型包**，在 volumes 段取消注释模型挂载行，改宿主机路径：
+4. 模型挂载（宿主机侧路径）→ **如果第二步解压了模型包**，在 volumes 段取消注释模型挂载行，改宿主机路径：
    ```yaml
    - /data/mineru_models:/root/.cache/modelscope
    ```
+
    镜像内置 mineru.json 已指向 `/root/.cache/modelscope/hub/models/...`，
    挂载后路径天然匹配，不需额外覆盖 mineru.json。
 
@@ -136,9 +149,9 @@ fork 的表格/发票后处理（`mineru/utils/custom/table_utils.py`、`title_u
 
 ## 常见问题
 
-| 现象 | 原因 | 解决 |
-|---|---|---|
-| 改的代码没生效 | 源码路径没挂对 / 没 restart | 确认挂载路径 = `import mineru` 输出父目录，`restart` |
-| 卡不可用 | 设备未透传 / 卡号错 | 确认 `/dev/alixpu` 存在，`ppu-smi` 看卡号 |
-| 报 `vllm` 找不到 | 用了 NVIDIA 镜像 | 确认 image 是 `mineru:ppu-vllm-latest` |
-| ModuleNotFoundError | 新文件没同步 | 重新解压源码包（`tar xzf` 会覆盖） |
+| 现象                | 原因                        | 解决                                                    |
+| ------------------- | --------------------------- | ------------------------------------------------------- |
+| 改的代码没生效      | 源码路径没挂对 / 没 restart | 确认挂载路径 =`import mineru` 输出父目录，`restart` |
+| 卡不可用            | 设备未透传 / 卡号错         | 确认`/dev/alixpu` 存在，`ppu-smi` 看卡号            |
+| 报`vllm` 找不到   | 用了 NVIDIA 镜像            | 确认 image 是`mineru:ppu-vllm-latest`                 |
+| ModuleNotFoundError | 新文件没同步                | 重新解压源码包（`tar xzf` 会覆盖）                    |
