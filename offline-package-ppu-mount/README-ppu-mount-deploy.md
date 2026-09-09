@@ -21,12 +21,16 @@
 ## 你的物料包里有什么
 
 ```
-mineru-src-3.4.4.tar.gz       ← 源码包（解压后挂载）
-compose-mount-ppu.yaml        ← 启动配置（含源码挂载）
-check_server_env.sh           ← 环境检查脚本
-README-ppu-mount-deploy.md    ← 本文件
-MANIFEST-ppu-mount.txt        ← 物料清单
+mineru-src-3.4.4.tar.gz         ← 源码包（解压后挂载）
+mineru-models-3.4.4.tar.gz     ← 模型缓存包（如有则需挂载，补全镜像欠缺的模型）
+mineru.json                    ← 模型路径配置模板（仅自定义路径时用）
+compose-mount-ppu.yaml         ← 启动配置（含源码挂载 + 模型挂载注释）
+check_server_env.sh            ← 环境检查脚本
+README-ppu-mount-deploy.md     ← 本文件
+MANIFEST-ppu-mount.txt         ← 物料清单
 ```
+
+构建人员给你的物料中若包含 `mineru-models-3.4.4.tar.gz`，说明镜像内置模型不完整（如缺少 `OriCls` 朝向分类模型），部署时需**额外解压模型包并取消 compose 中模型挂载注释**。
 
 > 方式 A（烤代码进镜像）见 `../offline-package-ppu/README-ppu-deploy.md`。
 
@@ -50,12 +54,18 @@ bash check_server_env.sh
 
 ---
 
-## 第二步：解压源码
+## 第二步：解压源码 + 模型包（如有）
 
 ```bash
+# 解压源码
 mkdir -p /data/mineru-src
 tar xzf /data/mineru-src-3.4.4.tar.gz -C /data/mineru-src
-# 得到 /data/mineru-src/mineru/，正好是 compose 挂载源
+
+# 如果有模型包，一并解压（补全镜像缺少的模型，如 OriCls）
+if [ -f /data/mineru-models-3.4.4.tar.gz ]; then
+    tar xzf /data/mineru-models-3.4.4.tar.gz -C /data
+    # 得到 /data/mineru_models/（hub/models/OpenDataLab/... 结构）
+fi
 ```
 
 ---
@@ -69,44 +79,21 @@ docker run --rm mineru:ppu-vllm-latest python3 -c "import mineru; print(mineru._
 
 ---
 
-## 第四步：改 compose-mount-ppu.yaml（3 处）
+## 第四步：改 compose-mount-ppu.yaml（3~4 处）
 
 1. `CUDA_VISIBLE_DEVICES` → 卡号（`ppu-smi` 看）
 2. 源码挂载左半边 → 与第二步解压路径一致（默认 `/data/mineru-src/mineru`）
 3. `/mnt`、`/datapool` → 服务器实际路径
+4. **如果同时解压了模型包**，在 volumes 段取消注释模型挂载行，改宿主机路径：
+   ```yaml
+   - /data/mineru_models:/root/.cache/modelscope
+   ```
+   镜像内置 mineru.json 已指向 `/root/.cache/modelscope/hub/models/...`，
+   挂载后路径天然匹配，不需额外覆盖 mineru.json。
 
 ---
 
-## 可选扩展：挂载外部模型（替换镜像内置模型）
-
-**默认不需要做这一步**：基础镜像 `mineru:ppu-vllm-latest` 构建时已把模型打包进镜像，开箱即用。
-
-**场景**：镜像内置模型不完整/版本旧，需用宿主机模型覆盖。例如镜像构建时 `mineru-models-download` 下载列表缺少 `OriCls`（朝向分类模型），但宿主机上的 modelscope 缓存是全量的（含 OriCls）——这时挂载宿主机模型即可补全，无需重建镜像。
-
-### 使用物料包中的模型包
-
-本目录提供了 `mineru-models-3.4.4.tar.gz`，解压到服务器后挂载即可：
-
-```bash
-# 在服务器上解压模型包
-tar xzf /data/mineru-models-3.4.4.tar.gz -C /data
-# 得到 /data/mineru_models/（含 hub/models/OpenDataLab/...）
-```
-
-在 `compose-mount-ppu.yaml` 的 `volumes` 段取消下面两行注释，改宿主机路径：
-
-```yaml
-      - /data/mineru_models:/root/.cache/modelscope
-      ## 注：mineru.json 可省——镜像内置 mineru.json 已指向
-      ## /root/.cache/modelscope/hub/models/OpenDataLab/...，
-      ## 挂载后路径天然匹配。如需自定义路径再覆盖 /root/mineru.json。
-```
-
-> 宿主机目录结构必须保持 Modelscope hub 格式：`hub/models/OpenDataLab/PDF-Extract-Kit-1___0/...`，和本包一致。挂载后镜像内置模型被宿主机同路径覆盖。
-
----
-
-## 第五步：启动## 第五步：启动
+## 第五步：启动
 
 ```bash
 mkdir -p /datapool/mineru_output
