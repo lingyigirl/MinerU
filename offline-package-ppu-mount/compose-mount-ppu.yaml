@@ -56,12 +56,20 @@ services:
       - /data/mineru-src/mineru:/usr/local/lib/python3.12/dist-packages/mineru
       # ---- 外部模型挂载（可选）----
       # 默认：不挂载，用镜像内置模型（推荐，镜像构建时已打包模型并写好 /root/mineru.json）
-      # 启用外部模型：取消下面两行注释，并把宿主机路径改成实际路径
-      #   - /宿主机/modelscope模型缓存:/mnt/models
+      #
+      # 场景：镜像内置模型不完整 / 想用宿主机模型替换镜像内置。
+      # 例：镜像构建时 mineru-models-download 下载列表缺少 OriCls 模型，
+      #     需用宿主机模型补全 → 取消下面两行注释：
+      #   - /宿主机/modelscope模型缓存:/root/.cache/modelscope
       #   - /宿主机/mineru.json:/root/mineru.json
-      # 注意：model-dir 是容器内路径；宿主机目录需保持 Modelscope hub 嵌套结构
-      # （/mnt/models/OpenDataLab/PDF-Extract-Kit-1___0 和 .../MinerU2___5-Pro-2605-1___2B），
-      # mineru.json 模板见本目录 mineru.json
+      #
+      # 注意：
+      #  - 宿主机目录需保持 Modelscope hub 嵌套结构：hub/models/OpenDataLab/...
+      #  - /root/.cache/modelscope 是镜像内置模型路径 + 镜像内置 mineru.json 指向的位置：
+      #      /root/.cache/modelscope/hub/models/OpenDataLab/PDF-Extract-Kit-1___0/  (pipeline)
+      #      /root/.cache/modelscope/hub/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B/ (vlm)
+      #  - 挂载后镜像内置模型被宿主机同路径模型覆盖；mineru.json 可省（镜像内置已指向该路径），
+      #    也可以额外挂载本目录的 mineru.json 模板自定义路径（如 /mnt/models/...）
     command:
       mineru-api
       --host 0.0.0.0

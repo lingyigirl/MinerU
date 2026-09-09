@@ -79,27 +79,34 @@ docker run --rm mineru:ppu-vllm-latest python3 -c "import mineru; print(mineru._
 
 ## 可选扩展：挂载外部模型（替换镜像内置模型）
 
-**默认不需要做这一步**：基础镜像 `mineru:ppu-vllm-latest` 构建时已把模型打包进镜像，并写好镜像内 `/root/mineru.json`，开箱即用。
+**默认不需要做这一步**：基础镜像 `mineru:ppu-vllm-latest` 构建时已把模型打包进镜像，开箱即用。
 
-只有你想**用宿主机上的模型替换镜像内置模型**时才需要：
+**场景**：镜像内置模型不完整/版本旧，需用宿主机模型覆盖。例如镜像构建时 `mineru-models-download` 下载列表缺少 `OriCls`（朝向分类模型），但宿主机上的 modelscope 缓存是全量的（含 OriCls）——这时挂载宿主机模型即可补全，无需重建镜像。
 
-1. 把宿主机 modelscope 模型缓存目录放到服务器（需保持 Modelscope hub 嵌套结构）：
-   ```
-   <宿主机缓存目录>/OpenDataLab/PDF-Extract-Kit-1___0/...
-   <宿主机缓存目录>/OpenDataLab/MinerU2___5-Pro-2605-1___2B/...
-   ```
-2. 在 `compose-mount-ppu.yaml` 的 `volumes` 段取消注释这两行，并把宿主机路径改成实际路径：
-   ```yaml
-   - /宿主机/modelscope模型缓存:/mnt/models
-   - /宿主机/mineru.json:/root/mineru.json
-   ```
-3. 第二个挂载的 `/root/mineru.json` 可直接使用本物料包里的 `mineru.json` 模板（已写清 `/mnt/models` 下的路径）。
+### 使用物料包中的模型包
 
-> ⚠️ 提醒：`mineru.json` 的 `models-dir` 是**容器内路径**（本项目模板指向 `/mnt/models/...`），不是宿主机路径；宿主机目录结构必须与上述嵌套一致，否则加载不到模型。
+本目录提供了 `mineru-models-3.4.4.tar.gz`，解压到服务器后挂载即可：
+
+```bash
+# 在服务器上解压模型包
+tar xzf /data/mineru-models-3.4.4.tar.gz -C /data
+# 得到 /data/mineru_models/（含 hub/models/OpenDataLab/...）
+```
+
+在 `compose-mount-ppu.yaml` 的 `volumes` 段取消下面两行注释，改宿主机路径：
+
+```yaml
+      - /data/mineru_models:/root/.cache/modelscope
+      ## 注：mineru.json 可省——镜像内置 mineru.json 已指向
+      ## /root/.cache/modelscope/hub/models/OpenDataLab/...，
+      ## 挂载后路径天然匹配。如需自定义路径再覆盖 /root/mineru.json。
+```
+
+> 宿主机目录结构必须保持 Modelscope hub 格式：`hub/models/OpenDataLab/PDF-Extract-Kit-1___0/...`，和本包一致。挂载后镜像内置模型被宿主机同路径覆盖。
 
 ---
 
-## 第五步：启动
+## 第五步：启动## 第五步：启动
 
 ```bash
 mkdir -p /datapool/mineru_output
