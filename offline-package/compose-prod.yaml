@@ -1,12 +1,11 @@
 # ============================================================
-# MinerU 3.4.4 生产环境 Docker Compose 配置模板
+# MinerU 3.4.4 生产环境 Docker Compose 配置
+# 方式 A — 自包含镜像（模型烤入镜像，无需挂载模型）
 #
 # 使用前修改:
 #   1. device_ids — 你的 GPU 编号
 #   2. ports — 映射端口
-#   3. mineru.json 路径 — 配置文件的宿主机路径
-#   4. 模型路径 — 与 mineru.json 中的 models-dir 一致
-#   5. 输出目录 — 解析结果存放位置
+#   3. 输出目录 — 解析结果存放位置
 #
 # 启动: docker compose -f compose-prod.yaml up -d
 # 停止: docker compose -f compose-prod.yaml down
@@ -39,12 +38,12 @@ services:
 
     entrypoint: mineru-api
     volumes:
-      # ---- 配置文件（只读） ----
-      - /root/mineru.json:/root/mineru.json:ro
-      # ---- 模型文件（只读，路径与 mineru.json 中 models-dir 一致） ----
-      - /data/mineru_models:/data/mineru_models:ro
-      # ---- 输出目录 ----
+      # ---- 输出目录（挂载宿主机目录，持久化解析结果） ----
       - /data/mineru_output:/vllm-workspace/output
+      # ---- 如需覆盖镜像内的 mineru.json（如配置 S3 桶、LLM 等），取消下行注释 ----
+      # - /root/mineru.json:/root/mineru.json:ro
+      # 注意：镜像内已含 /root/mineru.json（models-dir 指向 /data/mineru_models/），
+      #       覆盖时需要确保 models-dir 路径正确
     command:
       --host 0.0.0.0
       --port 8000

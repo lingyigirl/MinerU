@@ -8,11 +8,11 @@
 
 ## 术语速查（T-Head / alixpu / ppu-smi 是同一个硬件）
 
-| 名字 | 含义 |
-|---|---|
-| T-Head（平头哥） | 阿里芯片子公司，这块 PPU 卡的厂商 / 平台名 |
-| `/dev/alixpu` | 这块卡在 Linux 下的设备节点名（ali=阿里，xpu=加速器） |
-| `ppu-smi` | T-Head 平台的加速卡状态查看工具（对应 `nvidia-smi`） |
+| 名字             | 含义                                                  |
+| ---------------- | ----------------------------------------------------- |
+| T-Head（平头哥） | 阿里芯片子公司，这块 PPU 卡的厂商 / 平台名            |
+| `/dev/alixpu`  | 这块卡在 Linux 下的设备节点名（ali=阿里，xpu=加速器） |
+| `ppu-smi`      | T-Head 平台的加速卡状态查看工具（对应`nvidia-smi`） |
 
 **指定卡 vs 查看卡（别搞混）**：
 
@@ -87,43 +87,30 @@ curl -X POST http://localhost:8000/file_parse \
   -o /tmp/test.zip
 ```
 
-> ⚠️ **端口待确认**：旧文档 V2.txt 验证用 `172.19.0.3:8009`，本 compose 是 `--port 8000` + host 网络。到服务器确认实际监听端口：`ss -tlnp | grep 800`。
-
----
-
-## 更新代码（收到新镜像包后）
-
-构建人员改完代码会重打镜像，给你一个新的 `mineru-ppu-fork-3.4.4.tar.gz`，你重新 load + 重建容器即可：
-
-```bash
-docker load -i /data/mineru-ppu-fork-3.4.4.tar.gz
-docker compose -f /data/compose-ppu.yaml up -d --force-recreate
-curl http://localhost:8000/health
-```
-
 ---
 
 ## 常用运维命令
 
-| 操作 | 命令 |
-|------|------|
-| 查看状态 | `docker compose -f compose-ppu.yaml ps` |
+| 操作     | 命令                                                   |
+| -------- | ------------------------------------------------------ |
+| 启动服务 | `docker compose -f compose-ppu.yaml up -d`           |
+| 查看状态 | `docker compose -f compose-ppu.yaml ps`              |
 | 查看日志 | `docker compose -f compose-ppu.yaml logs --tail 100` |
-| 重启服务 | `docker compose -f compose-ppu.yaml restart` |
-| 停止服务 | `docker compose -f compose-ppu.yaml down` |
+| 重启服务 | `docker compose -f compose-ppu.yaml restart`         |
+| 停止服务 | `docker compose -f compose-ppu.yaml down`            |
 
 ---
 
 ## 遇到问题？
 
-| 现象 | 可能原因 | 解决 |
-|------|---------|------|
-| 卡不可用 | 设备未透传 / 卡号错 | 确认 `/dev/alixpu` 存在，`ppu-smi` 看卡号（再填进 `CUDA_VISIBLE_DEVICES`） |
-| 健康检查失败 | 模型还在加载 | 再等 1-2 分钟 |
-| 端口被占用 | 其他服务用了 8000 | 改 compose 里的 `--port` / 确认监听端口 |
-| 解析结果为空 | PDF 损坏或有密码 | 换一个正常 PDF 测试 |
-| 解析报缺 OriCls 模型 | 镜像构建时下载列表漏了该模型（2026-09-08 前构建的旧镜像） | 见下「镜像缺 OriCls 怎么办」 |
-| 收到新代码不知道怎么更新 | 构建在构建机完成 | 见上面「更新代码」；构建细节见构建机上的 `README-ppu-build.md` |
+| 现象                     | 可能原因                                                  | 解决                                                                            |
+| ------------------------ | --------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| 卡不可用                 | 设备未透传 / 卡号错                                       | 确认`/dev/alixpu` 存在，`ppu-smi` 看卡号（再填进 `CUDA_VISIBLE_DEVICES`） |
+| 健康检查失败             | 模型还在加载                                              | 再等 1-2 分钟                                                                   |
+| 端口被占用               | 其他服务用了 8000                                         | 改 compose 里的`--port` / 确认监听端口                                        |
+| 解析结果为空             | PDF 损坏或有密码                                          | 换一个正常 PDF 测试                                                             |
+| 解析报缺 OriCls 模型     | 镜像构建时下载列表漏了该模型（2026-09-08 前构建的旧镜像） | 见下「镜像缺 OriCls 怎么办」                                                    |
+| 收到新代码不知道怎么更新 | 构建在构建机完成                                          | 见上面「更新代码」；构建细节见构建机上的`README-ppu-build.md`                 |
 
 ### 镜像缺 OriCls 怎么办（2026-09-08 前构建的旧镜像）
 

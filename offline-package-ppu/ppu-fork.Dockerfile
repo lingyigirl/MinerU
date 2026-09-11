@@ -17,6 +17,12 @@
 
 FROM mineru:ppu-vllm-latest
 
+# 0. 补 OriCls 模型（基础镜像 2026-09-08 前构建时下载列表漏了该模型，
+#    见 docker/china/ppu.Dockerfile:29-37 的修复说明。此处从本地模型文件补齐，
+#    避免依赖 mineru-models-download）。
+COPY offline-package-ppu/oricls/ \
+     /root/.cache/modelscope/models/OpenDataLab--PDF-Extract-Kit-1.0/snapshots/master/models/OriCls/
+
 # 薄层 COPY：只覆盖已安装的上游 mineru 源码，不动依赖。
 # 目标路径用运行时解析（避免猜 site-packages / dist-packages），
 # 保留基础镜像的 .dist-info 与 mineru-api 等 entry point 不变。

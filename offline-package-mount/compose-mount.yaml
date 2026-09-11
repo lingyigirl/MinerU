@@ -50,9 +50,9 @@ services:
       # ---- 输出目录 ----
       - /data/mineru_output:/vllm-workspace/output
       # ---- 源码挂载（关键：覆盖镜像内安装的 mineru 包） ----
-      # 宿主机源码路径需与 pip 安装位置一致：
-      #   /usr/local/lib/python3.12/dist-packages/mineru
-      - /data/mineru-src/mineru:/usr/local/lib/python3.12/dist-packages/mineru
+      # 镜像使用 pip install -e .[core]（可编辑安装），import 实际读取：
+      #   /opt/mineru/mineru
+      - /data/mineru-src/mineru:/opt/mineru/mineru
     command:
       --host 0.0.0.0
       --port 8000

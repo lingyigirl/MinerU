@@ -9,11 +9,11 @@
 
 ## 什么时候用这份文档
 
-| 你的情况 | 用哪个文档 |
-|---|---|
-| 方式 A 的 fork 镜像 `mineru:ppu-fork-3.4.4` 已 `docker load`，但解析报**缺 OriCls** / 方向判断异常 | ✅ **用本文档** |
-| 基础镜像 `mineru:ppu-vllm-latest` 已重建（2026-09-08 后），OriCls 齐全 | 用 `offline-package-ppu/README-ppu-deploy.md`（方式 A 正常流程） |
-| 没有 fork 镜像，但有 `mineru:ppu-vllm-latest` 基础镜像 + 源码包 | 用 `README-ppu-mount-deploy.md`（方式 B 正常流程） |
+| 你的情况                                                                                                    | 用哪个文档                                                        |
+| ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| 方式 A 的 fork 镜像`mineru:ppu-fork-3.4.4` 已 `docker load`，但解析报**缺 OriCls** / 方向判断异常 | ✅**用本文档**                                              |
+| 基础镜像`mineru:ppu-vllm-latest` 已重建（2026-09-08 后），OriCls 齐全                                     | 用`offline-package-ppu/README-ppu-deploy.md`（方式 A 正常流程） |
+| 没有 fork 镜像，但有`mineru:ppu-vllm-latest` 基础镜像 + 源码包                                            | 用`README-ppu-mount-deploy.md`（方式 B 正常流程）               |
 
 ---
 
@@ -39,20 +39,10 @@ ls mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0/models/
 # 若输出列表中没有 OriCls/，则确认为缺失
 
 # 3. 把 OriCls 合并到原有的 mineru_models
-# 方式一（联网直接下到缓存对应位置）：
-python3 -c "
-from modelscope import snapshot_download
-snapshot_download(
-    'OpenDataLab/PDF-Extract-Kit-1.0',
-    cache_dir='./mineru_models/hub',
-    allow_patterns=['models/OriCls/*', 'models/OriCls/*/*'],
-)
-"
-#   该命令会落到 mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0/models/OriCls/...
-
-# 方式二（从别的机器/已补齐的缓存拷过来，离线场景用）：
-# cp -r /path/to/OriCls \
-#   mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0/models/OriCls
+# 从当前模型物料包（/zhangbo/mineru_models，已含 OriCls）复制到解压出的旧目录
+# 若源路径不同，替换为实际的 OriCls 所在路径
+cp -r /offline-package-ppu-mount/OriCls \
+  mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0/models/OriCls
 
 # 4. 确认 OriCls 已合并到位
 ls mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0/models/OriCls/paddle_orientation_classification/
@@ -66,11 +56,13 @@ ls -lh mineru-models-3.4.4.tar.gz
 ```
 
 > **保持 Modelscope 嵌套结构**：模型包内目录必须是
+>
 > ```
 > mineru_models/hub/models/OpenDataLab/PDF-Extract-Kit-1___0/models/
 >   ├── OriCls/   ← 本题补齐
 >   ├── Layout/  OCR/  MFR/  TabCls/  TabRec/
 > ```
+>
 > 与镜像内置 `mineru.json` 的 `models-dir` 指向天然匹配，挂载后无需额外配置。
 
 ---
@@ -187,13 +179,13 @@ docker exec -it mineru-ppu \
 
 ## 常见问题
 
-| 现象 | 原因 | 解决 |
-|---|---|---|
-| 仍报 OriCls 找不到 | 挂载路径不匹配 / 没生效 | 用上面 `docker exec` 命令看容器内路径；对照宿主机 `/data/mineru_models/hub/...` 结构是否一致，然后 `docker compose restart` |
-| 卡不可用 | 设备未透传 / 卡号错 | 确认 `/dev/alixpu` 存在，`ppu-smi` 看卡号，填进 `CUDA_VISIBLE_DEVICES` |
-| 健康检查失败 | 模型还在加载 | 再等 1-2 分钟 |
-| 端口被占用 | 其他服务用了 8000 | 改 `compose-ppu.yaml` 的 `--port` |
-| 解析结果为空 | PDF 损坏或有密码 | 换正常 PDF 测试 |
+| 现象               | 原因                    | 解决                                                                                                                             |
+| ------------------ | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| 仍报 OriCls 找不到 | 挂载路径不匹配 / 没生效 | 用上面`docker exec` 命令看容器内路径；对照宿主机 `/data/mineru_models/hub/...` 结构是否一致，然后 `docker compose restart` |
+| 卡不可用           | 设备未透传 / 卡号错     | 确认`/dev/alixpu` 存在，`ppu-smi` 看卡号，填进 `CUDA_VISIBLE_DEVICES`                                                      |
+| 健康检查失败       | 模型还在加载            | 再等 1-2 分钟                                                                                                                    |
+| 端口被占用         | 其他服务用了 8000       | 改`compose-ppu.yaml` 的 `--port`                                                                                             |
+| 解析结果为空       | PDF 损坏或有密码        | 换正常 PDF 测试                                                                                                                  |
 
 ---
 

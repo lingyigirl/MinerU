@@ -97,6 +97,7 @@ docker run --rm mineru:ppu-vllm-latest python3 -c "import mineru; print(mineru._
 2. 源码挂载（宿主机侧路径）→ 与第二步源码解压路径一致（默认 `/data/mineru-src/mineru`）
 3. `/mnt`、`/datapool` → 服务器实际路径
 4. 模型挂载（宿主机侧路径）→ **如果第二步解压了模型包**，在 volumes 段取消注释模型挂载行，改宿主机路径：
+
    ```yaml
    - /data/mineru_models:/root/.cache/modelscope
    ```

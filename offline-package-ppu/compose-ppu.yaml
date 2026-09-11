@@ -31,6 +31,10 @@ services:
     environment:
       MINERU_MODEL_SOURCE: local
       MINERU_BACKEND: vlm-vllm-async-engine   # PPU 上 vLLM 异步引擎
+      # 强制 vLLM 使用 V1 引擎：mineru 异步后端硬 import vllm.v1 的 AsyncLLM，
+      # 若不显式设为 1，vLLM 会自动回退 V0 并报
+      # "Using V1 AsyncLLMEngine, but envs.VLLM_USE_V1=False"
+      VLLM_USE_V1: "1"
       CUDA_VISIBLE_DEVICES: "0"              # ← 指定 PPU 卡号（ppu-smi 查看）
       MINERU_API_OUTPUT_ROOT: /datapool/mineru_output   # 输出落到已挂载的 /datapool 下（持久化）
       MINERU_LOG_FILE_ENABLE: "false"

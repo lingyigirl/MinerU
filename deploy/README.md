@@ -24,18 +24,19 @@
 
 | 包 | 构建教程 | 脚本 |
 |----|---------|------|
-| NVIDIA 方式 A | `build-offline-package.sh` 内注释 | [build-offline-package.sh](build-offline-package.sh) |
+| NVIDIA 方式 A | `build-offline-package.sh`（旧，依赖上游）或 `offline-package/README-nvidia-build.md`（新，本地 fork 代码 + 本地模型） | `offline-package/build-nvidia.sh` + `offline-package/nvidia-fork.Dockerfile` |
 | NVIDIA 方式 B | [offline-package-mount/README-mount-build.md](../offline-package-mount/README-mount-build.md) | `build-mount-src.sh` |
-| PPU 方式 A | [offline-package-ppu/README-ppu-build.md](../offline-package-ppu/README-ppu-build.md) | `build-ppu-fork.sh` |
+| PPU 方式 A | [offline-package-ppu/README-ppu-build.md](../offline-package-ppu/README-ppu-build.md) | `build-ppu-fork.sh` + `offline-package-ppu/ppu-fork.Dockerfile` |
 | PPU 方式 B | [offline-package-ppu-mount/README-ppu-mount-build.md](../offline-package-ppu-mount/README-ppu-mount-build.md) | `build-ppu-src.sh` |
 
 ## 方式 A vs 方式 B 选型
 
-| | 方式 A（烤代码进镜像） | 方式 B（源码挂载） |
+| | 方式 A（烤代码+模型进镜像） | 方式 B（源码挂载） |
 |---|---|---|
 | 代码怎么进容器 | 打进镜像 | 挂载宿主机源码目录 |
+| 模型怎么进容器 | 打进镜像（NVIDIA 通过 --build-context，PPU 预装在基础镜像） | 运行时挂载宿主机模型目录 |
 | 改代码后 | 重打镜像 + `docker load` + 重建容器 | 换源码 + `restart` |
-| 交付物 | 40GB 镜像 tar.gz（自包含） | 几 MB 源码包（依赖基础镜像已在） |
+| 交付物 | 30-40GB 镜像 tar.gz（自包含，含模型） | 几 MB 源码包（依赖基础镜像 + 模型已在服务器） |
 | 适合 | 稳定交付 / 首次部署 | 频繁更新（跟踪 develop） |
 
-> **NVIDIA vs PPU 差异**：PPU 把模型**烤进镜像**（43GB，自包含）；NVIDIA 模型单独一个 tar.gz（约 4GB）运行时挂载。
+> **NVIDIA vs PPU 差异**：两种加速卡的方式 A 都是自包含镜像（开箱即用）。PPU 模型预装在基础镜像中（43GB），nvidia-fork.Dockerfile 通过 `--build-context` 在构建时拷贝本地模型（~34GB）。方式 B 则均为挂载源码/模型。

@@ -63,6 +63,8 @@ agents_logs/
 compose.yaml
 mineru.json
 data/*
+# 补 OriCls 模型（本地模型文件，不打进 git）
+offline-package-ppu/oricls/
 .claude/
 .claudecode-rules.md
 .pytest_cache

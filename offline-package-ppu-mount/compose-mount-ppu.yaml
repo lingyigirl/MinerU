@@ -39,6 +39,10 @@ services:
     environment:
       MINERU_MODEL_SOURCE: local
       MINERU_BACKEND: vlm-vllm-async-engine   # PPU 上 vLLM 异步引擎
+      # 强制 vLLM 使用 V1 引擎：mineru 异步后端硬 import vllm.v1 的 AsyncLLM，
+      # 若不显式设为 1，vLLM 会自动回退 V0 并报
+      # "Using V1 AsyncLLMEngine, but envs.VLLM_USE_V1=False"
+      VLLM_USE_V1: "1"
       CUDA_VISIBLE_DEVICES: "0"              # ← 指定 PPU 卡号（ppu-smi 查看）
       MINERU_API_OUTPUT_ROOT: /datapool/mineru_output   # 输出落到已挂载的 /datapool 下（持久化）
       MINERU_LOG_FILE_ENABLE: "false"
@@ -51,9 +55,10 @@ services:
       - /datapool:/datapool
       # ---- 源码挂载（关键）：覆盖镜像内 pip 安装的 mineru 包 ----
       # 左半边 /data/mineru-src/mineru 来自 mineru-src-3.4.4.tar.gz（build-ppu-src.sh 产物）
-      # 右半边路径需与 PPU 镜像实际安装位置一致，先在容器内确认：
+      # 右半边路径需与 PPU 镜像实际安装位置一致，已在容器内验证：
       #   docker run --rm mineru:ppu-vllm-latest python3 -c "import mineru; print(mineru.__file__)"
-      - /data/mineru-src/mineru:/usr/local/lib/python3.12/dist-packages/mineru
+      #   → /usr/local/lib/python3.12/site-packages/mineru/__init__.py
+      - /data/mineru-src/mineru:/usr/local/lib/python3.12/site-packages/mineru
       # ---- 外部模型挂载（可选）----
       # 默认：不挂载，用镜像内置模型（推荐，镜像构建时已打包模型并写好 /root/mineru.json）
       #
