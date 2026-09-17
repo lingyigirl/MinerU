@@ -8,6 +8,7 @@
 """
 
 import re
+import unicodedata
 from typing import Optional
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -2763,6 +2764,7 @@ def supplement_empty_table_cells(
     vlm_html: str,
     ocr_results: list,
     table_img_width: int = 0,
+    chrome: dict | None = None,
 ) -> str:
     """使用 PaddleOCR 文字网格补充 VLM 表格中的空单元格。
 
@@ -2783,6 +2785,10 @@ def supplement_empty_table_cells(
         ocr_results: PaddleOCR (det+rec) 的输出结果，
             格式为 [[box_points, ['text', score]], ...]。
         table_img_width: 表格图片的像素宽度，用于 x 坐标列的聚类半径计算。
+        chrome: 守卫 5 语义源过滤上下文（可选）：
+            {"seals": 文档级印章文本集合, "title": 本页标题或空串}。
+            由 supplement_vlm_table_cells_with_ocr 采集下传，透传给
+            _fill_empty_cells_from_ocr_grid；为 None 时守卫 5 不生效。
 
     Returns:
         补充后的 HTML 字符串；若无需补充则返回原字符串。
@@ -2806,7 +2812,7 @@ def supplement_empty_table_cells(
     for table in soup.find_all("table"):
         try:
             modified = _fill_empty_cells_from_ocr_grid(
-                soup, table, ocr_grid
+                soup, table, ocr_grid, chrome=chrome
             ) or modified
         except Exception:
             logger.exception("OCR 网格填充单表时出错，跳过此表格")
@@ -4356,6 +4362,7 @@ def _fill_empty_cells_from_ocr_grid(
     soup: BeautifulSoup,
     table: Tag,
     ocr_grid: list[list[str]],
+    chrome: dict | None = None,
 ) -> bool:
     """将 OCR 网格中的文字填充到表格中的空单元格和含图片单元格。
 
@@ -4368,6 +4375,9 @@ def _fill_empty_cells_from_ocr_grid(
         soup: BeautifulSoup 对象。
         table: <table> Tag。
         ocr_grid: OCR 识别文字网格。
+        chrome: 守卫 5 语义源过滤上下文（可选）：
+            {"seals": 文档级印章文本集合, "title": 本页标题或空串}。
+            为 None 时守卫 5 不生效（保持既有调用兼容）。
 
     Returns:
         是否对表格做了任何修改。
@@ -4434,6 +4444,24 @@ def _fill_empty_cells_from_ocr_grid(
         if t
     }
 
+    # 守卫 5：本表数据区全部非空单元格的紧凑规范化文本集（供跨行截断比对）。
+    # 仅当 chrome 启用时计算（nil 时构造空集，避免无谓开销）。
+    # VLM 可能把相邻两格（如 对方户名+摘要）合并进同一 td 并以空白分隔
+    # （`滕州英华高级中学有限公司 业务专用章`，p0 实测）——拆段各自入集，
+    # 否则截断 fragment 会被「后缀值」从前后缀位置挤到中间而漏拦（guard 5B MISS）。
+    if chrome:
+        _cell_segs = re.compile(r"[\s　]+")
+        table_cell_norms = {
+            _compact_norm(seg)
+            for row in vlm_data[data_row_start:]
+            for t in row
+            if t
+            for seg in _cell_segs.split(t.strip())
+            if len(_compact_norm(seg)) >= 4 and _cjk_count(seg) >= 4
+        }
+    else:
+        table_cell_norms = set()
+
     for vlm_row_idx in range(data_row_start, len(vlm_data)):
         vlm_row = vlm_data[vlm_row_idx]
         vlm_tag_row = vlm_cells[vlm_row_idx]
@@ -4444,28 +4472,107 @@ def _fill_empty_cells_from_ocr_grid(
         # 本行 VLM 单元格的规范化文本（去重比对用，全角/半角标点一致）
         vlm_row_norms = [_normalize_for_matching(vt) for vt in vlm_row if vt]
         for ot in ocr_texts:
+            # 守卫 3-①：纯标点/符号噪声（如「。」）无任何信息量，直接丢弃，
+            # 不进入填充（不把噪声写进空列，输出不多不少）。
+            if _is_pure_punctuation(ot):
+                continue
+            # 守卫 4：拼接噪音——OCR 横向合并相邻单元格成无分隔串
+            # （"01-06收" = 日期 01-06 + 对公收费截断"收"；
+            #  "2025-02-1416:53:28" = 交易日期 + 时间丢失空格）。
+            # 这些模式在正常表格中无合法出现场景（日期/时间在各自列内
+            # 不会与其它列文字粘连），判定为拼接噪音直接丢弃，不落入空列。
+            if _is_merged_noise(ot):
+                continue
+            # 守卫 5：语义源 / 跨行截断过滤。
+            # 守卫 1-4 均为内容模式守卫，但银行流水对公收费行直接空白（VLM 正确
+            # 输出 <td></td>），OCR 行池 Y 聚类错位会把「表格外语义源」的 token
+            # 灌入空列——这些 token 与合法公司名无内容差异，只能按来源拦截：
+            #   5A-3   单 CJK ∈ 本页标题（如 p3「中」←「中国工商银行对公客户账务明细」）
+            #   5A-1   文本被文档级印章行包含（如 p1「业务专用章」——印章第 3 行）
+            #   5A-edit 文本与某印章行编辑距离 ≤1（如 p4「本庄三八支行」— OCR 把
+            #           印章第 2 行「枣庄三八支行」的「枣」识成「本」）
+            #   5B     文本是同表另一非空单元格的前/后缀截断（长度差 ≤2、
+            #           token≥5 字且 CJK≥4），如 p0「州英华高级中学有限公司」←
+            #          「滕州英华高级中学有限公司」截首字。
+            # 审计（GT 52 页 9962 非空 cell）：此规则集 0 误伤。
+            ot_cn = _compact_norm(ot)
+            if chrome and ot_cn:
+                _seals = chrome.get("seals") or set()
+                _title = chrome.get("title") or ""
+                # 5A-3：单 CJK ∈ 本页标题
+                if (
+                    len(ot_cn) == 1
+                    and _cjk_count(ot_cn) == 1
+                    and _title
+                    and ot_cn in _title
+                ):
+                    continue
+                if len(ot_cn) >= 2 and _cjk_count(ot_cn) >= 4:
+                    # 5A-1 / 5A-edit：印章包含或编辑距离 ≤1
+                    if any(
+                        ot_cn in _s or _edit_distance_le1(ot_cn, _s)
+                        for _s in _seals
+                    ):
+                        continue
+                    # 5B：同表前后缀截断（长度差 ≤2）
+                    if (
+                        len(ot_cn) >= 5
+                        and any(
+                            len(vn) > len(ot_cn)
+                            and len(vn) - len(ot_cn) <= 2
+                            and (vn.startswith(ot_cn) or vn.endswith(ot_cn))
+                            for vn in table_cell_norms
+                        )
+                    ):
+                        continue
             item_type = _classify_ocr_item_type(ot)
             if item_type == "text":
                 ot_norm = _normalize_for_matching(ot)
+                # 守卫 3-②：单个 CJK 字符若被任一表头 token 包含
+                # （如「类」∈「业务产品种类」），判为表头文字截断噪声丢弃，
+                # 不落入数据行空列。
+                if _is_single_cjk_char(ot_norm) and any(
+                    ot_norm in ht_norm for ht_norm in vlm_header_norm
+                ):
+                    continue
                 # 文本（标签）：同行或表头行已含该标签即视为重复，不做填充——
                 # 只"放置"新增信息，不复制已有信息（原则 1）。
                 # 仅查同行 + 表头，不查其它数据行，避免误伤可重复出现的值。
                 # 去重分两级：
                 # ① 规范化后精确相等（覆盖全角/半角标点差异）；
-                # ② 较长文本（≥4 字）的子串匹配——OCR 常截断 VLM 标签或丢失
+                # ② 较长文本（≥3 字）的子串匹配——OCR 常截断 VLM 标签或丢失
                 #    序号前缀，如「、经营活动产生的现金流量：」是
-                #    「一、经营活动产生的现金流量:」去掉「一、」的截断重复。
-                #    仅对较长文本启用，避免误伤「吨」「免税」等短值。
+                #    「一、经营活动产生的现金流量:」去掉「一、」的截断重复；
+                #    或同行摘要后缀 fragment（「手续费」⊂「跨行汇款手续费」，
+                #    p0 对公收费行空对方户名被其污染）。
+                #    3 字门槛低于「吨/免税」等 1-2 字真实短值，不误伤。
                 if ot_norm in vlm_row_norms:
                     continue
-                if len(ot_norm) >= 4 and any(
+                if len(ot_norm) >= 3 and any(
                     ot_norm in vt_norm for vt_norm in vlm_row_norms
+                ):
+                    continue
+                # 反向子串去重：OCR 跨格合并（如「01-02对公收费」读成单框）时，
+                # OCR token 是「日期 + 业务种类」两格值拼接的超集。此时 OCR 文本
+                # 内含同单元格的值（vt_norm ⊂ ot_norm），判为重复丢弃——不把相邻
+                # 格已输出的内容再复制进空列（输出不多不少）。双侧长度 ≥4 门，
+                # 避免「吨/免税」等短值被长 OCR 文本误吸收。
+                if len(ot_norm) >= 4 and any(
+                    len(vt_norm) >= 4 and vt_norm in ot_norm
+                    for vt_norm in vlm_row_norms
                 ):
                     continue
                 if ot_norm in vlm_header_norm:
                     continue
                 if len(ot_norm) >= 4 and any(
                     ot_norm in ht_norm for ht_norm in vlm_header_norm
+                ):
+                    continue
+                # 表头截断超集：OCR 将表头文字与相邻值/多格表头拼接成超集
+                # （如「种类对公收费」），同样判为重复丢弃。
+                if len(ot_norm) >= 4 and any(
+                    len(ht_norm) >= 4 and ht_norm in ot_norm
+                    for ht_norm in vlm_header_norm
                 ):
                     continue
             else:
@@ -4506,11 +4613,15 @@ def _fill_empty_cells_from_ocr_grid(
                 continue
 
             # 第二轮：任意类型 → 同类型可填充列（优先 empty 模式）
+            # 守卫 2：不再用 mode=="empty" 通配——空单元格只接受与列类型一致
+            # 的 OCR token。number/rate 类 与 表头推断出的 text 类空列不匹配，
+            # 防止 OCR 数值噪声（如 "0.0"、"106,270.070005800001"）灌入
+            # 「对方户名/摘要」等文本空列（输出不多不少）。
             for fi, (vc, ct, mode) in enumerate(fillable):
                 cell_tag = vlm_tag_row[vc]
                 if mode == "empty" and id(cell_tag) in filled_cell_ids:
                     continue
-                if ocr_type == ct or mode == "empty":
+                if ocr_type == ct:
                     _append_text_to_cell(cell_tag, ocr_text)
                     if mode == "empty":
                         filled_cell_ids.add(id(cell_tag))
@@ -4525,7 +4636,12 @@ def _fill_empty_cells_from_ocr_grid(
                 continue
 
             # 第三轮：兜底 → 任意剩余可填充列
+            # 守卫 2-兜底：number 类 OCR token 不得落入表头推断为 text 的列；
+            # 其余类型（text→number 略奇怪但保持现状、rate→text 等价丢弃）
+            # 按原逻辑兜底，保留历史行为。
             for fi, (vc, ct, mode) in enumerate(fillable):
+                if mode == "empty" and ct == "text" and ocr_type == "number":
+                    continue
                 cell_tag = vlm_tag_row[vc]
                 if mode == "empty" and id(cell_tag) in filled_cell_ids:
                     continue
@@ -4606,6 +4722,239 @@ def _classify_ocr_item_type(text: str) -> str:
 # Hybrid 模式表格 OCR 调度（从 hybrid_model_output_to_middle_json.py 的 hook 调用）
 # ============================================================
 
+def _is_pure_punctuation(text: str) -> bool:
+    """判断文本是否为无信息量的短标点噪声（如「。」「、」「-」「..」）。
+
+    用于在 OCR 文本过滤阶段排除纯标点噪声。判断两重：
+    1. 全为标点（P）/符号（S）/空白（Z）字符；
+    2. 长度 ≤ 2——「***」这类多字符纯符号串是银行流水/发票中的
+       账号打码掩码（真实内容），不能丢弃（输出不少），仅丢弃短噪声。
+
+    Args:
+        text: 待检查的原始 OCR 文本。
+
+    Returns:
+        是否是无信息量的短标点噪声。
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if len(stripped) > 2:
+        return False
+    return all(
+        unicodedata.category(ch).startswith(("P", "Z", "S"))
+        for ch in stripped
+    )
+
+
+def _is_single_cjk_char(text: str) -> bool:
+    """判断规范化后的文本是否为单一个中文字符。
+
+    Args:
+        text: 规范化后的文本。
+
+    Returns:
+        是否恰为单个 CJK 字符。
+    """
+    return len(text) == 1 and "一" <= text <= "鿿"
+
+
+def _is_merged_noise(text: str) -> bool:
+    """检测 OCR 横向合并相邻单元格产生的拼接噪音。
+
+    OCR 把相邻格读成单框且丢失分隔符，产生无合法语义的拼接串：
+    模式 M1: MM-DD 紧接非数字内容（"01-06收"、"01-02对公收费"）
+             —— 日期 `MM-DD` 后应只有空白/行尾，紧接其它字符说明
+             跨了相邻列；`D`（非数字）守卫保证 `12-3456789` 这类
+             账号不误伤。
+    模式 M2: YYYY-MM-DD 紧接 HH:MM 无空格（"2025-02-1416:53:28"）
+             —— 源 PDF 中交易日期与时间之间必有空格，无空格拼接
+             即 OCR 丢失分隔符（合法时间串 "2025-02-14 16:53:28"
+             中间是空格，不匹配）。
+
+    Args:
+        text: 待检查的原始 OCR 文本。
+
+    Returns:
+        是否为拼接噪音。
+    """
+    return bool(
+        re.match(r"^\d{2}-\d{2}\D", text)
+        or re.match(r"^\d{4}-\d{2}-\d{2}\d{2}:\d{2}", text),
+    )
+
+
+# 守卫 5 用：语义源（页面 chrome）文本正则
+_CJK_RE = re.compile(r"[一-鿿]")
+_SEAL_NOISE_CHARS = re.compile(r"[\s，。、,.:：（）()%％—-]")
+
+
+def _compact_norm(text: str) -> str:
+    """去空白与分隔标点后的紧凑文本（印章/标题/截断比对用）。
+
+    Args:
+        text: 原始文本。
+
+    Returns:
+        去除空白与 `，。、,.:：（）()%％—-` 后的字符串。
+    """
+    return _SEAL_NOISE_CHARS.sub("", text or "")
+
+
+def _cjk_count(text: str) -> int:
+    """统计文本中的 CJK 统一表意文字个数。"""
+    return len(_CJK_RE.findall(text or ""))
+
+
+def _edit_distance_le1(a: str, b: str) -> bool:
+    """判断两个规范化字符串的编辑距离是否 ≤1（早期退出）。
+
+    用于 OCR 印章误识近匹配（如「枣庄三八支行」→「本庄三八支行」：
+    枣→本 单字符替换）。长度差 >1 即不可能是 1 次编辑，直接返回。
+
+    Args:
+        a: 规范化后的字符串。
+        b: 规范化后的字符串。
+
+    Returns:
+        编辑距离 ≤1 时为 True。
+    """
+    if abs(len(a) - len(b)) > 1:
+        return False
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(m):
+        prev = dp
+        dp = [i + 1] + [0] * n
+        for j in range(n):
+            if a[i] == b[j]:
+                cost = 0
+            else:
+                cost = 1
+            dp[j + 1] = min(
+                prev[j + 1] + 1,  # 删除 a[i]
+                dp[j] + 1,  # 插入 b[j]
+                prev[j] + cost,  # 替换
+            )
+        if min(dp) > 1:
+            return False
+    return dp[n] <= 1
+
+
+def _collect_doc_seals(pdf_info_list: list) -> set:
+    """收集文档级印章文本（跨全部页面）用于对 OCR 池做语义源过滤。
+
+    VLM 把印章/签章识别为 image 块内的 image span，其 content 为多行文本
+    （如「中国工商银行股份有限公司 / 枣庄三八支行 / 业务专用章 / 编号」）。
+    印章物理上存在于多数页面，但 VLM 并非每页都显式标出（如 p1 只有 table 块），
+    故必须取**跨页超集**（与具体页面无关的固定印章词）。仅保留纯中文行
+    （CJK≥4 且不含数字），排除签名戳（「张之祥20231018」）与打印日期戳
+    （「打印日期20230506」）等含编号/日期的行，避免「日期/0.00」误伤。
+
+    Args:
+        pdf_info_list: 中间 JSON 的页面列表。
+
+    Returns:
+        印章规范化文本集合。
+    """
+    from mineru.backend.utils.para_block_utils import iter_block_spans
+    from mineru.utils.enum_class import ContentType
+
+    seals = set()
+    for page_info in pdf_info_list:
+        for block in page_info.get("preproc_blocks", []):
+            if block.get("type") != ContentType.IMAGE:
+                continue
+            for span in iter_block_spans(block):
+                if span.get("type") != ContentType.IMAGE:
+                    continue
+                content = str(span.get("content", "") or "")
+                for line in content.split("\n"):
+                    line = line.strip()
+                    if not line or line == "None":
+                        continue
+                    # 排除签名/日期戳：纯中文行（CJK≥4 且无数字）才是印章正文
+                    if _cjk_count(line) >= 4 and not re.search(r"\d", line):
+                        seals.add(_compact_norm(line))
+    return seals
+
+
+def _collect_page_title(page_info: dict) -> str:
+    """收集页面标题（表格上方的 table_caption 或 CJK 居多的 text 块）。
+
+    银行流水每页顶部有「中国工商银行对公客户账务明细」等标题；VLM 把标题
+    放出为 table_caption 子块或表格上方的 text 块。「中」等页标题截断单字
+    经 OCR 落入表格空列时，需比对本页标题判断（守卫 5A-3）。
+
+    Args:
+        page_info: 单页的中间 JSON。
+
+    Returns:
+        页标题规范化文本；无则为空字符串。
+    """
+    from mineru.backend.utils.para_block_utils import iter_block_spans
+    from mineru.utils.enum_class import ContentType
+
+    table_bbox = None
+    for block in page_info.get("preproc_blocks", []):
+        if block.get("type") == ContentType.TABLE:
+            table_bbox = block.get("bbox")
+            break
+    if not table_bbox or len(table_bbox) < 2:
+        return ""
+
+    title = ""
+    for block in page_info.get("preproc_blocks", []):
+        block_type = block.get("type")
+        bbox = block.get("bbox") or []
+        # 表格上方的 table_caption 子块优先
+        if block_type == ContentType.TABLE:
+            for sub in block.get("blocks", []):
+                sub_bbox = sub.get("bbox") or []
+                if (
+                    sub.get("type") == "table_caption"
+                    and len(sub_bbox) >= 2
+                    and sub_bbox[1] < table_bbox[1] - 1
+                ):
+                    for span in iter_block_spans(sub):
+                        title = _pick_title_span(span.get("content", ""))
+                        if title:
+                            return title
+        # 表格上方的 text 块（bbox y0 在表格之上）
+        elif (
+            block_type == ContentType.TEXT
+            and len(bbox) >= 2
+            and bbox[1] < table_bbox[1] - 2
+        ):
+            for span in iter_block_spans(block):
+                title = _pick_title_span(span.get("content", ""))
+                if title:
+                    return title
+    return title
+
+
+def _pick_title_span(content: object) -> str:
+    """从 span 文本中提取 ≥10 字且 CJK 居多（≥1/2）的标题。
+
+    Args:
+        content: span 的 content（str 或含 "content" 键的 dict 列表）。
+
+    Returns:
+        规范化后的标题；不满足条件返回空字符串。
+    """
+    if isinstance(content, list):
+        text = "".join(
+            str(item.get("content", "")) if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    else:
+        text = str(content or "")
+    text = text.strip()
+    if len(text) >= 10 and _cjk_count(text) >= len(text) // 2:
+        return _compact_norm(text)
+    return ""
+
+
 def supplement_vlm_table_cells_with_ocr(
     pdf_info_list: list,
     hybrid_pipeline_model,
@@ -4639,7 +4988,14 @@ def supplement_vlm_table_cells_with_ocr(
     filled_count = 0
     skipped_count = 0
 
+    # 守卫 5：文档级印章文本（跨页超集，VLM 每页并不都标出印章 image 项）。
+    # VLM 对同一 PDF 输出确定，印章词固定——一次性收集供全部页面比对。
+    doc_seals = _collect_doc_seals(pdf_info_list)
+
     for page_info in pdf_info_list:
+        # 守卫 5：本页标题（表格上方的 caption/text），供「单 CJK ∈ 页标题」判断
+        page_title = _collect_page_title(page_info)
+        chrome = {"seals": doc_seals, "title": page_title}
         for block in page_info.get("preproc_blocks", []):
             for span in iter_block_spans(block):
                 if span.get("type") != ContentType.TABLE:
@@ -4728,7 +5084,7 @@ def supplement_vlm_table_cells_with_ocr(
                 # 调用表格补充函数
                 try:
                     new_html = supplement_empty_table_cells(
-                        html, ocr_results, w
+                        html, ocr_results, w, chrome=chrome
                     )
                     if new_html != html:
                         span["html"] = new_html
