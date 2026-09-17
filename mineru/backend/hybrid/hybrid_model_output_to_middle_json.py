@@ -266,15 +266,22 @@ def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm
     # 必须在 build_para_blocks_from_preproc 之前执行，
     # 否则 para_blocks 不会包含 OCR 补充的文字。
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
-    try:
-        from mineru.utils.custom.table_utils import supplement_vlm_table_cells_with_ocr
-        supplement_vlm_table_cells_with_ocr(
-            pdf_info_list, hybrid_pipeline_model, image_writer=image_writer
-        )
-    except Exception as exc:
-        logger.warning(
-            f"OCR 表格单元格补充执行失败，将使用原始表格 HTML: {exc}"
-        )
+    # 开关 MINERU_TABLE_OCR_SUPPLEMENT（默认开启）：
+    #   "0"/"false"/"no" 时跳过 OCR 补充，表格单元格完全采用 VLM 原始输出。
+    #   适用于表格行池配准错位（印章/页标题/相邻行噪声灌入空列）干扰大于 recall 增益的场景。
+    _table_ocr_supplement_enable = os.getenv(
+        "MINERU_TABLE_OCR_SUPPLEMENT", "True"
+    ).lower() in ("1", "true", "yes")
+    if _table_ocr_supplement_enable:
+        try:
+            from mineru.utils.custom.table_utils import supplement_vlm_table_cells_with_ocr
+            supplement_vlm_table_cells_with_ocr(
+                pdf_info_list, hybrid_pipeline_model, image_writer=image_writer
+            )
+        except Exception as exc:
+            logger.warning(
+                f"OCR 表格单元格补充执行失败，将使用原始表格 HTML: {exc}"
+            )
 
     # [自定义] 将被误判为 header 的居中短标题从 discarded_blocks 救回正文，
     # 必须在 build_para_blocks_from_preproc 之前执行，否则救回的标题不会进入 para_blocks。

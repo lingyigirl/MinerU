@@ -2802,8 +2802,8 @@ def supplement_empty_table_cells(
         logger.warning("BeautifulSoup 解析表格 HTML 失败，跳过 OCR 补充")
         return vlm_html
 
-    # 构建 OCR 网格
-    ocr_grid = _build_ocr_text_grid(ocr_results, table_img_width)
+    # 构建 OCR 网格（含每行 y 中心，供 G6A 行池 y-extent 来源守卫）
+    ocr_grid, ocr_row_y = _build_ocr_text_grid(ocr_results, table_img_width)
     if not ocr_grid:
         return vlm_html
 
@@ -2812,7 +2812,7 @@ def supplement_empty_table_cells(
     for table in soup.find_all("table"):
         try:
             modified = _fill_empty_cells_from_ocr_grid(
-                soup, table, ocr_grid, chrome=chrome
+                soup, table, ocr_grid, chrome=chrome, ocr_row_y=ocr_row_y
             ) or modified
         except Exception:
             logger.exception("OCR 网格填充单表时出错，跳过此表格")
@@ -2826,7 +2826,7 @@ def supplement_empty_table_cells(
 def _build_ocr_text_grid(
     ocr_results: list,
     table_img_width: int = 0,
-) -> list[list[str]]:
+) -> tuple[list[list[str]], list[float]]:
     """将 PaddleOCR 结果按行列聚类为二维文字网格。
 
     步骤：
@@ -2839,10 +2839,13 @@ def _build_ocr_text_grid(
         table_img_width: 表格图片宽度（像素），用于估算列聚类半径。
 
     Returns:
-        二维文字网格 list[list[str]]，grid[row][col] = 文字。
+        (grid, row_y_centers)：
+        - grid：二维文字网格 list[list[str]]，grid[row][col] = 文字。
+        - row_y_centers：每行的 y 中心点（像素，截图坐标系），长度与 grid 相同。
+          供 G6A 行池 y-extent 来源守卫判断行是否位于锚定数据带内。
     """
     if not ocr_results:
-        return []
+        return [], []
 
     # 提取 (x_center, y_center, text) 三元组
     items = []
@@ -2876,7 +2879,7 @@ def _build_ocr_text_grid(
             continue
 
     if not items:
-        return []
+        return [], []
 
     # 按 y 坐标排序
     items.sort(key=lambda it: it[1])
@@ -2902,11 +2905,13 @@ def _build_ocr_text_grid(
 
     # 每行内按 x 排序
     grid = []
+    row_y_centers = []
     for row in rows:
         row.sort(key=lambda it: it[0])
         grid.append([it[3] for it in row])
+        row_y_centers.append(sum(it[1] for it in row) / len(row))
 
-    return grid
+    return grid, row_y_centers
 
 
 def _append_text_to_cell(cell_tag: Tag, text: str) -> None:
@@ -3027,6 +3032,7 @@ def _align_ocr_to_vlm_rows(
     ocr_grid: list[list[str]],
     vlm_data: list[list[str]],
     data_row_start: int,
+    ocr_row_y: list[float] | None = None,
 ) -> dict[int, list[str]]:
     """使用标签锚点将 OCR 网格行对齐到 VLM 数据行。
 
@@ -3043,6 +3049,9 @@ def _align_ocr_to_vlm_rows(
         ocr_grid: OCR 识别的文字网格。
         vlm_data: 展开后的 VLM 文本网格。
         data_row_start: 数据行起始索引。
+        ocr_row_y: 每行 OCR 的 y 中心（像素，截图坐标系），与 ocr_grid 等长；
+            由 _build_ocr_text_grid 返回。为 None 时 G6A 行池 y-extent 来源
+            守卫不生效（保持既有调用兼容）。
 
     Returns:
         {vlm_row_idx: [ocr_text, ...]} 映射。
@@ -3061,10 +3070,15 @@ def _align_ocr_to_vlm_rows(
         [_normalize_for_matching(t) for t in row] for row in vlm_data
     ]
 
-    current_vlm_row = data_row_start
-
+    # [自定义] G6A 行池 y-extent 来源守卫：
+    # 表格截图可能包含表格区域外的文字（印章/页标题/相邻行噪声）。这些行
+    # 无标签锚点（best_row 为 None），仅因"跟随上一个锚定行"而落入空行空列
+    # 池——即已知泄漏（业务专用章/中/州英华…）的行池成因。此处先预计算每行
+    # 是否锚定成功，收集锚定行的 y 中心形成数据带 y-extent；对从未锚定且
+    # y 中心落在数据带之外的行直接丢弃，不进入行池。
+    row_anchor: list[int | None] = []
+    anchored_y: list[float] = []
     for oi, ocr_row in enumerate(ocr_grid):
-        # 查找该 OCR 行最匹配的 VLM 数据行
         best_row = None
         best_score = 0
         for vi in range(data_row_start, vlm_nrows):
@@ -3089,9 +3103,49 @@ def _align_ocr_to_vlm_rows(
             if score > best_score:
                 best_score = score
                 best_row = vi
+        row_anchor.append(best_row)
+        if (
+            best_row is not None
+            and ocr_row_y is not None
+            and oi < len(ocr_row_y)
+        ):
+            anchored_y.append(ocr_row_y[oi])
+
+    # G6A y-extent：锚定行的 y 跨度（向外扩一行行距容差）。
+    # 行距取 OCR 网格相邻行 y 间距的中位数（自适应截图缩放），容差=一行行距，
+    # 保证紧邻锚定数据带的第一/末数据行不误伤；表外噪声（印章/页标题/相邻行）
+    # 距数据带通常 ≥2 行距，位于容差之外被丢弃。至少 1 行锚定才启用，
+    # 否则（OCR 与 VLM 无任何可锚定关系）退回既有跟随逻辑，避免误伤。
+    g6a_min_y: float | None = None
+    g6a_max_y: float | None = None
+    if ocr_row_y is not None and len(anchored_y) >= 1:
+        sorted_y = sorted(ocr_row_y)
+        pitches = [
+            high - low
+            for low, high in zip(sorted_y, sorted_y[1:])
+            if high > low
+        ]
+        row_pitch = (
+            sorted(pitches)[len(pitches) // 2]
+            if pitches
+            else max(anchored_y) - min(anchored_y)
+            if len(anchored_y) > 1
+            else 30.0
+        )
+        y_tol = max(row_pitch, 12.0)
+        g6a_min_y = min(anchored_y) - y_tol
+        g6a_max_y = max(anchored_y) + y_tol
+
+    current_vlm_row = data_row_start
+
+    for oi, ocr_row in enumerate(ocr_grid):
+        # 查找该 OCR 行最匹配的 VLM 数据行
+        best_row = row_anchor[oi]
+        anchored_now = False
 
         if best_row is not None:
             current_vlm_row = best_row
+            anchored_now = True
         elif oi + 1 < len(ocr_grid):
             # 向前看一行：OCR 识别中值文本常出现在标签文本上方（存单/票据模式）
             # 守卫条件：仅当当前行是"稀疏文本行"（≤2项，全部为 text 类型）时才 peek-ahead
@@ -3122,6 +3176,18 @@ def _align_ocr_to_vlm_rows(
                         next_best = vi
                 if next_best is not None:
                     current_vlm_row = next_best
+                    anchored_now = True
+
+        # G6A：从未锚定到任何 VLM 行（无自身锚点且 peek-ahead 无果，仅跟随
+        # 上一个锚定行）、且 y 中心落在锚定行数据带之外的行，判为表格区域外
+        # 噪声（印章/页标题/相邻行），整行丢弃不进入行池。
+        if (
+            not anchored_now
+            and g6a_min_y is not None
+            and oi < len(ocr_row_y)
+            and (ocr_row_y[oi] < g6a_min_y or ocr_row_y[oi] > g6a_max_y)
+        ):
+            continue
 
         if current_vlm_row in ocr_pool:
             ocr_pool[current_vlm_row].extend([t for t in ocr_row if t])
@@ -4363,6 +4429,7 @@ def _fill_empty_cells_from_ocr_grid(
     table: Tag,
     ocr_grid: list[list[str]],
     chrome: dict | None = None,
+    ocr_row_y: list[float] | None = None,
 ) -> bool:
     """将 OCR 网格中的文字填充到表格中的空单元格和含图片单元格。
 
@@ -4378,6 +4445,9 @@ def _fill_empty_cells_from_ocr_grid(
         chrome: 守卫 5 语义源过滤上下文（可选）：
             {"seals": 文档级印章文本集合, "title": 本页标题或空串}。
             为 None 时守卫 5 不生效（保持既有调用兼容）。
+        ocr_row_y: 每行 OCR 的 y 中心（像素，截图坐标系），与 ocr_grid 等长；
+            由 _build_ocr_text_grid 返回。为 None 时 G6A 行池 y-extent 来源
+            守卫不生效（保持既有调用兼容）。
 
     Returns:
         是否对表格做了任何修改。
@@ -4424,7 +4494,9 @@ def _fill_empty_cells_from_ocr_grid(
         )
 
     # 3. 使用标签锚点将 OCR 行对齐到 VLM 数据行
-    ocr_pool = _align_ocr_to_vlm_rows(ocr_grid, vlm_data, data_row_start)
+    ocr_pool = _align_ocr_to_vlm_rows(
+        ocr_grid, vlm_data, data_row_start, ocr_row_y=ocr_row_y
+    )
 
     # 4. 推断列类型
     header_types = _infer_column_types_from_header(vlm_data, vlm_cells)
@@ -4461,6 +4533,26 @@ def _fill_empty_cells_from_ocr_grid(
         }
     else:
         table_cell_norms = set()
+
+    # [自定义] 守卫 6 候选集：同表全部非空单元格的紧凑规范化文本
+    # （含表头行 0，len≥2 且 CJK≥2）。与守卫 5 的表头无关、与列语义无关，
+    # 用于跨行比对：
+    #   G6B1 token 是某候选的前/后缀截断（长度差 =2）——命中「金额」表头
+    #       残片（p26/p40/p44，逃脱 guard 5B 的 len≥5 下限）等短截断；
+    #   G6B2 token 与某候选编辑距离 ≤1 且不比候选长（等长或更长方向，
+    #       排除纯截断 prefix/suffix 与精确重复——diff=1 截断为原则 1
+    #       保护的合法短值，归 G6B1(diff=2)/guard5B(len≥5) 管辖：OCR
+    #       形近字重写 滕→腾/腾→滕，如 山东腾建投资集团有限公司 ← 山东
+    #       滕建投资集团有限公司、往米款 ← 往来款），len≥2。
+    if chrome:
+        _all_table_cell_norms = {
+            _compact_norm(t)
+            for row in vlm_data
+            for t in row
+            if t and len(_compact_norm(t)) >= 2 and _cjk_count(t) >= 2
+        }
+    else:
+        _all_table_cell_norms = set()
 
     for vlm_row_idx in range(data_row_start, len(vlm_data)):
         vlm_row = vlm_data[vlm_row_idx]
@@ -4523,6 +4615,54 @@ def _fill_empty_cells_from_ocr_grid(
                             and (vn.startswith(ot_cn) or vn.endswith(ot_cn))
                             for vn in table_cell_norms
                         )
+                    ):
+                        continue
+                # [自定义] 守卫 6：同表形近/宽松截断来源过滤。
+                # 守卫 5 的 len>=4/len>=5 门槛对 2-4 字短 token 存在盲区——
+                # 「金额」表头残片、2 字截断、形近字重写（滕→腾）等短 token
+                # 仍会灌入空列。守卫 6 基于是「同表已出现过的值」的变体判定：
+                #   G6B1 宽松截断：token 是某候选的前/后缀且长度差 =2
+                #         （len≥2 且 CJK≥2；不受 5B 的 len≥5 下限约束）。
+                #         候选集含表头行 0：如「金额」是「转出金额/转入金额」
+                #         表头值的 2 字后缀截断（p26/p40/p44 实测）——这类
+                #         表头残片因短于此前的 len≥5 门槛而逃脱 guard 5B；
+                #   G6B2 编辑距离 ≤1 且 token 不比候选长（等长或更长方向，
+                #         len≥2）：OCR 形近字重写 滕→腾/腾→滕、往→住 等，
+                #         如同表真实值「山东滕建投资集团有限公司」的 OCR 变体
+                #         「山东腾建投资集团有限公司」。
+                # 审计（GT 52 页模型真值 vs middle 逐格）：两者并集净清除 35 个
+                # WRONG/UNKNOWN 污染格，0 个真实召回误伤——3 个疑似 REAL 命中
+                # 经核验均系同行 对方单位 列已有的真实滕值（同表 ED1 副本）。
+                if len(ot_cn) >= 2 and _cjk_count(ot_cn) >= 2:
+                    # G6B1：宽松前后缀截断（长度差 =2，短 token 版）。
+                    # diff=1 排除：短 token 独占一字的截断（如「付材料款」←
+                    # 「支付材料款」）是真实短值保护对象（原则 1），非表头残片。
+                    # 审计（GT 52 页）：G6B1 仅命中 3 例「金额」（表头「转出金额/
+                    # 转入金额」2 字后缀，diff=2），0 例 diff=1 或 diff>2。
+                    # 首尾丢 2 字的高频特征（金额/凭证/摘要 等 2 字后缀截断）
+                    # 使 diff=2 足够覆盖已知盲区。
+                    if any(
+                        len(vn) > len(ot_cn)
+                        and len(vn) - len(ot_cn) == 2
+                        and (vn.startswith(ot_cn) or vn.endswith(ot_cn))
+                        for vn in _all_table_cell_norms
+                    ):
+                        continue
+                    # G6B2：编辑距离 ≤1 形近（等长或更长方向）。
+                    # 排除与候选完全相等的精确重复——跨行合法重复值（如「吨」）
+                    # 按原则 1 保留，不在此清空；只拦"有实际编辑"的形近变体。
+                    # 另外排除纯截断关系（vn.startswith(ot_cn) or
+                    # vn.endswith(ot_cn)）——纯截断由 G6B1（diff=2）或
+                    # guard 5B（len≥5, diff≤2）管控。diff=1 截断为合法短值
+                    # 保护对象（原则 1，如「付材料款」←「支付材料款」），
+                    # 不在此清空；形近字替换不产生 prefix/suffix 关系
+                    # （同长或内位置换），不受此条排除。
+                    if any(
+                        len(vn) >= len(ot_cn)
+                        and vn != ot_cn
+                        and not (vn.startswith(ot_cn) or vn.endswith(ot_cn))
+                        and _edit_distance_le1(ot_cn, vn)
+                        for vn in _all_table_cell_norms
                     ):
                         continue
             item_type = _classify_ocr_item_type(ot)

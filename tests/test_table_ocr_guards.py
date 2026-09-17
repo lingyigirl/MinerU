@@ -680,6 +680,165 @@ def test_guard5_collect_page_title_none() -> None:
     assert _collect_page_title(page) == "", "表格下方文本不算页标题"
 
 
+# ---- G6B: 同表形近/截断守卫（守卫 6）----
+
+
+def test_g6b1_header_suffix_trunc_dropped() -> None:
+    """G6B1：表头值后缀截断（「金额」⊂「转出金额」）在数据行空列丢弃。
+
+    审计实测：p26/p40/p44 对公收费行 对方户名空，表头「转出金额/贷方发生额/
+    转入金额」含 2 字残片「金额」落入空列。G6B1（len≥2、CJK≥2、diff≤2、
+    候选集含表头行 0）拦截。此前 guard 5B 的 len≥5 门槛对此短 token 存在
+    盲区。
+    """
+    chrome = {"seals": _STMT_SEALS, "title": "中国工商银行对公客户账务明细"}
+    header = [
+        "日期", "业务产品种类", "凭证种类", "凭证号", "对方户名",
+        "摘要", "转出金额", "贷方发生额", "余额", "记账信息",
+    ]
+    html = f"""<table>
+      <tr><th>{'</th><th>'.join(header)}</th></tr>
+      <tr><td>01-02</td><td>对公收费</td><td>0</td><td>0</td>
+          <td></td><td>跨行汇款手续费</td>
+          <td>600.00</td><td>0.00</td><td>2,047,754.23</td><td>0005800001</td></tr>
+      <tr><td>01-05</td><td>同城转账</td><td>0</td><td>0</td>
+          <td>山东滕建投资集团</td><td>支付材料款</td>
+          <td>0.00</td><td>5,000,000.00</td><td>6,628,354.23</td><td>0005800033</td></tr>
+    </table>"""
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    _fill_empty_cells_from_ocr_grid(
+        soup, table,
+        [header,
+         ["01-02", "对公收费", "金额", "跨行汇款手续费",
+          "600.00", "0.00", "2,047,754.23", "0005800001"],
+         ["01-05", "同城转账", "", "支付材料款",
+          "0.00", "5,000,000.00", "6,628,354.23", "0005800033"]],
+        chrome=chrome,
+    )
+    rows = table.find_all("tr")
+    cells0 = [c.get_text().strip() for c in rows[1].find_all("td")]
+    assert cells0[4] == "", f"G6B1: 金额截断不得进入空列，实际 {cells0[4]!r}"
+    cells1 = [c.get_text().strip() for c in rows[2].find_all("td")]
+    assert cells1[4] == "山东滕建投资集团", "其他行真实值应保留"
+    assert cells1[5] == "支付材料款", "其他行真实摘要应保留"
+
+
+def test_g6b2_ed1_variant_dropped() -> None:
+    """G6B2：编辑距离 ≤1 形近变体（「往米款」←「往来款」）被丢弃。
+
+    实测审计：同行 摘要 列已有完整值「往来款」，OCR 形近字（米→来）变体
+    「往米款」从行池错位进入空 对方户名列。G6B2 ED1 拦截（len≥2，等长方向）。
+    """
+    chrome = {"seals": _STMT_SEALS, "title": "中国工商银行对公客户账务明细"}
+    html = f"""<table>
+      <tr><th>{'</th><th>'.join(_STMT_HEADER)}</th></tr>
+      <tr><td>01-02</td><td>对公收费</td><td>0</td><td>0</td>
+          <td></td><td></td>
+          <td>600.00</td><td>0.00</td><td>2,047,754.23</td><td>0005800001</td></tr>
+      <tr><td>01-05</td><td>同城转账</td><td>0</td><td>0</td>
+          <td>山东滕建投资集团</td><td>往来款</td>
+          <td>0.00</td><td>5,000,000.00</td><td>6,628,354.23</td><td>0005800033</td></tr>
+    </table>"""
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    _fill_empty_cells_from_ocr_grid(
+        soup, table,
+        [_STMT_HEADER,
+         ["01-02", "对公收费", "往米款", "",
+          "600.00", "0.00", "2,047,754.23", "0005800001"],
+         ["01-05", "同城转账", "", "往来款",
+          "0.00", "5,000,000.00", "6,628,354.23", "0005800033"]],
+        chrome=chrome,
+    )
+    rows = table.find_all("tr")
+    cells0 = [c.get_text().strip() for c in rows[1].find_all("td")]
+    assert cells0[4] == "", f"G6B2: 形近变体不得进入空列，实际 {cells0[4]!r}"
+
+
+def test_g6b2_exact_dup_not_blocked() -> None:
+    """G6B2 不误拦精确重复：vn != ot_cn 排除完全相同值。
+
+    跨行合法重复值（如「吨」/「往来款」）按原则 1 保留。G6B2 的排除条件
+    vn != ot_cn 确保编辑距离=0 的精确匹配被跳过（不像初版 ED=0 也进入
+    判定被拦）。候选集含「往来款」但 OCR 填值也是「往来款」→ G6B2 跳过
+    → 正常落位。
+    """
+    chrome = {"seals": _STMT_SEALS, "title": "中国工商银行对公客户账务明细"}
+    html = f"""<table>
+      <tr><th>{'</th><th>'.join(_STMT_HEADER)}</th></tr>
+      <tr><td>01-02</td><td>对公收费</td><td>0</td><td>0</td>
+          <td></td><td></td>
+          <td>600.00</td><td>0.00</td><td>2,047,754.23</td><td>0005800001</td></tr>
+      <tr><td>01-05</td><td>同城转账</td><td>0</td><td>0</td>
+          <td>山东滕建投资集团</td><td>往来款</td>
+          <td>0.00</td><td>5,000,000.00</td><td>6,628,354.23</td><td>0005800033</td></tr>
+    </table>"""
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    _fill_empty_cells_from_ocr_grid(
+        soup, table,
+        [_STMT_HEADER,
+         ["01-02", "对公收费", "往来款", "",
+          "600.00", "0.00", "2,047,754.23", "0005800001"],
+         ["01-05", "同城转账", "", "往来款",
+          "0.00", "5,000,000.00", "6,628,354.23", "0005800033"]],
+        chrome=chrome,
+    )
+    rows = table.find_all("tr")
+    cells0 = [c.get_text().strip() for c in rows[1].find_all("td")]
+    assert cells0[4] == "往来款", f"G6B2: 精确重复不应被拦，实际 {cells0[4]!r}"
+
+
+def test_g6a_y_extent_drops_outer_row() -> None:
+    """G6A：锚定行 y-extent 之外的 OCR 行被丢弃（需 ≥2 锚定行使中位行距不受噪声干扰）。
+
+    4 行 OCR 网格：表头（y=50，无锚）+ 双数据行（y=150/250，锚定）+ 噪声行
+（y=500，无锚）。中位行距=100（双数据行间距），y-extent=50~350，
+    噪声 y=500 在带外 → 被丢弃。无 ocr_row_y 时（3 参旧调用）该行正常落位至
+    第 2 数据行空列。
+    """
+    html = f"""<table>
+      <tr><th>{'</th><th>'.join(_STMT_HEADER)}</th></tr>
+      <tr><td>01-02</td><td>对公收费</td><td>0</td><td>0</td>
+          <td></td><td>跨行汇款手续费</td>
+          <td>600.00</td><td>0.00</td><td>2,047,754.23</td><td>0005800001</td></tr>
+      <tr><td>01-05</td><td>同城转账</td><td>0</td><td>0</td>
+          <td></td><td>往来款</td>
+          <td>0.00</td><td>5,000,000.00</td><td>6,628,354.23</td><td>0005800033</td></tr>
+    </table>"""
+    ocr_grid = [
+        _STMT_HEADER,
+        ["01-02", "对公收费", "", "", "", "跨行汇款手续费",
+         "600.00", "0.00", "2,047,754.23", "0005800001"],
+        ["01-05", "同城转账", "", "", "", "往来款",
+         "0.00", "5,000,000.00", "6,628,354.23", "0005800033"],
+        ["业务专用章"],
+    ]
+    # 无 G6A（ocr_row_y 缺省 None）：噪声行正常落位至第 2 数据行空列
+    soup1 = BeautifulSoup(html, "html.parser")
+    table1 = soup1.find("table")
+    _fill_empty_cells_from_ocr_grid(soup1, table1, ocr_grid)
+    rows1 = table1.find_all("tr")
+    # VLM row 2 col4 空 → 噪声落入 VLM 行 2
+    cells_row2 = [c.get_text().strip() for c in rows1[2].find_all("td")]
+    assert cells_row2[4] == "业务专用章", f"无 G6A 时噪声应落位至 row2 col4，实际 {cells_row2[4]!r}"
+
+    # 有 G6A（ocr_row_y 提供）：噪声行 y=500 在锚定带外 → 被丢弃
+    soup2 = BeautifulSoup(html, "html.parser")
+    table2 = soup2.find("table")
+    _fill_empty_cells_from_ocr_grid(
+        soup2, table2, ocr_grid,
+        ocr_row_y=[50.0, 150.0, 250.0, 500.0],
+    )
+    rows2 = table2.find_all("tr")
+    cells2_row2 = [c.get_text().strip() for c in rows2[2].find_all("td")]
+    assert cells2_row2[4] == "", f"G6A: 噪声行应被丢弃，实际 {cells2_row2[4]!r}"
+    # 第 1 数据行行为不变
+    cells2_row1 = [c.get_text().strip() for c in rows2[1].find_all("td")]
+    assert cells2_row1[4] == "", f"第 1 数据行（原有空）应保持，实际 {cells2_row1[4]!r}"
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v", "-o", "addopts="]))
