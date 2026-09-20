@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -18,6 +17,11 @@ from loguru import logger
 
 from mineru.utils.custom.doc_classifier import DocType
 from mineru.utils.custom.doc_quality import DocumentQuality
+from mineru.utils.custom.config import (
+    get_kvp_engine,
+    get_kvp_server_url,
+    get_kvp_verify_engine,
+)
 
 
 @dataclass
@@ -83,18 +87,10 @@ def select_engine_route(
     if doc_type == DocType.FORM_KVP:
         # 🔴 票据/卡证 → KVP Pipeline
         # 默认引擎优先级：用户指定 > 环境变量 KVP_ENGINE > pp-structure（离线优先）
-        kvp_engine = (
-            user_kvp_engine
-            or os.environ.get("KVP_ENGINE")
-            or "pp-structure"
-        )
-        kvp_url = user_kvp_server_url or os.environ.get("KVP_SERVER_URL") or None
+        kvp_engine = user_kvp_engine or get_kvp_engine()
+        kvp_url = user_kvp_server_url or get_kvp_server_url()
         # VLM 纠错引擎：环境变量 KVP_VERIFY_ENGINE 可配置
-        kvp_verify = (
-            user_kvp_verify_engine
-            or os.environ.get("KVP_VERIFY_ENGINE")
-            or None
-        )
+        kvp_verify = user_kvp_verify_engine or get_kvp_verify_engine()
         return EngineRoute(
             doc_type=doc_type,
             engine_backend="kvp",

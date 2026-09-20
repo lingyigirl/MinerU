@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -25,6 +24,12 @@ from PIL import Image
 from mineru.utils.pdf_image_tools import (
     DEFAULT_PDF_IMAGE_DPI,
     load_images_from_pdf_core,
+)
+from mineru.utils.custom.config import (
+    get_kvp_api_key,
+    get_dashscope_api_key,
+    get_kvp_server_url,
+    get_kvp_engine,
 )
 
 
@@ -149,12 +154,12 @@ def _create_openai_client(config: KvpEngineConfig):
 
     api_key = (
         config.api_key
-        or os.environ.get("KVP_API_KEY")
-        or os.environ.get("DASHSCOPE_API_KEY")
+        or get_kvp_api_key()
+        or get_dashscope_api_key()
         or "not-needed"
     )
     # base_url 也可以从环境变量覆盖
-    base_url = os.environ.get("KVP_SERVER_URL") or config.base_url
+    base_url = get_kvp_server_url() or config.base_url
     return OpenAI(
         api_key=api_key,
         base_url=base_url,
@@ -386,7 +391,7 @@ def extract_kvp_from_form(
     """
     # 默认引擎：参数 > 环境变量 KVP_ENGINE > pp-structure
     if engine is None:
-        engine = os.environ.get("KVP_ENGINE", "pp-structure")
+        engine = get_kvp_engine()
 
     # 渲染页面
     images = load_images_from_pdf_core(
@@ -434,7 +439,7 @@ def extract_kvp_from_form(
         )
     config = ENGINE_REGISTRY[engine]
 
-    effective_url = server_url or os.environ.get("KVP_SERVER_URL")
+    effective_url = server_url or get_kvp_server_url()
     if effective_url:
         config = KvpEngineConfig(
             engine=config.engine,
@@ -511,7 +516,7 @@ def _verify_with_vlm(
     }
 
     config = ENGINE_REGISTRY[verify_engine]
-    effective_url = server_url or os.environ.get("KVP_SERVER_URL")
+    effective_url = server_url or get_kvp_server_url()
     if effective_url:
         config = KvpEngineConfig(
             engine=config.engine,

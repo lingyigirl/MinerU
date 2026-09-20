@@ -3,7 +3,6 @@
 确定性重建被拼接的数据行，并把 OCR 结果填回 VLM 表格的空单元格。
 入口：supplement_empty_table_cells（阶段 A 通用空单元格补充）。"""
 
-import os
 import re
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
@@ -26,6 +25,7 @@ from mineru.utils.custom.table_utils.detect import (
 from mineru.utils.custom.table_utils.ocr_guards import (
     _filter_seal_overlap_tokens,
 )
+from mineru.utils.custom.config import get_table_ocr_min_confidence
 from mineru.utils.custom.table_utils.ocr_align import (
     _INVOICE_DATA_COLUMN_KEYWORDS,
     _NUMERIC_COLUMN_KEYWORDS,
@@ -112,7 +112,7 @@ def supplement_empty_table_cells(
     # 留空的单元格（原则 1 输出不多不少；宁可为空而不错填）。
     # 环境变量 MINERU_TABLE_OCR_MIN_CONFIDENCE 控制门槛（默认 0.8）；
     # 设为 "0" 可彻底关闭置信度过滤（恢复原行为）。
-    _ocr_min_conf = float(os.getenv("MINERU_TABLE_OCR_MIN_CONFIDENCE", "0.8"))
+    _ocr_min_conf = get_table_ocr_min_confidence()
     if _ocr_min_conf > 0:
         _kept = []
         _dropped = 0

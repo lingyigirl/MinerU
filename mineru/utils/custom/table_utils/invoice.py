@@ -3,7 +3,6 @@
 列跨度归一化、8 列签名收拢、合计行 ¥ 值列对齐、购买方/销售方
 信息多行拆分。入口 normalize_invoice_table（阶段 B 钩子 4）等。"""
 
-import os
 import re
 from bs4 import BeautifulSoup, NavigableString, Tag
 from loguru import logger
@@ -16,6 +15,7 @@ from mineru.utils.custom.table_utils.detect import (
     _has_colspan_mismatch,
     _is_invoice_table,
 )
+from mineru.utils.custom.config import get_infer_missing_table_values
 
 
 # -- 购买方/销售方信息行内多行拆分 --
@@ -287,7 +287,7 @@ def _infer_missing_values_in_table(
         # 计算税率并填充
         # [自定义] 环境变量 MINERU_INFER_MISSING_TABLE_VALUES 控制是否启用推断填充
         # 默认关闭——推断值不是识别结果，违反"输出不多不少"原则
-        if not os.getenv("MINERU_INFER_MISSING_TABLE_VALUES", "").lower() in ("1", "true", "yes"):
+        if not get_infer_missing_table_values():
             continue
         computed_rate = round(tax_val / amount_val * 100)
         # 仅当税率在合理范围内（2~20%）才填充
