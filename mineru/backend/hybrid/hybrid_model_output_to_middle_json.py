@@ -274,7 +274,7 @@ def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm
     ).lower() in ("1", "true", "yes")
     if _table_ocr_supplement_enable:
         try:
-            from mineru.utils.custom.table_ocr_supplement import supplement_vlm_table_cells_with_ocr
+            from mineru.utils.custom.table_utils import supplement_vlm_table_cells_with_ocr
             supplement_vlm_table_cells_with_ocr(
                 pdf_info_list, hybrid_pipeline_model, image_writer=image_writer
             )

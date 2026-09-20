@@ -1,17 +1,27 @@
-"""印章采集与 VLM OCR 补充编排。
+"""印章采集与 VLM 表格 OCR 补充编排。
 
-从 table_utils.py 拆分出的顶层编排逻辑：印章采集、页面标题提取、
-跨页表头归一化、supplement_vlm_table_cells_with_ocr 混合入口。
-"""
+文档级印章采集、页面标题提取、跨页表头归一化，以及
+hybrid 后端阶段 A 的顶层入口 supplement_vlm_table_cells_with_ocr。"""
 
 import os
 import re
 from bs4 import BeautifulSoup
 from loguru import logger
-
-# 跨文件导入
-from mineru.utils.custom.table_utils import _is_invoice_table, _is_structurally_sparse_table, _is_financial_statement_table
-from mineru.utils.custom.table_ocr_grid import _is_ghost_table, supplement_empty_table_cells, _compact_norm, _cjk_count
+from mineru.utils.custom.table_utils._common import (
+    _cjk_count,
+    _compact_norm,
+)
+from mineru.utils.custom.table_utils.detect import (
+    _is_financial_statement_table,
+    _is_invoice_table,
+    _is_structurally_sparse_table,
+)
+from mineru.utils.custom.table_utils.ocr_guards import (
+    _is_ghost_table,
+)
+from mineru.utils.custom.table_utils.ocr_fill import (
+    supplement_empty_table_cells,
+)
 
 
 def _collect_doc_seals(pdf_info_list: list) -> set:
@@ -397,4 +407,12 @@ def supplement_vlm_table_cells_with_ocr(
     # 本步骤以跨页同列表头为基准做后缀剥离（仅改表头显示文本，不改列类型）。
     # 原则 9 跨页对照：同一表格跨多页时，非印章页的正确表头作为基准。
     _normalize_header_text_across_pages(pdf_info_list)
-    # === end 守卫 11 ===
+
+
+__all__ = [
+    '_collect_doc_seals',
+    '_collect_page_title',
+    '_normalize_header_text_across_pages',
+    '_pick_title_span',
+    'supplement_vlm_table_cells_with_ocr',
+]

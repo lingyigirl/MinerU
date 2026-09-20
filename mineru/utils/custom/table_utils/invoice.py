@@ -1,16 +1,24 @@
-"""增值税发票/VAT 表格后处理。
+"""增值税发票 / VAT 专用后处理。
 
-从 table_utils.py 拆分出的发票专用逻辑：列跨度归一化、VAT 发票列归一化、
-金额行修正、摘要拆分、多行单元格拆分等。
-"""
+列跨度归一化、8 列签名收拢、合计行 ¥ 值列对齐、购买方/销售方
+信息多行拆分。入口 normalize_invoice_table（阶段 B 钩子 4）等。"""
 
 import os
 import re
 from bs4 import BeautifulSoup, NavigableString, Tag
 from loguru import logger
+from mineru.utils.custom.table_utils._common import (
+    _SPLIT_SUMMARY_KEYWORDS,
+    _get_cell_text,
+    _is_data_value,
+)
+from mineru.utils.custom.table_utils.detect import (
+    _has_colspan_mismatch,
+    _is_invoice_table,
+)
 
-# 跨文件导入（table_utils.py 是本模块的根依赖，不反向导入）
-from mineru.utils.custom.table_utils import _is_data_value, _get_cell_text, _is_invoice_table, _has_colspan_mismatch, _SPLIT_SUMMARY_KEYWORDS
+
+# -- 购买方/销售方信息行内多行拆分 --
 
 
 def normalize_table_colspan(html: str) -> str:
@@ -297,8 +305,6 @@ def _infer_missing_values_in_table(
             )
 
 
-# -- 购买方/销售方信息行内多行拆分 --
-
 # 信息单元格中可识别为行分隔点的字段标签正则
 # 在"名称:"之后出现的这些标签前插入 <br/> 实现多行拆分
 # (统一社会信用代码/)?纳税人识别号 兼容有无"统一社会信用代码/"前缀的两种情况
@@ -411,8 +417,10 @@ def _has_significant_rowspan(html: str) -> bool:
 # 增值税发票货物区「名称」列标签（专用/普通发票共用的首列表头）。
 _VAT_INVOICE_NAME_LABELS = ("货物或应税劳务、服务名称", "项目名称")
 
+
 # 增值税发票货物区 8 列签名中除名称列外的 7 列，用于完整签名校验。
 _VAT_INVOICE_COLUMN_SIGNATURE = ("规格型号", "单位", "数量", "单价", "金额", "税率", "税额")
+
 
 # 非货物区行的行级标签（收拢列数时应保留其 colspan，不压缩）。
 _VAT_INVOICE_ROW_LABELS = ("价税合计", "购买方", "销售方", "密码区", "备注")
@@ -820,3 +828,20 @@ def _fix_summary_row_yen_for_th_table(
     )
 
 
+__all__ = [
+    '_INFO_LINE_BREAK_RE',
+    '_VAT_INVOICE_COLUMN_SIGNATURE',
+    '_VAT_INVOICE_NAME_LABELS',
+    '_VAT_INVOICE_ROW_LABELS',
+    '_fix_summary_row_yen_for_th_table',
+    '_format_summary_row_colspan',
+    '_has_significant_rowspan',
+    '_infer_missing_values_in_table',
+    '_is_vat_invoice_row_label',
+    '_normalize_vat_invoice_columns',
+    '_shrink_row_to_cols',
+    'fix_summary_row_yen_position',
+    'normalize_invoice_table',
+    'normalize_table_colspan',
+    'split_info_cell_multiline',
+]

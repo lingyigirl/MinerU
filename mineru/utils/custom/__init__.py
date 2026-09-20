@@ -11,9 +11,14 @@
 # 当前模块：
 # - pdf_utils.py: PDF 旋转修正功能（generate_rotation_corrected_pdf）
 # - content_list_utils.py: content_list_v2 后处理（list_item 独立 bbox）
-# - table_utils.py: VLM 表格 HTML 后处理（split_merged_table_cells, split_summary_from_data_cell,
-#   normalize_table_colspan, normalize_invoice_table, supplement_empty_table_cells,
-#   supplement_vlm_table_cells_with_ocr）
+# - table_utils/: VLM 表格 HTML 后处理（包，按功能域拆分）
+#   对外仍统一从 mineru.utils.custom.table_utils 导入：
+#   split_merged_table_cells, split_summary_from_data_cell,
+#   normalize_table_colspan, normalize_invoice_table,
+#   supplement_empty_table_cells, supplement_vlm_table_cells_with_ocr
+#   子模块：_common / detect / merge_split / summary / invoice /
+#          ocr_guards / ocr_align / ocr_fill / header_prefix / ocr_supplement
+#   新增表格函数请放入对应子模块，并由该子模块 __all__ 导出
 # - doc_quality.py: S0 文档质量分析器（DPI/模糊/印章/旋转检测）
 # - doc_classifier.py: S1 文档分类器（"信号灯"三路路由：通用/表格/表单）
 # - kvp_extractor.py: KVP Pipeline（基于 MLLM 的票据/卡证 KVP 信息提取）
