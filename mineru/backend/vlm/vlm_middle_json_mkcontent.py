@@ -92,7 +92,7 @@ def _format_embedded_html(html, img_buket_path):
     # [自定义] VLM 表格 HTML 后处理：发票表格 colspan 规范化、缺失值推断
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
-        from mineru.utils.custom.table_utils import normalize_invoice_table
+        from mineru.utils.custom.table_invoice import normalize_invoice_table
         formatted = normalize_invoice_table(formatted)
     except Exception as exc:
         logger.warning(
@@ -103,7 +103,7 @@ def _format_embedded_html(html, img_buket_path):
     # normalize_invoice_table 可能调整 colspan 导致 ¥ 值列错位，
     # 此步骤在 colspan 规范化后重新将 ¥ 值对齐到"金额"和"税额"列。
     try:
-        from mineru.utils.custom.table_utils import fix_summary_row_yen_position
+        from mineru.utils.custom.table_invoice import fix_summary_row_yen_position
         formatted = fix_summary_row_yen_position(formatted)
     except Exception as exc:
         logger.warning(
@@ -113,7 +113,7 @@ def _format_embedded_html(html, img_buket_path):
     # [自定义] VLM 表格 HTML 后处理：购买方/销售方信息行内多行拆分
     # 将 "名称:xxx统一社会信用代码/纳税人识别号:yyy" 拆分为两行
     try:
-        from mineru.utils.custom.table_utils import split_info_cell_multiline
+        from mineru.utils.custom.table_invoice import split_info_cell_multiline
         formatted = split_info_cell_multiline(formatted)
     except Exception as exc:
         logger.warning(
