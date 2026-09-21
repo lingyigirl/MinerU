@@ -268,9 +268,9 @@ def _process_output(
                         rotated_pdf_bytes,
                     )
                 else:
-                    logger.warning(
-                        f"旋转修正PDF生成为空，跳过写入 {pdf_file_name}_rotated.pdf，"
-                        f"请检查上方日志中是否有 load_images_from_pdf_core 或 pdf_images_to_pdf_bytes 的警告"
+                    logger.info(
+                        f"无需旋转修正，跳过写入 {pdf_file_name}_rotated.pdf"
+                        f"（解析沿用原始 PDF 的文本层）"
                     )
             except Exception as exc:
                 logger.warning(

@@ -86,8 +86,14 @@ def generate_rotation_corrected_pdf(
     5. 合成前还会去除红色印章像素（见 custom/seal_removal.py，开关
        MINERU_SEAL_REMOVAL）：印章会被切成图片块压住表头/字段文字，
        去掉后表头与字段才完整
+    6. [自定义] 若所有页面都无需旋转，直接返回空字节，由调用方沿用原始
+       pdf_bytes——避免无谓的全页光栅化销毁原生文本层。此时步骤 5 的印章
+       白化也不会执行（已知取舍，见函数内注释）
 
     注意：此函数会用 pypdfium2 打开文档，调用者需确保 pdfium_guard 锁可用。
+
+    Returns:
+        修正后的 PDF 字节流；若无页面需要旋转则返回 b""（调用方应沿用原始字节）。
 
     Args:
         pdf_bytes: 原始 PDF 字节流。
@@ -145,6 +151,7 @@ def generate_rotation_corrected_pdf(
 
     # Phase 3: 两级判定 → 旋转修正
     skip_count = 0
+    rotated_count = 0
     for idx, (img_dict, (label, conf)) in enumerate(zip(images_list, page_votes)):
         try:
             if label == majority:
@@ -153,12 +160,14 @@ def generate_rotation_corrected_pdf(
                     img_dict["img_pil"] = cls_model.rotate_pil_image(
                         img_dict["img_pil"], label
                     )
+                    rotated_count += 1
             else:
                 # 偏离多数派：仅当高置信度时执行独立旋转，否则视为低置信误判跳过
                 if conf >= theta and label != "0":
                     img_dict["img_pil"] = cls_model.rotate_pil_image(
                         img_dict["img_pil"], label
                     )
+                    rotated_count += 1
                 else:
                     skip_count += 1
                     logger.info(
@@ -176,6 +185,16 @@ def generate_rotation_corrected_pdf(
             f"旋转修正PDF——共跳过 {skip_count}/{len(images_list)} 页"
             f"（低置信偏离多数派）"
         )
+
+    # [自定义] 无任何页面需要旋转 → 不重编码 PDF，返回空字节让调用方沿用原始
+    # pdf_bytes。重编码会把整页光栅化，销毁原生文本层，使下游 txt_spans_extract
+    # 拿不到字符而降级为全文 OCR（精度与效率双降）。此处早退同时跳过印章白化，
+    # 属于已知取舍：需要白化的文档靠文本层读字 + span_gap_rescue 兜底。
+    if rotated_count == 0:
+        logger.info(
+            f"旋转修正PDF——{len(images_list)}页均无需旋转，保留原始PDF（含文本层）"
+        )
+        return b""
 
     # [自定义] 合成前去除红色印章像素：印章会被切成独立图片块，压在表头/
     # 字段文字上时导致表头格被 VLM 误读、字段 span 被截断。只白化"印章状"
