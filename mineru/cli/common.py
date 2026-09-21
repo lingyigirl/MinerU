@@ -257,7 +257,7 @@ def _process_output(
                 f"{pdf_file_name}_origin.pdf",
                 pdf_bytes,
             )
-            # [自定义] 生成旋转修正后的 PDF（页面朝向检测+旋转为正）
+            # [自定义] 生成预处理后的 PDF（页面朝向检测+旋转为正，并去除红色印章）
             # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
             try:
                 from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf

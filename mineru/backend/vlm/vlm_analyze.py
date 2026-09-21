@@ -434,7 +434,7 @@ def doc_analyze(
         predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
 
-    # [自定义] 在解析入口处对 PDF 做整体旋转修正
+    # [自定义] 在解析入口处对 PDF 做整体旋转修正 + 红色印章去除
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
         from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf
@@ -540,7 +540,7 @@ async def aio_doc_analyze(
         predictor = await _get_model_async(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
 
-    # [自定义] 在解析入口处对 PDF 做整体旋转修正
+    # [自定义] 在解析入口处对 PDF 做整体旋转修正 + 红色印章去除
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
         from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf

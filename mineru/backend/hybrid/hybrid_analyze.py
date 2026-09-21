@@ -730,9 +730,10 @@ def doc_analyze(
     _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
     _vlm_ocr_enable = _should_enable_vlm_ocr(_ocr_enable, language, inline_formula_enable)
 
-    # [自定义] 在解析入口处对 PDF 做整体旋转修正（逐页朝向检测+旋转后合成），
-    # 然后以旋转后的 PDF 为输入。这样 pdfium 页面尺寸与实际图片一致，
-    # 下游代码（VLM bbox 还原、OCR 区域裁剪等）无需任何额外适配。
+    # [自定义] 在解析入口处对 PDF 做整体页面图像预处理（逐页朝向检测+旋转后合成，
+    # 并去除红色印章像素），然后以处理后的 PDF 为输入。
+    # 这样 pdfium 页面尺寸与实际图片一致，下游代码（VLM bbox 还原、OCR 区域裁剪等）
+    # 无需任何额外适配。
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
         from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf
@@ -882,7 +883,7 @@ async def aio_doc_analyze(
     _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
     _vlm_ocr_enable = _should_enable_vlm_ocr(_ocr_enable, language, inline_formula_enable)
 
-    # [自定义] 在解析入口处对 PDF 做整体旋转修正
+    # [自定义] 在解析入口处对 PDF 做整体旋转修正 + 红色印章去除
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
         from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf

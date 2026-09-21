@@ -9,7 +9,9 @@
 # 3. 所有自定义代码需添加清晰的注释说明用途
 #
 # 当前模块：
-# - pdf_utils.py: PDF 旋转修正功能（generate_rotation_corrected_pdf）
+# - pdf_utils.py: PDF 页面图像预处理（旋转修正 generate_rotation_corrected_pdf
+#   + 红色印章去除）
+# - seal_removal.py: 红色印章像素去除（守卫规则：膨胀合并笔画 + 印章状区域判定）
 # - content_list_utils.py: content_list_v2 后处理（list_item 独立 bbox）
 # - table_utils/: VLM 表格 HTML 后处理（包，按功能域拆分）
 #   对外仍统一从 mineru.utils.custom.table_utils 导入：

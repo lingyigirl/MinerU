@@ -187,6 +187,116 @@ def get_infer_missing_table_values() -> bool:
     )
 
 
+# --- span 字符游程救援 ---
+
+def get_span_gap_rescue_enable() -> bool:
+    """是否启用 span 字符游程救援（gap-aware char rescue）。
+
+    原生文本层字符若中心点落在 span 框外，会被 fill_char_in_spans 直接丢弃 ——
+    当 span 框（来自 VLM ocr_text 或 layout）被印章/图片块截断时，框外字符即丢失
+    （表现为「：元」缺「单位」、「枣庄薛城」缺「支行」）。
+    本开关启用第二遍救援：把紧邻 span 现有游程的未归属字符按间隙吸收进来。
+
+    环境变量：MINERU_SPAN_GAP_RESCUE
+    JSON 键：  custom.span_gap_rescue_enable
+    默认值：  True
+    """
+    return get_bool(
+        "span_gap_rescue_enable",
+        env_var="MINERU_SPAN_GAP_RESCUE",
+        default=True,
+    )
+
+
+def get_span_gap_rescue_ratio() -> float:
+    """游程救援的最大水平间隙，按 span 高度的倍数计。
+
+    间隙超过该倍数视为跨字段/跨列边界，停止吸收。
+    中文正文的字间距远小于半个行高，而不同字段之间（如「支行」与「时间」间距 34.9pt
+    对 11pt 行高）约为其 3 倍以上，故 0.5 能干净地切在字段边界。
+
+    环境变量：MINERU_SPAN_GAP_RESCUE_RATIO
+    JSON 键：  custom.span_gap_rescue_ratio
+    默认值：  0.5
+    """
+    return get_float(
+        "span_gap_rescue_ratio",
+        env_var="MINERU_SPAN_GAP_RESCUE_RATIO",
+        default=0.5,
+    )
+
+
+# --- 红色印章去除 ---
+
+def get_seal_removal_enable() -> bool:
+    """是否启用红色印章去除（页面图像预处理）。
+
+    红色印章会被切成独立图片块，压在表头/字段文字上时导致两类错误：
+    表头格被 VLM 误读（转入金额/借贷标志 → 借出金额）、字段 span 被图片块
+    截断（「本方账号开户行」丢「支行」）。把印章红像素白化后两类错误同时消失。
+    守卫规则见 mineru/utils/custom/seal_removal.py；只影响红色像素，黑印章不处理。
+
+    环境变量：MINERU_SEAL_REMOVAL
+    JSON 键：  custom.seal_removal_enable
+    默认值：  True
+    """
+    return get_bool(
+        "seal_removal_enable",
+        env_var="MINERU_SEAL_REMOVAL",
+        default=True,
+    )
+
+
+def get_seal_removal_dilate_px() -> int:
+    """印章守卫的膨胀核边长（像素），用于把被黑字切断的印章笔画并成整体。
+
+    200 DPI 下默认 25px（约 3mm）足以跨越印章笔画间隙；调大可把相距更远的
+    红色元素并作一个整体（更激进），调小则更保守。
+
+    环境变量：MINERU_SEAL_REMOVAL_DILATE_PX
+    JSON 键：  custom.seal_removal_dilate_px
+    默认值：  25
+    """
+    return get_int(
+        "seal_removal_dilate_px",
+        env_var="MINERU_SEAL_REMOVAL_DILATE_PX",
+        default=25,
+    )
+
+
+def get_seal_removal_min_area_ratio() -> float:
+    """印章守卫的 bbox 面积占比下限。
+
+    占比 = 连通域 bbox 面积 / 页面面积。低于下限视为小红色元素
+    （红字金额、零星红点等），不白化。
+
+    环境变量：MINERU_SEAL_REMOVAL_MIN_AREA_RATIO
+    JSON 键：  custom.seal_removal_min_area_ratio
+    默认值：  0.004
+    """
+    return get_float(
+        "seal_removal_min_area_ratio",
+        env_var="MINERU_SEAL_REMOVAL_MIN_AREA_RATIO",
+        default=0.004,
+    )
+
+
+def get_seal_removal_max_area_ratio() -> float:
+    """印章守卫的 bbox 面积占比上限。
+
+    超过上限视为大片红色版面元素（整页红底、红色水印等），不白化，防误伤。
+
+    环境变量：MINERU_SEAL_REMOVAL_MAX_AREA_RATIO
+    JSON 键：  custom.seal_removal_max_area_ratio
+    默认值：  0.08
+    """
+    return get_float(
+        "seal_removal_max_area_ratio",
+        env_var="MINERU_SEAL_REMOVAL_MAX_AREA_RATIO",
+        default=0.08,
+    )
+
+
 # --- KVP 引擎 ---
 
 def get_kvp_engine() -> str:
@@ -246,6 +356,14 @@ __all__ = [
     # OCR 表格
     "get_table_ocr_min_confidence",
     "get_infer_missing_table_values",
+    # span 游程救援
+    "get_span_gap_rescue_enable",
+    "get_span_gap_rescue_ratio",
+    # 红色印章去除
+    "get_seal_removal_enable",
+    "get_seal_removal_dilate_px",
+    "get_seal_removal_min_area_ratio",
+    "get_seal_removal_max_area_ratio",
     # KVP
     "get_kvp_engine",
     "get_kvp_server_url",

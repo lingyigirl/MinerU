@@ -262,6 +262,16 @@ def fill_char_in_spans(spans, all_chars, median_span_height):
                 span['chars'].append(char)
                 break
 
+    # [自定义] span 字符游程救援：把中心点落在 span 框外、紧邻现有游程的
+    # 未归属字符按水平间隙吸收进来（span 框被印章/图片截断时框外字符原会直接丢弃）。
+    # 只处理第一遍无人认领的字符，不改 span bbox；开关 MINERU_SPAN_GAP_RESCUE。
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.span_gap_rescue import rescue_isolated_chars
+        rescue_isolated_chars(spans, all_chars)
+    except Exception as exc:
+        logger.warning(f"span游程救援执行失败，将跳过: {exc}")
+
     need_ocr_spans = []
     for span in spans:
         chars_to_content(span)
