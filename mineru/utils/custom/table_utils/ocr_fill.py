@@ -14,6 +14,7 @@ from mineru.utils.custom.table_utils._common import (
     _compact_norm,
     _edit_distance_le1,
     _is_data_value,
+    _is_lossy_row_variant,
     _is_merged_noise,
     _is_pure_punctuation,
     _is_same_row_value_variant,
@@ -1245,6 +1246,19 @@ def _fill_empty_cells_from_ocr_grid(
             # 此判定天然不命中（_digits_only 为空时退化为精确相等比对），
             # 不误伤「吨/免税」等合法短值。
             if _is_same_row_value_variant(ot, vlm_row):
+                continue
+            # [自定义] 守卫 13：同行有损子序列（残片完整度）。
+            # 守卫 8 只认「数字串完全相等」的变体，守卫 5B/G6B1/G6B2 只认
+            # 「前/后缀截断（长度差 ≤2）」或「编辑距离 ≤1」，而残片的实际
+            # 关系是「子序列 + 3~8 个删除」——实测滕悦 37 处 CJK 残片全部
+            # 逃逸（「山东汇智慧营销策划有限」← 同行「山东汇智慧赢营销策划
+            # 有限公司」，丢 3 字，非前后缀）。此处拦「同一行的值被有损重读
+            # 后当作新值」。安全性来自「同行」约束：跨行同名值不受影响，
+            # 四份文档实测对 VLM 原生值零误判。数字侧不在此列（同行「余额
+            # 14,300,000.00」↔「转入金额 4,300,000.00」是合法的有损子序列
+            # 关系，需另行设计判别，见守卫 13 的常量注释）。
+            if _is_lossy_row_variant(ot, vlm_row):
+                logger.debug(f"守卫 13 拒绝(同行残片): 行{vlm_row_idx} ← '{ot}'")
                 continue
             # [Fix] 判型前先做全角→半角归一：OCR 的全角逗号/全角数字落在
             # _is_data_value 的半角字符类盲区，会把数值串判成 text——既拿到

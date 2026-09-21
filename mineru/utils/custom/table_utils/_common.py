@@ -82,6 +82,21 @@ _FIXED_LEN_RATIO_MIN = 0.6
 _LONG_DIGIT_LEN = 6
 # 代码列拒收候选的「长数字」阈值（掩码账号/账号形态）
 _MASKED_DIGIT_LEN = 8
+# 短值 CJK 列的上限：列内已有 CJK 值上限不超过该字数才启用字长契约
+_COLUMN_CJK_SHORT_MAX = 4
+# 短值 CJK 列的越界宽度：候选 CJK 字数 >= 列内上限 + 该值即违约
+_COLUMN_CJK_EXPAND = 4
+
+# === [自定义] 守卫 13：同行残片（有损子序列）—— 常量 ===
+# 有损子序列：候选是同行某值的子序列（即该值删掉若干字符可得候选），
+# 用于拦截「同一行的值被 OCR 有损重读后当作新值」的残片。守卫 5B/G6B1/
+# G6B2 均建立在「前/后缀截断（长度差 ≤2）」或「编辑距离 ≤1」之上，对本
+# 类无效——实测关系是子序列 + 3~8 个删除（如「山东汇智慧营销策划有限」←
+# 同行「山东汇智慧赢营销策划有限公司」）。
+_LOSSY_SUBSEQ_MAX_DEL = 8
+_LOSSY_SUBSEQ_RATIO_MIN = 0.5
+_LOSSY_SUBSEQ_MIN_LEN = 6
+_LOSSY_SUBSEQ_MIN_CJK = 4
 
 
 def _build_column_profiles(vlm_data: list[list[str]]) -> dict[int, dict]:
@@ -132,6 +147,7 @@ def _build_column_profiles(vlm_data: list[list[str]]) -> dict[int, dict]:
         amount_ratio = amount_hits / n
         is_amount = amount_ratio >= _AMOUNT_RATIO_MIN
         dom_len_ratio = dom_hits / len(digit_lens) if digit_lens else 0.0
+        cjk_lens = [_cjk_count(v) for v in values if _cjk_count(v) > 0]
         profiles[vc] = {
             "n": n,
             "amount_ratio": amount_ratio,
@@ -146,6 +162,11 @@ def _build_column_profiles(vlm_data: list[list[str]]) -> dict[int, dict]:
             "dom_len": dom_len,
             "dom_len_ratio": dom_len_ratio,
             "has_long_digit": any(d >= _LONG_DIGIT_LEN for d in digit_lens),
+            # 守卫 12 判据 (d) 用：该列已有 CJK 值的字长上限与样本数。
+            # 「用途」这类短值列（实测上限 2-3 字）被灌入 9-11 字的
+            # 对方单位残片，是滕悦 67 处残余的主形态。
+            "cjk_n": len(cjk_lens),
+            "cjk_hi": max(cjk_lens) if cjk_lens else 0,
         }
     return profiles
 
@@ -157,13 +178,20 @@ def _violates_column_contract(
 ) -> bool:
     """候选值是否违反目标列已确立的形态契约（守卫 12）。
 
-    与列类型无关，只看「该列已有值的形态」。三条判据：
+    与列类型无关，只看「该列已有值的形态」。四条判据：
       (a) 金额列：候选须匹配该列已确立的金额形态（拦 00.0000/1000000 等
           小数位不符或裸整数形态）；
       (b) 非金额定长列：候选数字位须落在主流长度 ±1（拦 9 位 vs 主流 12 位
           的行号残片）；
       (c) 代码/短值列（该列无 >=6 位数字值）：拒收无 CJK 的 >=8 位数字串
-          （拦 15 位掩码账号灌入「凭证种类」）。
+          （拦 15 位掩码账号灌入「凭证种类」）；
+      (d) 短值 CJK 列（该列已有 CJK 值上限 <= _COLUMN_CJK_SHORT_MAX）：
+          拒收 CJK 字数 >= 上限 + _COLUMN_CJK_EXPAND 的候选（拦 9-11 字的
+          对方单位残片灌入 2-3 字的「用途」列，滕悦 67 处残余主形态）。
+
+    判据 (d) 的越界宽度取 +4 而非 +1：列内已有值只代表"至少这么长"，
+    合法新值长于已有值是常态（首次出现的较长摘要等），故只拦明显越界的
+    长残片；且仅当列内 CJK 值全都较短时才启用，长值列不受约束。
 
     Args:
         candidate: OCR 候选值原始文本。
@@ -196,6 +224,58 @@ def _violates_column_contract(
         and _cjk_count(candidate) == 0
     ):
         return True
+    # (d) 短值 CJK 列的字长契约：列内已有 CJK 值上限较短时，越界的长 CJK
+    # 候选不是该列的值，而是从别处（多为同行对方单位列）漏进来的残片。
+    if (
+        profile["cjk_n"] >= _MIN_PROFILE_SAMPLES
+        and profile["cjk_hi"] <= _COLUMN_CJK_SHORT_MAX
+        and _cjk_count(candidate) >= profile["cjk_hi"] + _COLUMN_CJK_EXPAND
+    ):
+        return True
+    return False
+
+
+def _is_subsequence(short: str, long: str) -> bool:
+    """short 是否为 long 的子序列（按顺序出现、允许中间跳字）。"""
+    it = iter(long)
+    return all(ch in it for ch in short)
+
+
+def _is_lossy_row_variant(candidate: str, row_values: list[str]) -> bool:
+    """候选是否为同行某值的有损子序列（守卫 13）。
+
+    与守卫 8（同行数值变体，比数字串相等）互补：守卫 8 只认「数字串完全
+    相等」的 OCR 变体，对丢字/换字的残片无效。本判据覆盖「同一行的值被
+    OCR 有损重读成一个更短的串」——实测滕悦 37 处 CJK 残片属此类
+    （「山东汇智慧营销策划有限」← 同行「山东汇智慧赢营销策划有限公司」，
+    丢 3 字；「滕州市华安装工程有」←「滕州市华塑建筑安装工程有限责」）。
+
+    安全性来自「同行」这一约束：跨行同名值（如多行重复的公司名）不受影响，
+    实测四份文档（工行/威海/滕悦/新发）对 VLM 原生值零误判。数字侧不在此
+    判据内——同行「余额 14,300,000.00」与「转入金额 4,300,000.00」构成
+    合法的有损子序列关系，数字侧需另行设计判别，避免误杀合法小额（原则 1）。
+
+    Args:
+        candidate: OCR 候选值原始文本。
+        row_values: 同一行的 VLM 单元值（含空串，内部跳过）。
+
+    Returns:
+        True 表示是同行残片，应丢弃该候选。
+    """
+    if _cjk_count(candidate) < _LOSSY_SUBSEQ_MIN_CJK:
+        return False
+    if len(candidate) < _LOSSY_SUBSEQ_MIN_LEN:
+        return False
+    for value in row_values:
+        if not value or value == candidate:
+            continue
+        deleted = len(value) - len(candidate)
+        if not (0 < deleted <= _LOSSY_SUBSEQ_MAX_DEL):
+            continue
+        if len(candidate) < _LOSSY_SUBSEQ_RATIO_MIN * len(value):
+            continue
+        if _is_subsequence(candidate, value):
+            return True
     return False
 
 
@@ -531,6 +611,7 @@ __all__ = [
     '_is_same_row_value_variant',
     '_is_single_cjk_char',
     '_is_text_token',
+    '_is_lossy_row_variant',
     '_normalize_for_matching',
     '_strip_header_prefix',
     '_strip_leading_punctuation',
