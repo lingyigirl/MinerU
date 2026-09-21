@@ -237,11 +237,11 @@ def _is_same_row_value_variant(ot: str, vlm_row: list[str]) -> bool:
         # ① 数字归一化相等
         if d_ot == d_vt:
             return True
-        # ② 截断残片（短的一侧 ≥5 位，长度差 ≤2）
+        # ② 截断残片（短的一侧 ≥5 位，长度差 ≤3；≤2 漏掉千位分组截断 e.g. 1,000,000.00→1,000,00 diff=3）
         shorter, longer = (d_ot, d_vt) if len(d_ot) <= len(d_vt) else (d_vt, d_ot)
         if (
             len(shorter) >= 5
-            and len(longer) - len(shorter) <= 2
+            and len(longer) - len(shorter) <= 3
             and (longer.startswith(shorter) or longer.endswith(shorter))
         ):
             return True
