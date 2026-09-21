@@ -5,6 +5,7 @@
 
 import re
 import unicodedata
+from collections import Counter
 from typing import Optional
 from bs4 import Tag
 
@@ -62,6 +63,140 @@ def _is_text_token(token: str) -> bool:
         True 表示文本类型。
     """
     return not _is_data_value(token)
+
+
+# === [自定义] 守卫 12：列形态契约 —— 常量 ===
+# 标准金额形态（千分位）与退化形态（无千分位）。用于按列统计「已确立值」
+# 中金额形态的占比，从而与列类型解耦地识别金额列（类型推断不可靠：
+# 新发流水表头实测 11 列全部被判为 text，number 列数为 0）。
+_AMOUNT_STRICT = re.compile(r"^\d{1,3}(,\d{3})*\.\d{2}$")
+_AMOUNT_PLAIN = re.compile(r"^\d+\.\d{2}$")
+
+# 列画像的最小样本数：少于该数量不生成画像，守卫对无画像列零介入（保守优先）
+_MIN_PROFILE_SAMPLES = 3
+# 金额列判定：金额形态占比阈值
+_AMOUNT_RATIO_MIN = 0.8
+# 定长列判定：主流数字位长度支持率阈值
+_FIXED_LEN_RATIO_MIN = 0.6
+# 「该列含长数字值」的阈值（用于区分代码列与账号/行号列）
+_LONG_DIGIT_LEN = 6
+# 代码列拒收候选的「长数字」阈值（掩码账号/账号形态）
+_MASKED_DIGIT_LEN = 8
+
+
+def _build_column_profiles(vlm_data: list[list[str]]) -> dict[int, dict]:
+    """按列统计 VLM 已确立值的形态画像（守卫 12 的判据来源）。
+
+    与列类型解耦：判据取自「该列已有值长什么样」，而非表头关键词推断的
+    列类型。_infer_column_types_from_header 的子串匹配会把「发生额/余额/
+    凭证种类」判成 text（新发流水实测整表 0 个 number 列），使类型驱动的
+    守卫反向放行 text 类污染。
+
+    Args:
+        vlm_data: VLM 表格的文本网格（含表头行）。
+
+    Returns:
+        {列索引: 画像 dict}，仅含非空样本数 >= _MIN_PROFILE_SAMPLES 的列。
+        画像字段：
+          n             非空样本数
+          amount_ratio  符合金额严格/退化形态的占比
+          is_amount     amount_ratio >= _AMOUNT_RATIO_MIN
+          dom_len       数字位长度众数
+          dom_len_ratio 众数支持率
+          is_fixed_len  非金额列且 dom_len_ratio >= _FIXED_LEN_RATIO_MIN
+                        且 dom_len >= 4（账号/行号/回单编号类定长列）
+          has_long_digit 该列是否存在数字位 >= _LONG_DIGIT_LEN 的值
+    """
+    col_count = max((len(row) for row in vlm_data), default=0)
+    profiles: dict[int, dict] = {}
+    for vc in range(col_count):
+        values = [
+            _normalize_for_matching(row[vc])
+            for row in vlm_data
+            if vc < len(row) and row[vc] and row[vc].strip()
+        ]
+        n = len(values)
+        if n < _MIN_PROFILE_SAMPLES:
+            continue
+        amount_hits = sum(
+            1
+            for v in values
+            if _AMOUNT_STRICT.match(v) or _AMOUNT_PLAIN.match(v)
+        )
+        digit_lens = [len(d) for d in (_digits_only(v) for v in values) if d]
+        dom_len = 0
+        dom_hits = 0
+        if digit_lens:
+            dom_len = Counter(digit_lens).most_common(1)[0][0]
+            dom_hits = digit_lens.count(dom_len)
+        amount_ratio = amount_hits / n
+        is_amount = amount_ratio >= _AMOUNT_RATIO_MIN
+        dom_len_ratio = dom_hits / len(digit_lens) if digit_lens else 0.0
+        profiles[vc] = {
+            "n": n,
+            "amount_ratio": amount_ratio,
+            "is_amount": is_amount,
+            # 金额列不做定长约束：金额的数字位长度本就随数量级浮动，
+            # 定长窗口会误杀合法的不同位数金额（原则 1 输出不少）。
+            "is_fixed_len": (
+                not is_amount
+                and dom_len >= 4
+                and dom_len_ratio >= _FIXED_LEN_RATIO_MIN
+            ),
+            "dom_len": dom_len,
+            "dom_len_ratio": dom_len_ratio,
+            "has_long_digit": any(d >= _LONG_DIGIT_LEN for d in digit_lens),
+        }
+    return profiles
+
+
+def _violates_column_contract(
+    candidate: str,
+    vc: int,
+    col_profiles: dict[int, dict],
+) -> bool:
+    """候选值是否违反目标列已确立的形态契约（守卫 12）。
+
+    与列类型无关，只看「该列已有值的形态」。三条判据：
+      (a) 金额列：候选须匹配该列已确立的金额形态（拦 00.0000/1000000 等
+          小数位不符或裸整数形态）；
+      (b) 非金额定长列：候选数字位须落在主流长度 ±1（拦 9 位 vs 主流 12 位
+          的行号残片）；
+      (c) 代码/短值列（该列无 >=6 位数字值）：拒收无 CJK 的 >=8 位数字串
+          （拦 15 位掩码账号灌入「凭证种类」）。
+
+    Args:
+        candidate: OCR 候选值原始文本。
+        vc: 目标列索引。
+        col_profiles: _build_column_profiles 的输出。
+
+    Returns:
+        True 表示违反契约、应拒绝该列。
+    """
+    profile = col_profiles.get(vc)
+    if not profile:
+        return False  # 样本不足 → 守卫不介入（保守优先）
+    norm = _normalize_for_matching(candidate)
+    if profile["is_amount"] and not (
+        _AMOUNT_STRICT.match(norm) or _AMOUNT_PLAIN.match(norm)
+    ):
+        return True
+    digits = _digits_only(candidate)
+    if profile["is_fixed_len"] and digits:
+        if not (profile["dom_len"] - 1 <= len(digits) <= profile["dom_len"] + 1):
+            return True
+    # 无 CJK 才判代码列污染：含中文的候选（如「摘要 12345678」）不属于
+    # 掩码账号形态，不在此拦截（原则 1 输出不少）。金额列不适用此判据——
+    # 金额列由 (a) 的格式判据管辖：已确立值可能恰好全为 "0.00"（短位数），
+    # 此时合法的大额数会被误拒，故 (c) 只对非金额的代码/短值列生效。
+    if (
+        not profile["is_amount"]
+        and not profile["has_long_digit"]
+        and len(digits) >= _MASKED_DIGIT_LEN
+        and _cjk_count(candidate) == 0
+    ):
+        return True
+    return False
 
 
 def _get_cell_text(cells: list[Tag], idx: int) -> str:
@@ -299,7 +434,11 @@ def _is_merged_noise(text: str) -> bool:
     模式 M2: YYYY-MM-DD 紧接 HH:MM 无空格（"2025-02-1416:53:28"）
              —— 源 PDF 中交易日期与时间之间必有空格，无空格拼接
              即 OCR 丢失分隔符（合法时间串 "2025-02-14 16:53:28"
-             中间是空格，不匹配）。
+             中间是空格，不匹配）。小时位放宽为 1-2 位：OCR 对
+             「0:34」「1:42」这类单数字小时的读物同样会与日期连写
+             （实测残留 "2025-01-220:34"、"2026-01-011:42" 均因小时位
+             硬编码两位数字而逃逸，贡献 18 处注入）；两条模式都要求日期
+             与时间之间无分隔符，故不会误伤空格分隔的合法时间戳。
 
     Args:
         text: 待检查的原始 OCR 文本。
@@ -309,7 +448,8 @@ def _is_merged_noise(text: str) -> bool:
     """
     return bool(
         re.match(r"^\d{2}-\d{2}\D", text)
-        or re.match(r"^\d{4}-\d{2}-\d{2}\d{2}:\d{2}", text),
+        or re.match(r"^\d{4}-\d{2}-\d{2}\d{1,2}:\d{2}", text)
+        or re.match(r"^\d{4}-\d{2}-\d{2}\d{1,2}[:：]\d{1,2}[:：]?\d{0,2}$", text),
     )
 
 
@@ -377,6 +517,7 @@ __all__ = [
     '_INVOICE_HEADER_KEYWORDS',
     '_SEAL_NOISE_CHARS',
     '_SPLIT_SUMMARY_KEYWORDS',
+    '_build_column_profiles',
     '_cjk_count',
     '_classify_ocr_item_type',
     '_compact_norm',
@@ -393,4 +534,5 @@ __all__ = [
     '_normalize_for_matching',
     '_strip_header_prefix',
     '_strip_leading_punctuation',
+    '_violates_column_contract',
 ]
