@@ -730,10 +730,10 @@ def doc_analyze(
     _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
     _vlm_ocr_enable = _should_enable_vlm_ocr(_ocr_enable, language, inline_formula_enable)
 
-    # [自定义] 在解析入口处对 PDF 做整体页面图像预处理（逐页朝向检测+旋转后合成，
-    # 并去除红色印章像素），然后以处理后的 PDF 为输入。
-    # 这样 pdfium 页面尺寸与实际图片一致，下游代码（VLM bbox 还原、OCR 区域裁剪等）
-    # 无需任何额外适配。
+    # [自定义] 在解析入口处对 PDF 做页面旋转修正，确保 pdfium 页面尺寸
+    # 与图片一致（下游 VLM bbox 还原、OCR 区域裁剪无需额外适配）。
+    # 红色印章去除已从 PDF 字节级迁至图像级（见下方 window 循环内的
+    # [自定义] 白化钩子），以保留原生文本层（Fix 1 + option 2 ②）。
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
         from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf
@@ -777,6 +777,15 @@ def doc_analyze(
                     image_type=ImageType.PIL,
                     pdf_bytes=pdf_bytes,
                 )
+                # [自定义] 图像级红色印章去除：在 VLM/OCR 看到图像前白化像素，
+                # 不修改 pdf_bytes，从而保留原生文本层（Fix 1）。印章块压住的
+                # 表头/字段文字，视觉上印色消失后 VLM 才能正确分块。
+                # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+                try:
+                    from mineru.utils.custom.seal_removal import remove_seal_from_images
+                    remove_seal_from_images(images_list)
+                except Exception as exc:
+                    logger.warning(f"印章去除失败，保留原图继续: {exc}")
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
                     logger.info(
@@ -883,7 +892,10 @@ async def aio_doc_analyze(
     _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
     _vlm_ocr_enable = _should_enable_vlm_ocr(_ocr_enable, language, inline_formula_enable)
 
-    # [自定义] 在解析入口处对 PDF 做整体旋转修正 + 红色印章去除
+    # [自定义] 在解析入口处对 PDF 做页面旋转修正，确保 pdfium 页面尺寸
+    # 与图片一致（下游 VLM bbox 还原、OCR 区域裁剪无需额外适配）。
+    # 红色印章去除已从 PDF 字节级迁至图像级（见下方 window 循环内的
+    # [自定义] 白化钩子），以保留原生文本层（Fix 1 + option 2 ②）。
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
         from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf
@@ -926,6 +938,15 @@ async def aio_doc_analyze(
                     end_page_id=window_end,
                     image_type=ImageType.PIL,
                 )
+                # [自定义] 图像级红色印章去除：在 VLM/OCR 看到图像前白化像素，
+                # 不修改 pdf_bytes，从而保留原生文本层（Fix 1）。印章块压住的
+                # 表头/字段文字，视觉上印色消失后 VLM 才能正确分块。
+                # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+                try:
+                    from mineru.utils.custom.seal_removal import remove_seal_from_images
+                    remove_seal_from_images(images_list)
+                except Exception as exc:
+                    logger.warning(f"印章去除失败，保留原图继续: {exc}")
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
                     logger.info(

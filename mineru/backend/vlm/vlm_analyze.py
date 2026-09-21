@@ -434,7 +434,9 @@ def doc_analyze(
         predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
 
-    # [自定义] 在解析入口处对 PDF 做整体旋转修正 + 红色印章去除
+    # [自定义] 在解析入口处对 PDF 做页面旋转修正，确保 pdfium 页面尺寸
+    # 与图片一致。红色印章去除已从 PDF 字节级迁至图像级（见下方 window
+    # 循环内的 [自定义] 白化钩子），以保留原生文本层（Fix 1 + option 2 ②）。
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
         from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf
@@ -475,6 +477,14 @@ def doc_analyze(
                     image_type=ImageType.PIL,
                     pdf_bytes=pdf_bytes,
                 )
+                # [自定义] 图像级红色印章去除：在 VLM 看到图像前白化像素，
+                # 不修改 pdf_bytes，从而保留原生文本层（Fix 1）。
+                # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+                try:
+                    from mineru.utils.custom.seal_removal import remove_seal_from_images
+                    remove_seal_from_images(images_list)
+                except Exception as exc:
+                    logger.warning(f"印章去除失败，保留原图继续: {exc}")
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
                     logger.info(
@@ -540,7 +550,9 @@ async def aio_doc_analyze(
         predictor = await _get_model_async(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
 
-    # [自定义] 在解析入口处对 PDF 做整体旋转修正 + 红色印章去除
+    # [自定义] 在解析入口处对 PDF 做页面旋转修正，确保 pdfium 页面尺寸
+    # 与图片一致。红色印章去除已从 PDF 字节级迁至图像级（见下方 window
+    # 循环内的 [自定义] 白化钩子），以保留原生文本层（Fix 1 + option 2 ②）。
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
     try:
         from mineru.utils.custom.pdf_utils import generate_rotation_corrected_pdf
@@ -580,6 +592,14 @@ async def aio_doc_analyze(
                     end_page_id=window_end,
                     image_type=ImageType.PIL,
                 )
+                # [自定义] 图像级红色印章去除：在 VLM 看到图像前白化像素，
+                # 不修改 pdf_bytes，从而保留原生文本层（Fix 1）。
+                # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+                try:
+                    from mineru.utils.custom.seal_removal import remove_seal_from_images
+                    remove_seal_from_images(images_list)
+                except Exception as exc:
+                    logger.warning(f"印章去除失败，保留原图继续: {exc}")
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
                     logger.info(

@@ -83,12 +83,11 @@ def generate_rotation_corrected_pdf(
          多数派的误判，跳过旋转、保留原页
     4. 将修正后的所有页面合成单 PDF，写入 resolution=dpi 元数据，
        使页面尺寸与源 PDF 一致，同时图像像素保持 dpi 分辨率不降采样
-    5. 合成前还会去除红色印章像素（见 custom/seal_removal.py，开关
-       MINERU_SEAL_REMOVAL）：印章会被切成图片块压住表头/字段文字，
-       去掉后表头与字段才完整
+    5. [不再负责] 红色印章去除已移入 hybrid/vlm 的图像级处理（option 2），
+       在加载 PDF 页面图像后统一白化，不修改 pdf_bytes，从而保留文本层。
+       参见 hybrid_analyze.py / vlm_analyze.py 的 [自定义] 图像级白化钩子。
     6. [自定义] 若所有页面都无需旋转，直接返回空字节，由调用方沿用原始
-       pdf_bytes——避免无谓的全页光栅化销毁原生文本层。此时步骤 5 的印章
-       白化也不会执行（已知取舍，见函数内注释）
+       pdf_bytes——避免无谓的全页光栅化销毁原生文本层。
 
     注意：此函数会用 pypdfium2 打开文档，调用者需确保 pdfium_guard 锁可用。
 
@@ -196,16 +195,9 @@ def generate_rotation_corrected_pdf(
         )
         return b""
 
-    # [自定义] 合成前去除红色印章像素：印章会被切成独立图片块，压在表头/
-    # 字段文字上时导致表头格被 VLM 误读、字段 span 被截断。只白化"印章状"
-    # 区域内的红像素（守卫规则见 custom/seal_removal.py），黑印章不受影响。
-    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
-    try:
-        from mineru.utils.custom.seal_removal import remove_seal_from_images
-        remove_seal_from_images(images_list)
-    except Exception as exc:
-        logger.warning(f"印章去除失败，保留原图继续: {exc}")
-
+    # 继续合成 PDF：有页面经过了旋转修正，必须重新编码（旋转页的光栅化
+    # 结果不含文本层，属已知取舍）。印章白化已移入 hybrid_analyze.py 的图像级
+    # 处理（option 2 ②）：加载旋转后 PDF 的图像时统一白化，此处不再操作。
     try:
         return _images_to_pdf_bytes_with_dpi(images_list, dpi)
     except Exception as exc:
