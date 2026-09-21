@@ -128,7 +128,8 @@ def capture_seal_bboxes(images_list: list[dict]) -> list[list[list[float]]]:
 
     Returns:
         按页组织：[[[x0,y0,x1,y1], ...], ...]，每页一个子列表。
-        无印章的页返回空列表 []。
+        坐标已在 [0, 1] 范围归一化（÷图像宽高），与 VLM 模型输出一致，
+        下游 cal_real_bbox(width×height) 可正确还原。无印章的页返回空列表 []。
     """
     from mineru.utils.custom.config import (
         get_seal_removal_dilate_px,
@@ -147,6 +148,7 @@ def capture_seal_bboxes(images_list: list[dict]) -> list[list[list[float]]]:
     for img_dict in images_list:
         try:
             arr = np.asarray(img_dict["img_pil"].convert("RGB"))
+            img_h, img_w = arr.shape[:2]  # 像素尺寸，用于归一化
             red_mask = build_red_mask(arr)
 
             if not red_mask.any():
@@ -170,7 +172,13 @@ def capture_seal_bboxes(images_list: list[dict]) -> list[list[list[float]]]:
                 aspect = width / height if height else 0.0
                 if not _ASPECT_RANGE[0] <= aspect <= _ASPECT_RANGE[1]:
                     continue
-                bboxes.append([float(x), float(y), float(x + width), float(y + height)])
+                # 输出归一化坐标 [0, 1]（下游 cal_real_bbox 用 width/height 还原）
+                bboxes.append([
+                    float(x) / img_w,
+                    float(y) / img_h,
+                    float(x + width) / img_w,
+                    float(y + height) / img_h,
+                ])
             page_bboxes.append(bboxes)
         except Exception:
             page_bboxes.append([])
