@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup, Tag
 from loguru import logger
 from mineru.utils.custom.table_utils._common import (
     _INVOICE_HEADER_KEYWORDS,
+    _build_column_profiles,
     _cjk_count,
     _classify_ocr_item_type,
     _compact_norm,
@@ -18,6 +19,7 @@ from mineru.utils.custom.table_utils._common import (
     _is_same_row_value_variant,
     _is_single_cjk_char,
     _normalize_for_matching,
+    _violates_column_contract,
 )
 from mineru.utils.custom.table_utils.detect import (
     _is_invoice_table,
@@ -1035,6 +1037,19 @@ def _fill_empty_cells_from_ocr_grid(
     # 4. 推断列类型
     header_types = _infer_column_types_from_header(vlm_data, vlm_cells)
 
+    # 4.1 [自定义] 守卫 12：按列统计 VLM 已确立值的形态画像。
+    # 与列类型解耦——类型推断不可靠（新发流水实测整表 11 列全被判为 text，
+    # number 列数为 0），故判据取自「该列已有值长什么样」。
+    col_profiles = _build_column_profiles(vlm_data)
+    logger.debug(
+        "守卫 12 列形态画像: "
+        + ", ".join(
+            f"列{vc}(n={p['n']},金额={p['amount_ratio']:.2f},"
+            f"定长={p['is_fixed_len']},主流长={p['dom_len']})"
+            for vc, p in sorted(col_profiles.items())
+        )
+    )
+
     # 5. 按行填充
     modified = False
     filled_cell_ids = set()  # 记录已填充的 Tag id，处理 colspan 重复引用
@@ -1087,6 +1102,27 @@ def _fill_empty_cells_from_ocr_grid(
         }
     else:
         _all_table_cell_norms = set()
+
+    def _place_checked(row_idx: int, vc: int, mode: str, text: str) -> bool:
+        """守卫 12 校验通过后写入目标单元格；返回是否写入成功。
+
+        守卫必须挂在「放置」处而非「候选」处：判定需要**目标列**身份
+        （fillable 给出的 vc），而候选串的来源列身份已在池化时丢失
+        （_align_ocr_to_vlm_rows 返回 dict[int, list[str]]，只留裸字符串）。
+        三条放置路径（第一轮 append / 第二轮同类型 / 第三轮兜底）统一经此
+        函数写入，避免守卫逻辑在三处漂移——三轮各有独立的
+        _append_text_to_cell 调用点，不存在单一 choke point。
+        """
+        if _violates_column_contract(text, vc, col_profiles):
+            logger.debug(
+                f"守卫 12 拒绝(列形态契约): 行{row_idx}列{vc} ← '{text}'"
+            )
+            return False
+        cell = vlm_cells[row_idx][vc]
+        _append_text_to_cell(cell, text)
+        if mode == "empty":
+            filled_cell_ids.add(id(cell))
+        return True
 
     for vlm_row_idx in range(data_row_start, len(vlm_data)):
         vlm_row = vlm_data[vlm_row_idx]
@@ -1199,7 +1235,22 @@ def _fill_empty_cells_from_ocr_grid(
                         for vn in _all_table_cell_norms
                     ):
                         continue
-            item_type = _classify_ocr_item_type(ot)
+            # [自定义] 守卫 8：与同行的归一化变体比对去重。
+            # 数值可合法重复出现（跨行），但**同行**内的 OCR 变体不是新信息。
+            # [Fix] 提到类型分支之外无条件执行：守卫 8 原只写在 else
+            # （number/rate）分支，而判型以 _classify_ocr_item_type 为准——一旦
+            # 数值串被误判为 text（如全角逗号 "4，256.781.38" 不在 _is_data_value
+            # 的半角字符类内），数值去重即被整条跳过。实测该串 digits 与同行
+            # "4,256,781.38" 相等，守卫 8 本可直接丢弃。对无数字的纯 CJK 短值
+            # 此判定天然不命中（_digits_only 为空时退化为精确相等比对），
+            # 不误伤「吨/免税」等合法短值。
+            if _is_same_row_value_variant(ot, vlm_row):
+                continue
+            # [Fix] 判型前先做全角→半角归一：OCR 的全角逗号/全角数字落在
+            # _is_data_value 的半角字符类盲区，会把数值串判成 text——既拿到
+            # text 列的入场券，又旁路了数值专用的守卫 8/守卫 2。归一后判型与
+            # VLM 的半角形态一致（"4，256.781.38" → number）。
+            item_type = _classify_ocr_item_type(_normalize_for_matching(ot))
             if item_type == "text":
                 ot_norm = _normalize_for_matching(ot)
                 # 守卫 3-②：单个 CJK 字符若被任一表头 token 包含
@@ -1259,11 +1310,6 @@ def _fill_empty_cells_from_ocr_grid(
                     for ht_norm in vlm_header_norm
                 ):
                     continue
-            else:
-                # [自定义] 守卫 8：数值/税率与同行的归一化变体比对去重。
-                # 数值可合法重复出现（跨行），但**同行**内的 OCR 变体不是新信息。
-                if _is_same_row_value_variant(ot, vlm_row):
-                    continue
             ocr_new.append((ot, item_type))
 
         if not ocr_new:
@@ -1283,10 +1329,10 @@ def _fill_empty_cells_from_ocr_grid(
             # 第一轮：文本类型 → append 模式单元格
             if ocr_type == "text":
                 for fi, (vc, ct, mode) in enumerate(fillable):
-                    cell_tag = vlm_tag_row[vc]
                     if mode != "append":
                         continue
-                    _append_text_to_cell(cell_tag, ocr_text)
+                    if not _place_checked(vlm_row_idx, vc, mode, ocr_text):
+                        continue  # 守卫 12 形态契约不合 → 试下一列
                     modified = True
                     logger.debug(
                         f"OCR 填充(append): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
@@ -1303,13 +1349,11 @@ def _fill_empty_cells_from_ocr_grid(
             # 防止 OCR 数值噪声（如 "0.0"、"106,270.070005800001"）灌入
             # 「对方户名/摘要」等文本空列（输出不多不少）。
             for fi, (vc, ct, mode) in enumerate(fillable):
-                cell_tag = vlm_tag_row[vc]
-                if mode == "empty" and id(cell_tag) in filled_cell_ids:
+                if mode == "empty" and id(vlm_tag_row[vc]) in filled_cell_ids:
                     continue
                 if ocr_type == ct:
-                    _append_text_to_cell(cell_tag, ocr_text)
-                    if mode == "empty":
-                        filled_cell_ids.add(id(cell_tag))
+                    if not _place_checked(vlm_row_idx, vc, mode, ocr_text):
+                        continue  # 守卫 12 形态契约不合 → 试下一列
                     modified = True
                     logger.debug(
                         f"OCR 填充({mode}): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
@@ -1325,17 +1369,19 @@ def _fill_empty_cells_from_ocr_grid(
             # text 类 OCR token（印章碎片/行标签截断）不得落入 number/rate 列，
             # 防止列类型修复后（如"转出金额"→number）的 name→number 跨类型污染。
             for fi, (vc, ct, mode) in enumerate(fillable):
-                if mode == "empty":
-                    if ct == "text" and ocr_type == "number":
-                        continue
-                    if ct in ("number", "rate") and ocr_type == "text":
-                        continue
-                cell_tag = vlm_tag_row[vc]
-                if mode == "empty" and id(cell_tag) in filled_cell_ids:
+                # [Fix] 类型门槛移出 if mode == "empty"：append 模式此前完全不过
+                # 类型判定——实测 1,000,00 正是由此落进「对方户名」text 列的
+                # <img> 单元格（第三轮 + append + 零门槛）。现对两种模式一律
+                # 生效；第一轮已专门承担 text→append 的合法语义（如姓名追加到
+                # 含图单元格），此处是第三轮兜底，不得再跨类型放行。
+                if ct == "text" and ocr_type == "number":
                     continue
-                _append_text_to_cell(cell_tag, ocr_text)
-                if mode == "empty":
-                    filled_cell_ids.add(id(cell_tag))
+                if ct in ("number", "rate") and ocr_type == "text":
+                    continue
+                if mode == "empty" and id(vlm_tag_row[vc]) in filled_cell_ids:
+                    continue
+                if not _place_checked(vlm_row_idx, vc, mode, ocr_text):
+                    continue  # 守卫 12 形态契约不合 → 试下一列
                 modified = True
                 logger.debug(
                     f"OCR 填充(fallback): 行{vlm_row_idx}列{vc} ← '{ocr_text}'"
