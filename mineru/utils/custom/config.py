@@ -247,6 +247,45 @@ def get_seal_removal_enable() -> bool:
     )
 
 
+# --- 旋转几何判据 ---
+
+def get_rotate_geom_enable() -> bool:
+    """是否启用旋转修正的几何判据（pdf_utils.generate_rotation_corrected_pdf）。
+
+    原判据只用「分类器置信度 >= theta」决定偏离多数派的页是否旋转，但真旋转页
+    （实测 conf 0.4354-0.4481）与误判页（上限 0.439）的分布物理重叠，任何单
+    阈值都无法分离（降 theta 是零和）。几何判据以「页面宽高比是否偏离文档多数派」
+    决定【是否】旋转、分类器只决定【方向】，二者正交；且几何少数派集合与历史
+    误判 180° 页集合（宽高比与多数派一致）不相交，不会复活旧的误转问题。
+
+    环境变量：MINERU_ROTATE_GEOM_ENABLE
+    JSON 键：  custom.rotate_geom_enable
+    默认值：  True
+    """
+    return get_bool(
+        "rotate_geom_enable",
+        env_var="MINERU_ROTATE_GEOM_ENABLE",
+        default=True,
+    )
+
+
+def get_rotate_geom_majority_min() -> float:
+    """几何判据生效所需的文档多数派宽高比占比下限。
+
+    占比低于该值的文档（横向/纵向接近 50:50）上几何多数派不可靠，判据整体
+    失效、回退纯置信度逻辑（保守）。本批新发 96 页 93 横向 3 纵向，占比 0.97。
+
+    环境变量：MINERU_ROTATE_GEOM_MAJORITY_MIN
+    JSON 键：  custom.rotate_geom_majority_min
+    默认值：  0.8
+    """
+    return get_float(
+        "rotate_geom_majority_min",
+        env_var="MINERU_ROTATE_GEOM_MAJORITY_MIN",
+        default=0.8,
+    )
+
+
 def get_seal_removal_dilate_px() -> int:
     """印章守卫的膨胀核边长（像素），用于把被黑字切断的印章笔画并成整体。
 
@@ -364,6 +403,9 @@ __all__ = [
     "get_seal_removal_dilate_px",
     "get_seal_removal_min_area_ratio",
     "get_seal_removal_max_area_ratio",
+    # 旋转几何判据
+    "get_rotate_geom_enable",
+    "get_rotate_geom_majority_min",
     # KVP
     "get_kvp_engine",
     "get_kvp_server_url",
