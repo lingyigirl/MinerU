@@ -115,6 +115,68 @@ def select_seal_pixels(
     return selected
 
 
+def capture_seal_bboxes(images_list: list[dict]) -> list[list[list[float]]]:
+    """在不修改图像的前提下，逐页检测印章 bbox（复用红掩膜+守卫逻辑）。
+
+    与 remove_seal_from_images 使用相同配置阈值。调用时机：白化前，
+    用于捕获印章 bbox。白化后这些 bbox 注入 VLM model_list，
+    使下游 supplement_vlm_seal_with_ocr 能触发印章文本增强，
+    并在最终输出中保留 `<details>seal</detail>` 与印章图块标记。
+
+    Args:
+        images_list: 形如 [{"img_pil": PIL.Image}, ...] 的页面图像列表。
+
+    Returns:
+        按页组织：[[[x0,y0,x1,y1], ...], ...]，每页一个子列表。
+        无印章的页返回空列表 []。
+    """
+    from mineru.utils.custom.config import (
+        get_seal_removal_dilate_px,
+        get_seal_removal_max_area_ratio,
+        get_seal_removal_min_area_ratio,
+    )
+
+    dilate_px = get_seal_removal_dilate_px()
+    min_area_ratio = get_seal_removal_min_area_ratio()
+    max_area_ratio = get_seal_removal_max_area_ratio()
+    min_red_px = _MIN_RED_PX
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px))
+
+    page_bboxes: list[list[list[float]]] = []
+    for img_dict in images_list:
+        try:
+            arr = np.asarray(img_dict["img_pil"].convert("RGB"))
+            red_mask = build_red_mask(arr)
+
+            if not red_mask.any():
+                page_bboxes.append([])
+                continue
+
+            page_area = red_mask.shape[0] * red_mask.shape[1]
+            merged = cv2.dilate(red_mask.astype(np.uint8), kernel)
+            _, _, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
+
+            bboxes = []
+            for label in range(1, stats.shape[0]):
+                x, y, width, height, _ = stats[label]
+                region = red_mask[y : y + height, x : x + width]
+                red_px = int(region.sum())
+                if red_px < min_red_px:
+                    continue
+                area_ratio = (width * height) / page_area
+                if not min_area_ratio <= area_ratio <= max_area_ratio:
+                    continue
+                aspect = width / height if height else 0.0
+                if not _ASPECT_RANGE[0] <= aspect <= _ASPECT_RANGE[1]:
+                    continue
+                bboxes.append([float(x), float(y), float(x + width), float(y + height)])
+            page_bboxes.append(bboxes)
+        except Exception:
+            page_bboxes.append([])
+    return page_bboxes
+
+
 def remove_seal_pixels(
     img: Image.Image,
     *,

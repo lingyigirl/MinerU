@@ -477,9 +477,16 @@ def doc_analyze(
                     image_type=ImageType.PIL,
                     pdf_bytes=pdf_bytes,
                 )
-                # [自定义] 图像级红色印章去除：在 VLM 看到图像前白化像素，
-                # 不修改 pdf_bytes，从而保留原生文本层（Fix 1）。
-                # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+                # [自定义] 红色印章处理（两阶段：先捕获 bbox → 再白化像素）：
+                # 1) 捕获印章 bbox 供 VLM 推理后注入 model_list（Fix B），
+                #    使输出保留印章标记；2) 白化印章像素（不修改 pdf_bytes），
+                #    防止印章压表头致 VLM 误读。捕获先于白化，确保轮廓完整。
+                try:
+                    from mineru.utils.custom.seal_removal import capture_seal_bboxes
+                    seal_bboxes_window = capture_seal_bboxes(images_list)
+                except Exception as exc:
+                    logger.warning(f"印章 bbox 捕获失败，继续白化: {exc}")
+                    seal_bboxes_window = [[] for _ in images_list]
                 try:
                     from mineru.utils.custom.seal_removal import remove_seal_from_images
                     remove_seal_from_images(images_list)
@@ -497,6 +504,20 @@ def doc_analyze(
                             images=images_pil_list,
                             image_analysis=image_analysis,
                         )
+                    # [自定义] 注入印章 bbox（白化前捕获，推理后写入 results）
+                    if any(pg_bboxes for pg_bboxes in seal_bboxes_window):
+                        for page_offset, page_bboxes in enumerate(seal_bboxes_window):
+                            if not page_bboxes:
+                                continue
+                            if page_offset >= len(window_results):
+                                break
+                            for bbox in page_bboxes:
+                                window_results[page_offset].append({
+                                    "type": "image",
+                                    "bbox": bbox,
+                                    "sub_type": "seal",
+                                    "content": None,
+                                })
                     results.extend(window_results)
                     if progress_bar is None:
                         progress_bar = tqdm(total=page_count, desc="Processing pages")
@@ -592,9 +613,16 @@ async def aio_doc_analyze(
                     end_page_id=window_end,
                     image_type=ImageType.PIL,
                 )
-                # [自定义] 图像级红色印章去除：在 VLM 看到图像前白化像素，
-                # 不修改 pdf_bytes，从而保留原生文本层（Fix 1）。
-                # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+                # [自定义] 红色印章处理（两阶段：先捕获 bbox → 再白化像素）：
+                # 1) 捕获印章 bbox 供 VLM 推理后注入 model_list（Fix B），
+                #    使输出保留印章标记；2) 白化印章像素（不修改 pdf_bytes），
+                #    防止印章压表头致 VLM 误读。捕获先于白化，确保轮廓完整。
+                try:
+                    from mineru.utils.custom.seal_removal import capture_seal_bboxes
+                    seal_bboxes_window = capture_seal_bboxes(images_list)
+                except Exception as exc:
+                    logger.warning(f"印章 bbox 捕获失败，继续白化: {exc}")
+                    seal_bboxes_window = [[] for _ in images_list]
                 try:
                     from mineru.utils.custom.seal_removal import remove_seal_from_images
                     remove_seal_from_images(images_list)
@@ -612,6 +640,20 @@ async def aio_doc_analyze(
                             images=images_pil_list,
                             image_analysis=image_analysis,
                         )
+                    # [自定义] 注入印章 bbox（白化前捕获，推理后写入 results）
+                    if any(pg_bboxes for pg_bboxes in seal_bboxes_window):
+                        for page_offset, page_bboxes in enumerate(seal_bboxes_window):
+                            if not page_bboxes:
+                                continue
+                            if page_offset >= len(window_results):
+                                break
+                            for bbox in page_bboxes:
+                                window_results[page_offset].append({
+                                    "type": "image",
+                                    "bbox": bbox,
+                                    "sub_type": "seal",
+                                    "content": None,
+                                })
                     results.extend(window_results)
                     if progress_bar is None:
                         progress_bar = tqdm(total=page_count, desc="Processing pages")
