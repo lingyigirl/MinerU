@@ -246,12 +246,17 @@ def remove_seal_from_images(images_list: Iterable[dict]) -> int:
     total = 0
     for idx, img_dict in enumerate(images_list):
         try:
+            orig_img = img_dict["img_pil"]
             img_dict["img_pil"], removed = remove_seal_pixels(
-                img_dict["img_pil"],
+                orig_img,
                 dilate_px=dilate_px,
                 min_area_ratio=min_area_ratio,
                 max_area_ratio=max_area_ratio,
             )
+            # [自定义] 仅当该页确实被白化时，保留白化前的原图；
+            # 供下游 sub_type="seal" 图块从原图裁剪（保留真实红章）。
+            if removed:
+                img_dict["img_pil_orig"] = orig_img
             total += removed
         except Exception as exc:
             logger.warning(f"印章去除——第{idx}页处理失败: {exc}")

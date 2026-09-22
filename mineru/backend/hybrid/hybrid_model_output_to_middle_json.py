@@ -103,9 +103,16 @@ def blocks_to_page_info(
 
     all_spans = magic_model.get_all_spans()
     # 对image/table/chart/interline_equation的span截图
+    # [自定义] 印章 span（sub_type="seal"）从白化前的原图（img_pil_orig）裁剪，
+    #          保留真实红章；白化图只用于 VLM/OCR 推理，避免印章图块被抠成白色。
     for span in all_spans:
         if span["type"] in [ContentType.IMAGE, ContentType.TABLE, ContentType.CHART, ContentType.INTERLINE_EQUATION]:
-            span = cut_image_and_table(span, page_pil_img, page_img_md5, page_index, image_writer, scale=scale)
+            crop_src = (
+                image_dict["img_pil_orig"]
+                if (span.get("sub_type") == "seal" and image_dict.get("img_pil_orig") is not None)
+                else page_pil_img
+            )
+            span = cut_image_and_table(span, crop_src, page_img_md5, page_index, image_writer, scale=scale)
 
     replace_inline_table_images(table_blocks, image_writer, page_index)
 
