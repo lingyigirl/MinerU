@@ -51,8 +51,17 @@ class EngineRoute:
 
 # 针对不同文档类型的策略优先级：
 # DOCUMENT_PARSE → 根据质量选择最合适的 MinerU 后端
-# STRUCTURED_TABLE → Hybrid + OCR 补充（当前已实现）
+# STRUCTURED_TABLE → VLM 端到端（表格内容由 VLM 直出，跳过 OCR 补充）
 # FORM_KVP → KVP Pipeline（外部 MLLM）
+#
+# [自定义] 2026-09-21 策略变更：STRUCTURED_TABLE 由 Hybrid 改为 VLM。
+# 依据：Hybrid 的表格正文同样来自 VLM，与纯 VLM 的唯一差异是
+# MINERU_TABLE_OCR_SUPPLEMENT（PaddleOCR 回填 VLM 的空单元格）。实测
+# 3 份银行流水 + 1 份发票：回填要么不发生（工行6562/威海流水/电费发票，
+# delta=0，Hybrid 结果与 VLM 逐格相同），要么全部为污染（滕悦 52 页流水
+# 12 页共 23 处回填，均为同行变体/OCR 截断/单字垃圾/数字误读）。
+# 即：OCR 补充在密集表格上净价值 ≤ 0，故该类型直接走 VLM，同时省掉
+# utils/custom 下针对回填污染的一批后处理守卫。
 
 def select_engine_route(
     doc_type: DocType,
@@ -105,15 +114,13 @@ def select_engine_route(
         )
 
     elif doc_type == DocType.STRUCTURED_TABLE:
-        # 🟡 密集表格 → Hybrid + OCR 补充
+        # 🟡 密集表格 → VLM 端到端
+        # 表格正文本就由 VLM 直出，Hybrid 额外做的只有 PaddleOCR 空单元格
+        # 回填；实测该回填在密集表格上净价值 ≤ 0（见文件头策略变更说明）。
         return EngineRoute(
             doc_type=doc_type,
-            engine_backend="hybrid-auto-engine",
-            strategy="structured_table",
-            extra_kwargs={
-                "parse_method": "ocr",  # 表格用 OCR 模式更精确
-                "table_enable": True,
-            },
+            engine_backend="vlm-auto-engine",
+            strategy="structured_table_vlm",
             quality=quality,
         )
 

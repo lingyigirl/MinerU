@@ -445,6 +445,22 @@ async def _async_process_vlm(
         )
 
 
+def _resolve_vlm_backend_and_env(formula_enable: bool, table_enable: bool) -> str:
+    """把 `vlm-auto-engine` 解析为具体推理引擎，并设置与官方 do_parse 一致的 VLM 开关。
+
+    do_parse 的 `backend.startswith("vlm-")` 分支（见本文件 ~L1192）会做
+    `backend[4:]` + `get_vlm_engine('auto', is_async=False)` + 设置
+    MINERU_VLM_FORMULA_ENABLE / MINERU_VLM_TABLE_ENABLE 后再调 _process_vlm。
+    改道路径此前直接把 `"vlm-auto-engine"` 透传给 _process_vlm，导致
+    MinerUClient 报 `ValueError: Unsupported backend: vlm-auto-engine` 并
+    被 hook 静默吞掉、回落 hybrid（OCR 补充照常被启用）。此处与官方路径对齐。
+    """
+    engine = get_vlm_engine(inference_engine="auto", is_async=False)
+    os.environ["MINERU_VLM_FORMULA_ENABLE"] = str(formula_enable)
+    os.environ["MINERU_VLM_TABLE_ENABLE"] = str(table_enable)
+    return engine
+
+
 def _process_vlm(
         output_dir,
         pdf_file_names,
@@ -459,10 +475,19 @@ def _process_vlm(
         f_dump_content_list,
         f_make_md_mode,
         server_url=None,
+        landing_parse_method=None,
         **kwargs,
 ):
-    """同步处理VLM后端逻辑"""
-    parse_method = "vlm"
+    """同步处理VLM后端逻辑。
+
+    Args:
+        landing_parse_method: 产出落盘的子目录名。默认 "vlm"（请求 backend 就是
+            vlm-* 时的官方行为）。当 S0/S1 内部把 hybrid 请求改道到 VLM 时，
+            调用方传入 "hybrid_{parse_method}"，使产出仍落在调用者按请求参数
+            推导出的目录里，避免"请求 hybrid 却要跑去 vlm/ 找结果"。此时
+            中间 JSON 顶层的 `_backend` 仍是 "vlm"，实际引擎因此有据可查。
+    """
+    parse_method = landing_parse_method or "vlm"
     f_draw_span_bbox = False
     if not backend.endswith("client"):
         server_url = None
@@ -943,6 +968,13 @@ def _try_smart_routing(
         )
         return True
 
+    # [自定义] 是否允许 S0/S1 结果改道后端。
+    # 仅默认后端 hybrid-auto-engine 可被改道到 VLM；用户显式指定其它后端
+    # （pipeline / vlm-auto-engine / *-http-client / vllm-* / lmdeploy 等）
+    # 时一律透传，尊重其选择——避免在无 VLM 算力的部署上（例如 pipeline
+    # 的纯 CPU 环境、或 VLM 在远端的 http-client 环境）被改道而失败。
+    _allow_backend_reroute = backend == "hybrid-auto-engine"
+
     # doc_type == "auto" → 运行 S0 + S1 自动分类（用户显式选择，需付出分析开销）
     if doc_type == "auto":
         try:
@@ -1008,7 +1040,39 @@ def _try_smart_routing(
                 )
                 return True
 
-            # 非 KVP 路由 → 透传，继续原有逻辑
+            # 非 KVP 路由 → 按策略模块给出的 engine_backend 执行。
+            # 注意：此处不再按 doc_type 硬编码判断，engine_factory 是唯一的
+            # 策略来源（STRUCTURED_TABLE 已在其中改为 vlm-auto-engine）。
+            if (route.engine_backend == "vlm-auto-engine"
+                    and _allow_backend_reroute):
+                logger.info(
+                    f"[路由] {doc_type_result.value} → VLM"
+                    f"（策略 {route.strategy}，跳过 OCR 补充）"
+                )
+                # 与官方 do_parse 的 vlm 分支一致：auto-engine → 具体引擎 + VLM 开关
+                vlm_backend = _resolve_vlm_backend_and_env(formula_enable, table_enable)
+                # 落盘到按请求参数推导的 hybrid_* 目录，保持调用方目录契约；
+                # 实际引擎以 middle_json._backend="vlm" 与上方的 [路由] 日志给出提示。
+                _process_vlm(
+                    output_dir=output_dir,
+                    pdf_file_names=pdf_file_names,
+                    pdf_bytes_list=pdf_bytes_list,
+                    backend=vlm_backend,
+                    landing_parse_method=f"hybrid_{parse_method}",
+                    f_draw_layout_bbox=f_draw_layout_bbox,
+                    f_draw_span_bbox=f_draw_span_bbox,
+                    f_dump_md=f_dump_md,
+                    f_dump_middle_json=f_dump_middle_json,
+                    f_dump_model_output=f_dump_model_output,
+                    f_dump_orig_pdf=f_dump_orig_pdf,
+                    f_dump_content_list=f_dump_content_list,
+                    f_make_md_mode=f_make_md_mode,
+                    server_url=server_url,
+                    image_analysis=image_analysis,
+                )
+                return True
+
+            # 其余路由 → 透传，继续原有 hybrid 逻辑
             logger.info(
                 f"[自定义] 智能路由: {doc_type_result.value} → {route.engine_backend}"
             )
@@ -1018,7 +1082,57 @@ def _try_smart_routing(
             logger.exception("[自定义] 智能路由失败，回退到原有解析流程")
             return False
 
-    # doc_type == "general" → 透传
+    # doc_type == "general" → 做轻量 S0/S1 分类，判断是否可先验地路由到 VLM。
+    # 对现有 API 调用者透明：不改参数、不加环境变量，仅内部选择后端。
+    # 仅默认后端参与（_allow_backend_reroute），显式指定其它后端时透传。
+    if doc_type == "general" and _allow_backend_reroute:
+        try:
+            from mineru.utils.custom.doc_quality import analyze_document_quality
+            from mineru.utils.custom.doc_classifier import classify_document, DocType
+            from mineru.utils.custom.engine_factory import select_engine_route
+
+            # S0 + S1（仅采样前几页，~1-2s 开销）
+            quality = analyze_document_quality(pdf_bytes)
+            doc_type_result = classify_document(pdf_bytes, quality=quality)
+
+            # 与 doc_type=auto 保持一致：general 语义下不自动转 KVP。
+            # KVP pp-structure 对含表格结构的票据不如通用解析，仅保留显式 opt-in。
+            if doc_type_result == DocType.FORM_KVP:
+                doc_type_result = DocType.DOCUMENT_PARSE
+
+            route = select_engine_route(doc_type=doc_type_result, quality=quality)
+
+            if route.engine_backend == "vlm-auto-engine":
+                logger.info(
+                    f"[路由] general({doc_type_result.value}) → VLM"
+                    f"（策略 {route.strategy}，跳过 OCR 补充）"
+                )
+                # 与官方 do_parse 的 vlm 分支一致：auto-engine → 具体引擎 + VLM 开关
+                vlm_backend = _resolve_vlm_backend_and_env(formula_enable, table_enable)
+                # 落盘到按请求参数推导的 hybrid_* 目录，保持调用方目录契约；
+                # 实际引擎以 middle_json._backend="vlm" 与上方的 [路由] 日志给出提示。
+                _process_vlm(
+                    output_dir=output_dir,
+                    pdf_file_names=pdf_file_names,
+                    pdf_bytes_list=pdf_bytes_list,
+                    backend=vlm_backend,
+                    landing_parse_method=f"hybrid_{parse_method}",
+                    f_draw_layout_bbox=f_draw_layout_bbox,
+                    f_draw_span_bbox=f_draw_span_bbox,
+                    f_dump_md=f_dump_md,
+                    f_dump_middle_json=f_dump_middle_json,
+                    f_dump_model_output=f_dump_model_output,
+                    f_dump_orig_pdf=f_dump_orig_pdf,
+                    f_dump_content_list=f_dump_content_list,
+                    f_make_md_mode=f_make_md_mode,
+                    server_url=server_url,
+                    image_analysis=image_analysis,
+                )
+                return True
+        except Exception:
+            logger.debug("[路由] general 轻量分类失败，直通 hybrid（无影响）")
+
+    # 默认：透传
     return False
 
 

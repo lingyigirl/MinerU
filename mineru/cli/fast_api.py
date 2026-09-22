@@ -48,7 +48,11 @@ from mineru.cli.public_http_client_policy import (
     is_public_bind_host,
     warn_if_public_http_client_policy as _warn_if_public_http_client_policy,
 )
-from mineru.cli.output_paths import resolve_parse_dir
+from mineru.cli.output_paths import (
+    OFFICE_PARSE_DIR_NAME,
+    VLM_PARSE_DIR_NAME,
+    resolve_parse_dir,
+)
 from mineru.cli.api_protocol import (
     API_PROTOCOL_VERSION,
     DEFAULT_MAX_CONCURRENT_REQUESTS,
@@ -431,6 +435,39 @@ def get_parse_dir(output_dir: str, pdf_name: str, backend: str, parse_method: st
     )
 
 
+def locate_parse_dir(
+    output_dir: str,
+    pdf_name: str,
+    backend: str,
+    parse_method: str,
+) -> str:
+    """定位 PDF 实际产出所在的解析目录（响应组装用）。
+
+    通常等于按请求 backend 推导的目录；但当 S0/S1 自动路由把文档内部改道到
+    其它后端时（hybrid-auto-engine → vlm-auto-engine），产物落在与请求参数
+    一致的 hybrid_*/ 目录（实际引擎见 middle_json._backend 与服务端 [路由]
+    日志）。这里按候选顺序探测实际存在的目录，作为兜底。每次请求都有独立
+    的 output_dir，因此目录存在即代表本次请求的产物。
+    """
+    candidates: list[str] = []
+    try:
+        candidates.append(get_parse_dir(output_dir, pdf_name, backend, parse_method))
+    except ValueError:
+        logger.warning(f"Unknown backend type: {backend}, falling back to dir probing")
+    for sub_dir in (
+        VLM_PARSE_DIR_NAME,  # vlm（内部改道到 VLM 时的实际落点）
+        f"hybrid_{parse_method}",
+        parse_method,
+        OFFICE_PARSE_DIR_NAME,
+        "kvp",  # [自定义] KVP Pipeline 回退
+    ):
+        candidates.append(os.path.join(output_dir, pdf_name, sub_dir))
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidates[0]
+
+
 def is_task_terminal(status: str) -> bool:
     return status in TASK_TERMINAL_STATES
 
@@ -451,19 +488,10 @@ def build_result_dict(
         result_dict[pdf_name] = {}
         data = result_dict[pdf_name]
 
-        try:
-            parse_dir = get_parse_dir(output_dir, pdf_name, backend, parse_method)
-        except ValueError:
-            logger.warning(f"Unknown backend type: {backend}, skipping {pdf_name}")
+        # [自定义] 按实际产出目录定位（含内部改道 VLM、KVP 回退等情形）
+        parse_dir = locate_parse_dir(output_dir, pdf_name, backend, parse_method)
+        if not os.path.isdir(parse_dir):
             continue
-
-        # [自定义] KVP Pipeline 回退：当标准目录不存在时，检查 kvp/ 目录
-        if not os.path.exists(parse_dir):
-            kvp_fallback = os.path.join(output_dir, pdf_name, "kvp")
-            if os.path.exists(kvp_fallback):
-                parse_dir = kvp_fallback
-            else:
-                continue
 
         if return_md:
             data["md_content"] = get_infer_result(".md", pdf_name, parse_dir)
@@ -513,18 +541,14 @@ def create_result_zip(
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for pdf_name in pdf_file_names:
             try:
-                parse_dir = get_parse_dir(output_dir, pdf_name, backend, parse_method)
+                # [自定义] 按实际产出目录定位（含内部改道 VLM、KVP 回退等情形）
+                parse_dir = locate_parse_dir(output_dir, pdf_name, backend, parse_method)
             except ValueError:
                 logger.warning(f"Unknown backend type: {backend}, skipping {pdf_name}")
                 continue
 
-            if not os.path.exists(parse_dir):
-                # [自定义] KVP Pipeline 回退
-                kvp_fallback = os.path.join(output_dir, pdf_name, "kvp")
-                if os.path.exists(kvp_fallback):
-                    parse_dir = kvp_fallback
-                else:
-                    continue
+            if not os.path.isdir(parse_dir):
+                continue
 
             if return_md:
                 path = os.path.join(parse_dir, f"{pdf_name}.md")

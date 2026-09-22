@@ -1,8 +1,8 @@
 """S1 文档分类器（"信号灯"路由）。
 
 根据文档视觉特征和文本特征，将文档分为三类：
-- DOCUMENT_PARSE：通用文档（学术/书籍/报告）→ MinerU 三后端
-- STRUCTURED_TABLE：密集表格（报表/统计表）→ MinerU Hybrid + OCR 补充
+- DOCUMENT_PARSE：通用文档（学术/书籍/报告/合同）→ MinerU Hybrid
+- STRUCTURED_TABLE：密集表格（银行流水/发票/对账单/报表）→ MinerU VLM
 - FORM_KVP：票据/卡证/高密度 KVP 表单 → KVP Pipeline（MLLM）
 
 分类采用视觉特征 + 文本特征的混合策略，不依赖单一模型。
@@ -26,6 +26,13 @@ from mineru.utils.pdf_image_tools import (
 # ---------------------------------------------------------------------------
 # PaddleOCR 懒加载单例（避免每次请求重建模型）
 # ---------------------------------------------------------------------------
+
+# 判定"存在表格结构"的最小表格线密度（横/竖框线像素占比）。
+# 实测（200 DPI，生产路径）：合同类文档与纯文字报告恒为 0.000000，
+# 而最稀疏的表格文档（威海银行流水，无框线式表格）为 0.001197，
+# 其余表格文档在 0.0075 ~ 0.058 区间。取 0.0005 既排除零值，
+# 又对稀疏表格留出约 2.4 倍余量。
+_MIN_TABLE_LINES_RATIO = 0.0005
 
 _ocr_instance = None
 
@@ -386,15 +393,19 @@ def classify_document(
     4. 无嵌入文本时回退到 PaddleOCR（复用单例）
 
     分类策略（按优先级）：
-    1. DOCUMENT_PARSE：重复标签模式（同一行出现 "户名...户名" 等表格结构）
+    1. STRUCTURED_TABLE：重复标签模式 + KVP≥3 + 表格关键词≥3 + 无印章
+       + 检出表格框线（银行流水/对账单等，存在二维表格结构）
     2. DOCUMENT_PARSE：重复 KVP 标签 ≥ 2 个 + KVP≥5 + 有印章
        （银行回单等表格型票据，标签重复出现说明有二维结构，不限页数）
     3. FORM_KVP：KVP 关键词 ≥ 3 个 且（有印章 或 OCR 难度高）
-    4. DOCUMENT_PARSE：KVP≥5 + 表格关键词≥3 + 无印章（发票含货物清单）
-    5. FORM_KVP：KVP 关键词 ≥ 5 个 且 无印章 且 短文档（≤2 页）
+    4. STRUCTURED_TABLE：KVP≥5 + 表格关键词≥3 + 无印章 + 检出表格框线
+       （银行流水、发票含货物清单）
+    5. DOCUMENT_PARSE：KVP≥5 + 表格关键词≥3 + 无印章 但未检出表格框线
+       （仅关键词命中、无表格结构证据，如合同 → 通用解析）
+    6. FORM_KVP：KVP 关键词 ≥ 5 个 且 无印章 且 短文档（≤2 页）
        （多页文档虽 KVP 术语密集但通常是金融报告/对账单，走 DOCUMENT_PARSE）
-    6. STRUCTURED_TABLE：表格关键词 ≥ 5 个 且 KVP 关键词 < 3 个
-    7. DOCUMENT_PARSE：其他所有文档
+    7. STRUCTURED_TABLE：表格关键词 ≥ 5 个 且 KVP 关键词 < 3 个
+    8. DOCUMENT_PARSE：其他所有文档
 
     Args:
         pdf_bytes: PDF 文件字节流。
@@ -479,15 +490,27 @@ def classify_document(
             # OCR 可用时的标准分类规则
             # 优先检测表格 + KVP 混合结构（如银行回单、对账单）
             # 这类文档有重复标签模式（同一行出现 "户名...账号...户名...账号"）
-            # 应走 Hybrid 管线由 VLM 处理表格，而非 KVP 本地引擎
+            # 应走通用管线由 VLM 处理表格，而非 KVP 本地引擎
+            #
+            # [自定义] 2026-09-21：无印章的表格型文档改判为 STRUCTURED_TABLE。
+            # 它们本质是"密集表格"（符合 DocType.STRUCTURED_TABLE 的定义），
+            # 原先标为 DOCUMENT_PARSE 只是为了导向 Hybrid；但实测 Hybrid 的
+            # OCR 空单元格回填在该类文档上净价值 ≤ 0（详见 engine_factory.py
+            # 文件头的策略变更说明），故改判类型，由策略模块导向 VLM。
+            # 带印章的表格型文档仍保持原行为（印章正是回填机制的设计场景）。
             has_repeating = _has_repeating_labels(text_sample)
-            if has_repeating and kvp_count >= 3 and table_kw_count >= 3:
-                # 表格型 KVP 文档（银行回单、对账单等）→ Hybrid 处理表格
+            # 表格结构证据：检出表格框线。关键词计数（table_kw）不足以
+            # 证明表格结构——合同类文档同样会命中"金额/合计/备注"等词，
+            # 实测销售合同/采购合同/担保合同三项均为 0.000000。
+            has_table_structure = table_lines_ratio >= _MIN_TABLE_LINES_RATIO
+            if (has_repeating and kvp_count >= 3 and table_kw_count >= 3
+                    and not has_stamp and has_table_structure):
+                # 表格型 KVP 文档（银行回单、对账单等）→ 密集表格
                 logger.info(
-                    f"检测到表格+KVP混合结构（重复标签模式），"
-                    f"路由到通用解析（Hybrid后端处理表格）"
+                    "检测到表格+KVP混合结构（重复标签模式，无印章，有表格框线），"
+                    "归类为密集表格"
                 )
-                doc_type = DocType.DOCUMENT_PARSE
+                doc_type = DocType.STRUCTURED_TABLE
             elif (kvp_count >= 5 and repeating_kvp_count >= 2
                   and has_stamp):
                 # 重复标签型 KVP 文档（银行回单、对账单等）
@@ -503,13 +526,24 @@ def classify_document(
                 doc_type = DocType.DOCUMENT_PARSE
             elif kvp_count >= 3 and (has_stamp or ocr_difficulty in ("medium", "high")):
                 doc_type = DocType.FORM_KVP
-            elif kvp_count >= 5 and table_kw_count >= 3 and not has_stamp:
-                # 含表格结构的票据（如增值税发票含货物清单）
+            elif (kvp_count >= 5 and table_kw_count >= 3 and not has_stamp
+                  and has_table_structure):
+                # 含表格结构的票据（如银行流水、增值税发票含货物清单）
                 # KVP 本地引擎无法处理多行表格（标签只能匹配一次）
-                # 走 Hybrid 后端由 VLM 做表格结构识别
+                # → 密集表格（无印章），由策略模块导向 VLM
                 logger.info(
-                    f"检测到表格型 KVP 文档（table_kw={table_kw_count}），"
-                    f"路由到通用解析（Hybrid 后端处理表格）"
+                    f"检测到表格型 KVP 文档（table_kw={table_kw_count}，无印章，"
+                    f"表格线={table_lines_ratio:.3%}），归类为密集表格"
+                )
+                doc_type = DocType.STRUCTURED_TABLE
+            elif kvp_count >= 5 and table_kw_count >= 3 and not has_stamp:
+                # [自定义] 2026-09-21：同上条件但未检出表格框线。
+                # 仅关键词命中、无表格结构证据 → 保持原标签 DOCUMENT_PARSE
+                # （→ Hybrid），不导向 VLM；同时避免误落到下方 FORM_KVP 分支
+                # （合同并非票据）。
+                logger.info(
+                    f"表格关键词较多但未检出表格框线（table_kw={table_kw_count}，"
+                    f"kvp={kvp_count}），保持通用解析"
                 )
                 doc_type = DocType.DOCUMENT_PARSE
             elif kvp_count >= 5 and not has_stamp and page_count <= 2:
