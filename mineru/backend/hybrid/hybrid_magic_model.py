@@ -183,6 +183,8 @@ class MagicModel:
                     "bbox": block_bbox,
                     "type": span_type,
                 }
+                if block_sub_type:
+                    span["sub_type"] = block_sub_type
                 if span_type == ContentType.TABLE:
                     span["html"] = block_content
                 elif raw_block_type in ["image", "chart"] and block_content is not None:
