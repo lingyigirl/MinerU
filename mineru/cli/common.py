@@ -418,10 +418,11 @@ async def _async_process_vlm(
         f_dump_content_list,
         f_make_md_mode,
         server_url=None,
+        landing_parse_method=None,
         **kwargs,
 ):
     """异步处理VLM后端逻辑"""
-    parse_method = "vlm"
+    parse_method = landing_parse_method or "vlm"
     f_draw_span_bbox = False
     if not backend.endswith("client"):
         server_url = None
@@ -455,7 +456,7 @@ def _resolve_vlm_backend_and_env(formula_enable: bool, table_enable: bool) -> st
     MinerUClient 报 `ValueError: Unsupported backend: vlm-auto-engine` 并
     被 hook 静默吞掉、回落 hybrid（OCR 补充照常被启用）。此处与官方路径对齐。
     """
-    engine = get_vlm_engine(inference_engine="auto", is_async=False)
+    engine = get_vlm_engine(inference_engine="auto", is_async=True)
     os.environ["MINERU_VLM_FORMULA_ENABLE"] = str(formula_enable)
     os.environ["MINERU_VLM_TABLE_ENABLE"] = str(table_enable)
     return engine
@@ -929,7 +930,7 @@ def _log_vlm_reroute(doc_type_value: str, strategy: str) -> None:
     )
 
 
-def _try_smart_routing(
+async def _try_smart_routing(
     pdf_file_names: list[str],
     pdf_bytes_list: list[bytes],
     p_lang_list: list[str],
@@ -1078,7 +1079,7 @@ def _try_smart_routing(
                 vlm_backend = _resolve_vlm_backend_and_env(formula_enable, table_enable)
                 # 落盘到按请求参数推导的 hybrid_* 目录，保持调用方目录契约；
                 # 实际引擎以 middle_json._backend="vlm" 与上方的 [路由] 日志给出提示。
-                _process_vlm(
+                await _async_process_vlm(
                     output_dir=output_dir,
                     pdf_file_names=pdf_file_names,
                     pdf_bytes_list=pdf_bytes_list,
@@ -1133,7 +1134,7 @@ def _try_smart_routing(
                 vlm_backend = _resolve_vlm_backend_and_env(formula_enable, table_enable)
                 # 落盘到按请求参数推导的 hybrid_* 目录，保持调用方目录契约；
                 # 实际引擎以 middle_json._backend="vlm" 与上方的 [路由] 日志给出提示。
-                _process_vlm(
+                await _async_process_vlm(
                     output_dir=output_dir,
                     pdf_file_names=pdf_file_names,
                     pdf_bytes_list=pdf_bytes_list,
@@ -1210,7 +1211,7 @@ def do_parse(
 
     # [自定义] S0 → S1 智能路由 hook
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
-    _routed = _try_smart_routing(
+    _routed = asyncio.run(_try_smart_routing(
         pdf_file_names=pdf_file_names,
         pdf_bytes_list=pdf_bytes_list,
         p_lang_list=p_lang_list,
@@ -1236,7 +1237,7 @@ def do_parse(
         end_page_id=end_page_id,
         kvp_verify_engine=kvp_verify_engine,
         **kwargs,
-    )
+    ))
     if _routed:
         return
 
@@ -1341,7 +1342,7 @@ async def aio_do_parse(
     pdf_bytes_list = _prepare_pdf_bytes(pdf_bytes_list, start_page_id, end_page_id)
 
     # [自定义] S0 → S1 智能路由 hook（异步路径）
-    _routed = _try_smart_routing(
+    _routed = await _try_smart_routing(
         pdf_file_names=pdf_file_names,
         pdf_bytes_list=pdf_bytes_list,
         p_lang_list=p_lang_list,
