@@ -265,4 +265,13 @@ def remove_seal_from_images(images_list: Iterable[dict]) -> int:
             f"印章去除——共白化 {total} 个红色像素"
             f"（膨胀={dilate_px}px，面积占比∈[{min_area_ratio:.3f}, {max_area_ratio:.3f}]）"
         )
+    else:
+        # [自定义] 零命中也要出声。此前静默：红掩膜判据（R−G>40 且 R−B>40 且 R>90）
+        # 对灰色/黑色印章完全失效时，白化、印章 bbox 注入、印章 OCR 补充三条
+        # 缓解链会同时静默失效，日志上表现为"一切正常"。实测灰色印章
+        # （R−G≈+1）因此长期无人察觉，必须显式记录负结果。
+        logger.info(
+            f"印章去除——未命中红色印章（{len(images_list)} 页），"
+            f"零白化；若文档实际含印章，检查其是否为非红色油墨"
+        )
     return total

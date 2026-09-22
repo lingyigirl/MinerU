@@ -901,6 +901,34 @@ def _make_kvp_content_list(
     return content_list
 
 
+# [自定义] 改道 VLM 时不再执行的 hybrid 专属后处理钩子。
+# 这些钩子串行位于 hybrid_model_output_to_middle_json.finalize_middle_json 内，
+# VLM 路由不经过该函数，故整组跳过。改道日志中显式点名，避免"输出目录叫
+# hybrid_auto 就以为 hybrid 钩子都跑过了"的误判——滕悦银行流水印章叠印表头
+# 问题即因守卫 11 当时只挂在 hybrid 钩子内而被整组跳过，且日志上无任何痕迹。
+_VLM_ROUTE_SKIPPED_HOOKS = (
+    "印章 OCR 补充",
+    "表格 OCR 补充（含守卫 5/7/12/13）",
+    "标题救援",
+    "发票字段救援",
+)
+
+
+def _log_vlm_reroute(doc_type_value: str, strategy: str) -> None:
+    """记录改道 VLM 的路由日志，并点名被跳过的 hybrid 专属钩子。
+
+    表头一致性归一化（守卫 11 扩展版）已下沉到 VLM 后端自己的
+    finalize_middle_json，两条路由都执行，故不在跳过清单内。
+    """
+    logger.info(
+        f"[路由] {doc_type_value} → VLM（策略 {strategy}，跳过 OCR 补充）"
+    )
+    logger.info(
+        "[路由] 本路由不执行以下 hybrid 专属钩子："
+        + "、".join(_VLM_ROUTE_SKIPPED_HOOKS)
+    )
+
+
 def _try_smart_routing(
     pdf_file_names: list[str],
     pdf_bytes_list: list[bytes],
@@ -1045,10 +1073,7 @@ def _try_smart_routing(
             # 策略来源（STRUCTURED_TABLE 已在其中改为 vlm-auto-engine）。
             if (route.engine_backend == "vlm-auto-engine"
                     and _allow_backend_reroute):
-                logger.info(
-                    f"[路由] {doc_type_result.value} → VLM"
-                    f"（策略 {route.strategy}，跳过 OCR 补充）"
-                )
+                _log_vlm_reroute(doc_type_result.value, route.strategy)
                 # 与官方 do_parse 的 vlm 分支一致：auto-engine → 具体引擎 + VLM 开关
                 vlm_backend = _resolve_vlm_backend_and_env(formula_enable, table_enable)
                 # 落盘到按请求参数推导的 hybrid_* 目录，保持调用方目录契约；
@@ -1103,10 +1128,7 @@ def _try_smart_routing(
             route = select_engine_route(doc_type=doc_type_result, quality=quality)
 
             if route.engine_backend == "vlm-auto-engine":
-                logger.info(
-                    f"[路由] general({doc_type_result.value}) → VLM"
-                    f"（策略 {route.strategy}，跳过 OCR 补充）"
-                )
+                _log_vlm_reroute(f"general({doc_type_result.value})", route.strategy)
                 # 与官方 do_parse 的 vlm 分支一致：auto-engine → 具体引擎 + VLM 开关
                 vlm_backend = _resolve_vlm_backend_and_env(formula_enable, table_enable)
                 # 落盘到按请求参数推导的 hybrid_* 目录，保持调用方目录契约；
