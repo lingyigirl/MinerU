@@ -336,6 +336,47 @@ def get_seal_removal_max_area_ratio() -> float:
     )
 
 
+# --- 表头一致性归一化 ---
+
+def get_table_header_consensus_enable() -> bool:
+    """是否启用跨页表头一致性归一化（守卫 11 扩展版）。
+
+    双向（前缀/后缀）污染检测 + 印章文本子串校验，用于修复 VLM 将印章
+    叠印文字合并进表头的问题（"专用章转出金额" → "转出金额"）。
+
+    环境变量：MINERU_TABLE_HEADER_CONSENSUS
+    JSON 键：  custom.table_header_consensus_enable
+    默认值：  True
+    """
+    return get_bool(
+        "table_header_consensus_enable",
+        env_var="MINERU_TABLE_HEADER_CONSENSUS",
+        default=True,
+    )
+
+
+# --- 金额千分位回写 ---
+
+def get_amount_sep_repair_enable() -> bool:
+    """是否启用金额千分位逗号被读成点号的回写（确定性重编码）。
+
+    VLM 生成表格 HTML 时会把千分位 `,` 读成 `.`（`3,991,623.04` →
+    `3.991.623.04`）。该形态是「不可能的数字」（十进制只有一个小数点，
+    且每组恰好 3 位、尾段 2 位），故可无损解码为逗号形态，非猜测。
+    仅改写经列级金额投票确认的列内整格匹配；见
+    table_utils/amount_sep_repair.py。
+
+    环境变量：MINERU_AMOUNT_SEP_REPAIR
+    JSON 键：  custom.amount_sep_repair_enable
+    默认值：  True
+    """
+    return get_bool(
+        "amount_sep_repair_enable",
+        env_var="MINERU_AMOUNT_SEP_REPAIR",
+        default=True,
+    )
+
+
 # --- KVP 引擎 ---
 
 def get_kvp_engine() -> str:
@@ -406,6 +447,10 @@ __all__ = [
     # 旋转几何判据
     "get_rotate_geom_enable",
     "get_rotate_geom_majority_min",
+    # 表头一致性归一化
+    "get_table_header_consensus_enable",
+    # 金额千分位回写
+    "get_amount_sep_repair_enable",
     # KVP
     "get_kvp_engine",
     "get_kvp_server_url",

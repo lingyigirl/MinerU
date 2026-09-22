@@ -290,6 +290,38 @@ def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm
                 f"OCR 表格单元格补充执行失败，将使用原始表格 HTML: {exc}"
             )
 
+    # [自定义] 跨页表头一致性归一化（守卫 11 扩展版）
+    # 双向（前缀/后缀）污染检测 + 印章文本子串校验，必须早于
+    # build_para_blocks_from_preproc 执行，否则 para_blocks 内表头结构不可逆。
+    # 已在 VLM 后端的 finalize_middle_json 内独立调用，此处在 hybrid 后端
+    # 保持一致，避免两条路由行为分叉。
+    try:
+        from mineru.utils.custom.config import get_table_header_consensus_enable
+        if get_table_header_consensus_enable():
+            from mineru.utils.custom.table_utils.header_consensus import (
+                normalize_table_headers_across_pages,
+            )
+            normalize_table_headers_across_pages(pdf_info_list)
+    except Exception as exc:
+        logger.warning(f"表头一致性归一化执行失败，将跳过: {exc}")
+
+    # [自定义] 金额千分位逗号被读成点号的确定性回写（VLM 原生缺陷）
+    # VLM 生成表格 HTML 时会把千分位 `,` 读成 `.`（3,991,623.04 →
+    # 3.991.623.04）。该形态不是合法十进制数（小数点唯一），故按「非末位
+    # 分隔符即千分位」无损解码，非猜测；闸门为列级金额投票 + 整格匹配。
+    # 必须在 build_para_blocks_from_preproc 之前执行——表 HTML 此后被复制进
+    # para_blocks 与 content_list，再改不可逆；且需晚于 OCR 补充（看最终文本）。
+    # 开关 MINERU_AMOUNT_SEP_REPAIR（默认开启）/ JSON custom.amount_sep_repair_enable。
+    try:
+        from mineru.utils.custom.config import get_amount_sep_repair_enable
+        if get_amount_sep_repair_enable():
+            from mineru.utils.custom.table_utils.amount_sep_repair import (
+                repair_dotted_amount_separators,
+            )
+            repair_dotted_amount_separators(pdf_info_list)
+    except Exception as exc:
+        logger.warning(f"金额千分位回写执行失败，将跳过: {exc}")
+
     # [自定义] 将被误判为 header 的居中短标题从 discarded_blocks 救回正文，
     # 必须在 build_para_blocks_from_preproc 之前执行，否则救回的标题不会进入 para_blocks。
     # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块

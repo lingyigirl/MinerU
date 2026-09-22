@@ -137,6 +137,31 @@ def append_page_blocks_to_middle_json(
 
 
 def finalize_middle_json(pdf_info_list):
+    # [自定义] 跨页表头一致性归一化（守卫 11 扩展版）
+    # 必须早于 build_para_blocks_from_preproc 执行，
+    # 否则 para_blocks 内表头结构不可逆。
+    try:
+        from mineru.utils.custom.config import get_table_header_consensus_enable
+        if get_table_header_consensus_enable():
+            from mineru.utils.custom.table_utils.header_consensus import normalize_table_headers_across_pages
+            normalize_table_headers_across_pages(pdf_info_list)
+    except Exception as exc:
+        logger.warning(f"表头一致性归一化执行失败: {exc}")
+
+    # [自定义] 金额千分位逗号被读成点号的确定性回写（VLM 原生缺陷）
+    # 缺陷源自 VLM 出表，hybrid 与 VLM 两条后端都会复现，故保持同调，
+    # 避免两条路由行为分叉（与上方表头一致性归一化同理）。
+    # 必须在 build_para_blocks_from_preproc 之前执行，表 HTML 此后不可逆。
+    try:
+        from mineru.utils.custom.config import get_amount_sep_repair_enable
+        if get_amount_sep_repair_enable():
+            from mineru.utils.custom.table_utils.amount_sep_repair import (
+                repair_dotted_amount_separators,
+            )
+            repair_dotted_amount_separators(pdf_info_list)
+    except Exception as exc:
+        logger.warning(f"金额千分位回写执行失败: {exc}")
+
     build_para_blocks_from_preproc(pdf_info_list)
     merge_para_text_blocks(pdf_info_list)
 

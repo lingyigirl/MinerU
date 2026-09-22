@@ -138,81 +138,15 @@ def _pick_title_span(content: object) -> str:
     return ""
 
 
-def _normalize_header_text_across_pages(pdf_info_list: list) -> None:
-    """跨页对齐表头文字：当某页表头以印章后缀结尾时，以纯文本基准归一化。
+def _normalize_header_text_across_pages(pdf_info_list):
+    """跨页对齐表头文字（保留兼容入口）。
 
-    规则（原则 9 跨页对照）：同一多页表格，若某页面某列表头文本以另一页面
-    同列表头文本为真前缀且长度差 ≤4 → 截断为该前缀。典型场景：VLM 将印章
-    叠印文字合并进表头（"转出金额专用章" → "转出金额"），非印章页的
-    同列正确表头作为基准。
-
-    Args:
-        pdf_info_list: 中间 JSON 页面列表（本函数就地修改 span["html"]）。
+    规则详见 header_consensus.normalize_table_headers_across_pages。
+    实现已迁至 header_consensus 模块，此处仅做路由转发。
+    VLM 后端直接调用 header_consensus.normalize_table_headers_across_pages。
     """
-    from mineru.backend.utils.para_block_utils import iter_block_spans
-    from mineru.utils.enum_class import ContentType
-
-    # col_idx → [(page_idx, table_idx, text, cell, soup, span, raw_html)]
-    entries: dict[int, list] = {}
-
-    for page_idx, page_info in enumerate(pdf_info_list):
-        table_idx = 0
-        for block in page_info.get("preproc_blocks", []):
-            for span in iter_block_spans(block):
-                if span.get("type") != ContentType.TABLE:
-                    continue
-                html = span.get("html", "")
-                if not html:
-                    continue
-                soup = BeautifulSoup(html, "html.parser")
-                table = soup.find("table")
-                if not table:
-                    continue
-                first_row = table.find("tr")
-                if not first_row:
-                    continue
-                for col_idx, cell in enumerate(first_row.find_all(["td", "th"])):
-                    text = cell.get_text().strip()
-                    if text and len(text) >= 2:
-                        entries.setdefault(col_idx, []).append(
-                            (page_idx, table_idx, text, cell, soup, span, html)
-                        )
-                table_idx += 1
-
-    for col_idx, col_entries in entries.items():
-        if len(col_entries) < 2:
-            continue
-        # 找最短文本作为基准
-        texts = [e[2] for e in col_entries]
-        base = min(texts, key=len)
-        if len(base) < 2:
-            continue
-
-        for page_idx, table_idx, text, cell, soup, span, raw_html in col_entries:
-            if text == base:
-                continue
-            if not text.startswith(base):
-                continue
-            length_diff = len(text) - len(base)
-            if length_diff <= 0 or length_diff > 4:
-                continue  # 不是单纯后缀（或后缀太长）
-
-            # 该表头是基准的超集（多了一个印章后缀），替换
-            for child in list(cell.children):
-                child.extract()
-            cell.string = base
-            # 序列化并更新 span["html"]
-            _new_html = str(soup)
-            if span.get("html", "") == raw_html:
-                span["html"] = _new_html
-            else:
-                logger.warning(
-                    f"守卫 11: span html changed since read (col{col_idx}), skip"
-                )
-            logger.debug(
-                f"守卫 11 跨页表头归一化: 列{col_idx} "
-                f"{text!r} -> {base!r} (长度差 {len(text)-len(base)})"
-            )
+    from .header_consensus import normalize_table_headers_across_pages as _fn
+    _fn(pdf_info_list)
 
 
 def supplement_vlm_table_cells_with_ocr(
@@ -402,11 +336,8 @@ def supplement_vlm_table_cells_with_ocr(
             f"跳过 {skipped_count} 个表格"
         )
 
-    # === [自定义] 守卫 11：跨页表头印章后缀剥离 ===
-    # VLM 有时将印章叠印文字与表头合并（如 "转出金额专用章" 应为 "转出金额"），
-    # 本步骤以跨页同列表头为基准做后缀剥离（仅改表头显示文本，不改列类型）。
-    # 原则 9 跨页对照：同一表格跨多页时，非印章页的正确表头作为基准。
-    _normalize_header_text_across_pages(pdf_info_list)
+    # （表头一致性归一化已迁至各后端 finalize_middle_json 中独立调用，
+    #  不在此处重复执行以避免 VLM/hybrid 双路径双跑。）
 
 
 __all__ = [
