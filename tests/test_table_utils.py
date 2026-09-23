@@ -16,6 +16,8 @@ from bs4 import BeautifulSoup
 
 from mineru.utils.custom.table_utils import (
     extract_column_header_prefixes,
+    fix_summary_row_yen_position,
+    normalize_invoice_table,
     split_summary_from_data_cell,
 )
 
@@ -126,9 +128,129 @@ def test_split_summary_from_data_cell_splits_invoice():
     assert "*供电*电费" in out, f"数据标签「*供电*电费」应保留，实际 {out}"
 
 
+def _rendered_grid(html: str) -> tuple[dict, int]:
+    """按 HTML 表格算法（rowspan/colspan 占位避让）模拟渲染网格。
+
+    rowspan 是"跨行占位"语义：声明列索引只描述 DOM 顺序，浏览器渲染时
+    会跳过已被上方 rowspan 占用的列。断言必须落在渲染列上，否则无法
+    发现"声明位置对、实际错列"的缺陷。
+
+    Args:
+        html: 表格 HTML 字符串。
+
+    Returns:
+        (grid, total_cols)：grid 为 {(row, col): (tag, origin)}，
+        origin 为该单元格自身的起止 (row, col)，用于识别 rowspan 续行。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    grid = {}
+    for r, tr in enumerate(soup.find_all("tr")):
+        c = 0
+        for td in tr.find_all(["td", "th"]):
+            while (r, c) in grid:
+                c += 1
+            rowspan = int(td.get("rowspan", 1))
+            colspan = int(td.get("colspan", 1))
+            for dr in range(rowspan):
+                for dc in range(colspan):
+                    grid[(r + dr, c + dc)] = (td, (r, c))
+            c += colspan
+    total_cols = max(c for _, c in grid) + 1
+    return grid, total_cols
+
+
+def _rendered_col_of(
+    grid: dict,
+    text: str,
+    origin_row: int | None = None,
+) -> int:
+    """返回渲染网格中首个自身文本含 text 的单元格起始列号。
+
+    Args:
+        grid: _rendered_grid 返回的网格。
+        text: 目标单元格自身文本（子串匹配）。
+        origin_row: 限定单元格起始行；None 表示不限。
+        （同一文本可能出现在多行，如「价税合计(大写)」格内的 (小写)¥ 值。）
+    """
+    cols = sorted(
+        c for (r, c), (td, origin) in grid.items()
+        if text in td.get_text() and origin == (r, c)
+        and (origin_row is None or origin[0] == origin_row)
+    )
+    assert cols, f"渲染网格中未找到含「{text}」的单元格"
+    return cols[0]
+
+
+def test_summary_row_yen_aligns_after_rowspan_clamp() -> None:
+    """数据行 rowspan 越过合计行时，¥ 值仍须与「金额」列同格渲染。
+
+    复现场景：202305水费.pdf 第 5 页增值税发票。VLM 把项目行的金额/税率/税额
+    与合计行同列内容各拼成一个 rowspan="2" 单元格（印刷发票项目行与合计行之间
+    无分隔线，是这类拼接的高发场景）：
+        <td rowspan="2">金额25659.20¥25659.20</td>
+
+    后处理提取 ¥ 值搬到合计行时保留了源单元格的 rowspan，而合计行按展开列索引
+    落座：合计行第 7 列已被数据行 rowspan 占住，声明在第 7 列的 ¥ 值被渲染网格
+    挤到虚拟第 11 列（密码区下方），整表渲染列数由 11 膨胀到 15。
+    """
+    table_html = (
+        "<table>"
+        "<tr><td>购 买 方</td><td colspan=\"5\">名称:某公司</td>"
+        "<td>密 码 区</td><td colspan=\"4\">x</td></tr>"
+        "<tr><td colspan=\"2\">货物或应税劳务、服务名称*劳务*1类生产污水</td>"
+        "<td>规格型号</td><td>单位</td><td>数量18328</td><td colspan=\"2\">单价1.4</td>"
+        '<td rowspan="2">金额25659.20¥25659.20</td>'
+        '<td rowspan="2">税率免税</td><td rowspan="2" colspan="2">税额***</td></tr>'
+        '<tr><td colspan="2">合计</td><td></td><td></td><td></td><td colspan="2"></td></tr>'
+        '<tr><td colspan="2">价税合计(大写)</td>'
+        '<td colspan="9">贰万伍仟陆佰伍拾玖圆贰角整 (小写)¥25659.20</td></tr>'
+        "</table>"
+    )
+    out = fix_summary_row_yen_position(
+        normalize_invoice_table(extract_column_header_prefixes(table_html))
+    )
+
+    grid, total_cols = _rendered_grid(out)
+    soup = BeautifulSoup(out, "html.parser")
+    tr_tags = soup.find_all("tr")
+    declared_cols = len(next(tr for tr in tr_tags if tr.find("th")).find_all("th"))
+    # 合计行自身的行号：「价税合计(大写)」行内也含 (小写)¥ 值，须按行限定
+    summary_idx = next(
+        i for i, tr in enumerate(tr_tags)
+        if tr.find_all("td") and tr.find_all("td")[0].get_text().strip() == "合计"
+    )
+
+    # ¥ 值必须与「金额」表头同列渲染（而非被 rowspan 挤到虚拟列）
+    yen_col = _rendered_col_of(grid, "¥25659.20", origin_row=summary_idx)
+    amount_col = _rendered_col_of(grid, "金额")
+    assert yen_col == amount_col, (
+        f"合计行 ¥25659.20 应渲染在「金额」列(col={amount_col})，"
+        f"实际渲染在 col={yen_col}"
+    )
+
+    # 不得出现声明列以外的虚拟列（rowspan 越界会撑出 phantom 列）
+    assert total_cols == declared_cols, (
+        f"渲染列数({total_cols})应与表头声明列数({declared_cols})一致，"
+        f"多余列说明仍有数据行 rowspan 越过合计行"
+    )
+
+    # ¥ 值已从项目行移出（只留在合计行，且只有一格）
+    rows = _row_texts(out)
+    summary_row = next(r for r in rows if r and r[0] == "合计")
+    assert sum(1 for c in summary_row if "¥" in c) == 1, (
+        f"合计行应恰有一格 ¥ 值，实际 {summary_row}"
+    )
+    data_row = next(r for r in rows if any("1类生产污水" in c for c in r))
+    assert "25659.20" in data_row, f"项目行应保留金额值，实际 {data_row}"
+    assert not any("¥" in c for c in data_row), (
+        f"项目行不应残留 ¥ 值（已搬至合计行），实际 {data_row}"
+    )
+
+
 if __name__ == "__main__":
     test_extract_column_header_prefixes_splits_spaced_keyword()
     test_extract_column_header_prefixes_keeps_compact_keyword()
     test_split_summary_from_data_cell_skips_financial_statement()
     test_split_summary_from_data_cell_splits_invoice()
-    print("✅ table_utils 列名拆分 + 合计拆分回归测试通过")
+    test_summary_row_yen_aligns_after_rowspan_clamp()
+    print("✅ table_utils 列名拆分 + 合计拆分 + 合计行 rowspan 回归测试通过")

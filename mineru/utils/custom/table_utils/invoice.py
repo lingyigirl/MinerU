@@ -691,6 +691,17 @@ def fix_summary_row_yen_position(html: str) -> str:
 
     for table in soup.find_all("table"):
         try:
+            # 先收缩跨越合计行的 rowspan，再修复合计行 ¥ 值列位置。
+            # 若数据行 rowspan 越过合计行，其声明的列索引与实际渲染列错位，
+            # 按展开列索引落座的 ¥ 值会被挤到虚拟列，整表渲染列数膨胀。
+            summary_row = None
+            for row in table.find_all("tr"):
+                cells = row.find_all("td")
+                if cells and cells[0].get_text().strip() in ("合计", "合"):
+                    summary_row = row
+                    break
+            if summary_row is not None:
+                _clamp_rowspan_crossing_summary_row(table, summary_row)
             _fix_summary_row_yen_for_th_table(table, soup)
         except Exception:
             logger.exception("fix_summary_row_yen_position 处理单个表格时出错，跳过")
@@ -828,11 +839,59 @@ def _fix_summary_row_yen_for_th_table(
     )
 
 
+def _clamp_rowspan_crossing_summary_row(
+    table: Tag,
+    summary_row: Tag,
+) -> int:
+    """收缩跨越合计行的 rowspan，返回修正的单元格数。
+
+    合计行是独立的一行，不应被上方数据行的 rowspan 侵占。
+    VLM 常把「数据行值 + 合计行值」拼成一个 rowspan=N 单元格
+    （发票项目行与合计行之间无分隔线时高发），使合计行的声明列索引
+    与实际渲染列错位：按展开列索引放置的 ¥ 值被挤到虚拟列，
+    整表渲染列数膨胀。与 ocr_fill 重建行时「只复制 colspan、
+    丢弃 rowspan」的约定保持一致。
+
+    仅收缩"越过"合计行的部分：跨多条项目行的 rowspan 保留，
+    只截断到合计行之前（clamp 至 summary_idx - r）。
+
+    Args:
+        table: BeautifulSoup 的 <table> 标签。
+        summary_row: 合计行（首格文本为"合计"/"合"）。
+
+    Returns:
+        被修正的单元格数量。
+    """
+    rows = table.find_all("tr")
+    try:
+        sidx = rows.index(summary_row)
+    except ValueError:
+        return 0
+    fixed = 0
+    for r in range(sidx):
+        for td in rows[r].find_all(["td", "th"]):
+            rs = int(td.get("rowspan", 1) or 1)
+            if rs <= 1 or r + rs <= sidx:
+                continue
+            new_rs = max(1, sidx - r)
+            if new_rs > 1:
+                td["rowspan"] = str(new_rs)
+            else:
+                del td["rowspan"]
+            fixed += 1
+            logger.info(
+                f"收缩越界 rowspan：行{r} 单元格'{td.get_text().strip()[:12]}' "
+                f"rowspan {rs}→{new_rs}（不侵占合计行 r{sidx}）"
+            )
+    return fixed
+
+
 __all__ = [
     '_INFO_LINE_BREAK_RE',
     '_VAT_INVOICE_COLUMN_SIGNATURE',
     '_VAT_INVOICE_NAME_LABELS',
     '_VAT_INVOICE_ROW_LABELS',
+    '_clamp_rowspan_crossing_summary_row',
     '_fix_summary_row_yen_for_th_table',
     '_format_summary_row_colspan',
     '_has_significant_rowspan',
