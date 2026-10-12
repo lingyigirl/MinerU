@@ -187,6 +187,61 @@ def get_infer_missing_table_values() -> bool:
     )
 
 
+# --- 表格内联图 OCR 补回 ---
+
+def get_inline_image_ocr_enable() -> bool:
+    """是否启用表格内联图（VLM 误判为 image 的手写字段）OCR 文本补回。
+
+    VLM 把手写字段（户名/账号）判成 image block 后，mineru_vl_utils 会将其吸收
+    进表格 HTML（<img src="data:...">），该区域因此没有任何文本。本开关启用
+    反查定位 + 扩边 OCR + 标签锚定写回（详见 custom/table_utils/inline_image_ocr.py）。
+
+    环境变量：MINERU_INLINE_IMAGE_OCR
+    JSON 键：  custom.inline_image_ocr_enable
+    默认值：  True
+    """
+    return get_bool(
+        "inline_image_ocr_enable",
+        env_var="MINERU_INLINE_IMAGE_OCR",
+        default=True,
+    )
+
+
+def get_inline_image_ocr_pad_px() -> int:
+    """内联图 OCR 前从页面重裁的扩边像素（页面像素坐标）。
+
+    取值依据：实测 200 DPI 定期存单「户名」值——扩边 6/10/16px 识别为
+    '陈汉武'（0.996/0.999/0.998），不扩边为垃圾（'随'/0.657），24px 起旁边
+    印刷行被卷入、置信度回落。默认 10px 居中且两侧留余量。
+
+    环境变量：MINERU_INLINE_IMAGE_OCR_PAD_PX
+    JSON 键：  custom.inline_image_ocr_pad_px
+    默认值：  10
+    """
+    return get_int(
+        "inline_image_ocr_pad_px",
+        env_var="MINERU_INLINE_IMAGE_OCR_PAD_PX",
+        default=10,
+    )
+
+
+def get_inline_image_match_min_score() -> float:
+    """data URI 反查页面的模板匹配最低分（TM_CCOEFF_NORMED）。
+
+    取值依据：表格内联图的 data URI 是页面的整数像素精确子图，实测正确匹配
+    0.9967~0.9980，误匹配不可能达到该量级；0.9 留出跨渲染/白化差异余量。
+
+    环境变量：MINERU_INLINE_IMAGE_MATCH_MIN_SCORE
+    JSON 键：  custom.inline_image_match_min_score
+    默认值：  0.9
+    """
+    return get_float(
+        "inline_image_match_min_score",
+        env_var="MINERU_INLINE_IMAGE_MATCH_MIN_SCORE",
+        default=0.9,
+    )
+
+
 # --- span 字符游程救援 ---
 
 def get_span_gap_rescue_enable() -> bool:
@@ -283,6 +338,46 @@ def get_rotate_geom_majority_min() -> float:
         "rotate_geom_majority_min",
         env_var="MINERU_ROTATE_GEOM_MAJORITY_MIN",
         default=0.8,
+    )
+
+
+# --- 图块级旋转门控 ---
+
+def get_sub_image_rotate_enable() -> bool:
+    """是否启用图块级朝向旋转（cut_image 与表格内联图落盘前）。
+
+    图块级指 span 裁剪图（image/table/chart/公式/印章）与表格 HTML 内联图，
+    与页面级（generate_rotation_corrected_pdf）是两条独立路径。
+
+    环境变量：MINERU_SUB_IMAGE_ROTATE
+    JSON 键：  custom.sub_image_rotate_enable
+    默认值：  True（置 false 后所有图块一律不旋转，保留原图）
+    """
+    return get_bool(
+        "sub_image_rotate_enable",
+        env_var="MINERU_SUB_IMAGE_ROTATE",
+        default=True,
+    )
+
+
+def get_sub_image_rotate_min_conf() -> float:
+    """图块级旋转的最小置信度阈值（非 "0" 标签必须达标才旋转）。
+
+    取值依据（200 DPI 定期存单实测，8 张落盘图 4 张被错转）：朝向分类器对小尺寸/
+    宽扁图块判别力极低，四类概率全落在 0.185~0.443 的噪声带内（均匀基线 0.25）。
+    四张误转图（户名值/金额大写/名章/印章小）的 conf 为 0.403/0.304/0.325/0.295，
+    上限 0.403；正立且判对（label="0"）的图块 conf 0.408~0.449，不参与门控。
+    θ=0.45 可拦下全部实测误转，且与页面级 θ=0.45（pdf_utils）同值同心智模型。
+    置 0 可恢复旧行为（无门槛，argmax 即旋转）。
+
+    环境变量：MINERU_SUB_IMAGE_ROTATE_MIN_CONF
+    JSON 键：  custom.sub_image_rotate_min_conf
+    默认值： 0.45
+    """
+    return get_float(
+        "sub_image_rotate_min_conf",
+        env_var="MINERU_SUB_IMAGE_ROTATE_MIN_CONF",
+        default=0.45,
     )
 
 
@@ -436,6 +531,10 @@ __all__ = [
     # OCR 表格
     "get_table_ocr_min_confidence",
     "get_infer_missing_table_values",
+    # 表格内联图 OCR 补回
+    "get_inline_image_ocr_enable",
+    "get_inline_image_ocr_pad_px",
+    "get_inline_image_match_min_score",
     # span 游程救援
     "get_span_gap_rescue_enable",
     "get_span_gap_rescue_ratio",
@@ -447,6 +546,9 @@ __all__ = [
     # 旋转几何判据
     "get_rotate_geom_enable",
     "get_rotate_geom_majority_min",
+    # 图块级旋转门控
+    "get_sub_image_rotate_enable",
+    "get_sub_image_rotate_min_conf",
     # 表头一致性归一化
     "get_table_header_consensus_enable",
     # 金额千分位回写

@@ -426,7 +426,8 @@ def cut_image(
     crop_img = get_crop_img(bbox, page_pil_img, scale=scale)
 
     # direction detection and rotation correction for sub-images
-    crop_img = _rotate_sub_image(crop_img)
+    # [自定义] 传入落盘文件名作为来源，便于旋转/跳过的日志定位到具体图片
+    crop_img = _rotate_sub_image(crop_img, source=img_hash256_path)
 
     img_bytes = image_to_bytes(crop_img, image_format="JPEG")
 
@@ -501,13 +502,20 @@ def _get_orientation_cls_model():
     return _orientation_cls_model
 
 
-def _rotate_sub_image(crop_img: Image.Image) -> Image.Image:
+def _rotate_sub_image(crop_img: Image.Image, source: str = "") -> Image.Image:
     """Detect and rotate sub-images (seals, embedded images, table crops)."""
-    cls_model = _get_orientation_cls_model()
-    label = cls_model.predict_direct(crop_img)
-    if label != "0":
-        crop_img = cls_model.rotate_pil_image(crop_img, label)
-    return crop_img
+    # [自定义] 图块级旋转增加置信度门控（阈值/开关见 mineru/utils/custom/config.py）：
+    # 原实现直接取朝向分类器 argmax 旋转，而该模型对小尺寸/宽扁图块的判别力极低
+    # （四类概率落在 0.185~0.443 噪声带内），导致手写值/名章/金额行被错转 180°/270°。
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.sub_image_rotate import rotate_sub_image_if_confident
+        return rotate_sub_image_if_confident(
+            crop_img, cls_model=_get_orientation_cls_model(), source=source
+        )
+    except Exception:
+        logger.exception("图块级旋转门控执行失败，保留原图")
+        return crop_img
 
 
 def getPilImageBytes(images_list):

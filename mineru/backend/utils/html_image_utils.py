@@ -9,6 +9,7 @@ from loguru import logger
 from mineru.backend.utils.office_image import is_vector_image_part, serialize_office_image
 from mineru.utils.enum_class import BlockType, ContentType
 from mineru.utils.hash_utils import str_sha256
+# [自定义] 表格 HTML 内联图的落盘需经图块级旋转门控（custom/sub_image_rotate.py）
 from mineru.utils.pdf_image_tools import _rotate_sub_image
 from mineru.utils.pdf_reader import image_to_bytes
 
@@ -105,7 +106,8 @@ def save_base64_image(b64_data_uri: str, image_writer, page_index: int):
         pil_img = Image.open(BytesIO(img_bytes))
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        pil_img = _rotate_sub_image(pil_img)
+        # [自定义] 传入来源标识；门控（置信度阈值 + INFO 日志）在 _rotate_sub_image 内
+        pil_img = _rotate_sub_image(pil_img, source=f"表格内联图:page={page_index}")
         save_fmt = "JPEG" if fmt == "jpg" else fmt.upper()
         img_bytes = image_to_bytes(pil_img, image_format=save_fmt)
     except Exception as e:

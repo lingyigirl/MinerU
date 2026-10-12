@@ -4,6 +4,10 @@
 与上游 pdf_image_tools.py 解耦，便于合并上游更新。
 """
 
+from typing import Any
+
+from PIL import Image
+
 from mineru.utils.custom.config import (
     get_rotate_geom_enable,
     get_rotate_geom_majority_min,
@@ -65,6 +69,22 @@ def _get_classified_rotation(cls_model, pil_img) -> tuple[str, float]:
     label = cls_model.labels[int(np.argmax(probs))]
     conf = float(probs.max())
     return label, conf
+
+
+def get_classified_rotation(cls_model: Any, pil_img: Image.Image) -> tuple[str, float]:
+    """单页/图块朝向分类的公开入口，返回 (label, softmax 置信度)。
+
+    与 _get_classified_rotation 同源共用实现，供图块级门控
+    （mineru/utils/custom/sub_image_rotate.py）复用，避免重复实现 softmax。
+
+    Args:
+        cls_model: PaddleOrientationClsModel 实例（或其鸭子类型替身）。
+        pil_img: 待分类的 PIL 图像。
+
+    Returns:
+        (label, conf)：label ∈ {"0","90","180","270"}，conf 为 argmax 概率。
+    """
+    return _get_classified_rotation(cls_model, pil_img)
 
 
 def generate_rotation_corrected_pdf(
