@@ -10,16 +10,19 @@
 #
 # 当前模块：
 # - pdf_utils.py: PDF 页面图像预处理（旋转修正 generate_rotation_corrected_pdf
-#   + 红色印章去除）
+#   + 红色印章去除 + 朝向分类公开入口 get_classified_rotation）
+# - sub_image_rotate.py: 图块级朝向旋转的置信度门控（_rotate_sub_image 的落点）
 # - seal_removal.py: 红色印章像素去除（守卫规则：膨胀合并笔画 + 印章状区域判定）
 # - content_list_utils.py: content_list_v2 后处理（list_item 独立 bbox）
 # - table_utils/: VLM 表格 HTML 后处理（包，按功能域拆分）
 #   对外仍统一从 mineru.utils.custom.table_utils 导入：
 #   split_merged_table_cells, split_summary_from_data_cell,
 #   normalize_table_colspan, normalize_invoice_table,
-#   supplement_empty_table_cells, supplement_vlm_table_cells_with_ocr
+#   supplement_empty_table_cells, supplement_vlm_table_cells_with_ocr,
+#   supplement_table_inline_images_with_ocr
 #   子模块：_common / detect / merge_split / summary / invoice /
-#          ocr_guards / ocr_align / ocr_fill / header_prefix / ocr_supplement
+#          ocr_guards / ocr_align / ocr_fill / header_prefix / ocr_supplement /
+#          inline_image_ocr
 #   新增表格函数请放入对应子模块，并由该子模块 __all__ 导出
 # - doc_quality.py: S0 文档质量分析器（DPI/模糊/印章/旋转检测）
 # - doc_classifier.py: S1 文档分类器（"信号灯"三路路由：通用/表格/表单）

@@ -21,6 +21,7 @@
     header_consensus.py 跨页表头一致性归一化（守卫 11 扩展版，双向污染 + 印章校验）
     amount_sep_repair.py 金额千分位逗号被读成点号的确定性回写（列级金额投票闸门）
     ocr_supplement.py 印章采集与 VLM 表格 OCR 补充编排
+    inline_image_ocr.py 表格内联图（VLM 误判为 image 的手写字段）OCR 文本补回
 
 调用链【阶段 B：内容生成钩子】入口 _format_embedded_html
 （vlm_middle_json_mkcontent.py），按固定顺序串行调用：
@@ -41,6 +42,12 @@
   repair_dotted_amount_separators     金额千分位点号回写（VLM 天然缺陷，列级投票闸门；
                                        hybrid 与 VLM 后端同调，早于
                                        build_para_blocks_from_preproc）
+
+调用链【阶段 A′：表格内联图补回】入口 blocks_to_page_info
+（hybrid/vlm 的 model_output_to_middle_json.py），早于 replace_inline_table_images
+（此时 HTML 内仍是 data URI，可反查 bbox，且页面图仍在内存）：
+  supplement_table_inline_images_with_ocr  模板匹配反查 bbox + 页面扩边重裁 OCR +
+                                       标签锚定写回（户名/账号/客户号 白名单）
 
 【发票检测与归一化】
   _is_invoice_table                发票表级检测（≥3 关键词）
@@ -74,6 +81,7 @@ from mineru.utils.custom.table_utils.header_prefix import *  # noqa: F401,F403
 from mineru.utils.custom.table_utils.header_consensus import *  # noqa: F401,F403
 from mineru.utils.custom.table_utils.amount_sep_repair import *  # noqa: F401,F403
 from mineru.utils.custom.table_utils.ocr_supplement import *  # noqa: F401,F403
+from mineru.utils.custom.table_utils.inline_image_ocr import *  # noqa: F401,F403
 
 # 子模块本身也挂到包上，便于按域直接引用与调试
 from mineru.utils.custom.table_utils import (  # noqa: F401
@@ -89,6 +97,7 @@ from mineru.utils.custom.table_utils import (  # noqa: F401
     header_consensus,
     amount_sep_repair,
     ocr_supplement,
+    inline_image_ocr,
 )
 
 
@@ -107,6 +116,7 @@ def _collect_all() -> list:
         header_consensus,
         amount_sep_repair,
         ocr_supplement,
+        inline_image_ocr,
     ]
     names: list = []
     for module in modules:

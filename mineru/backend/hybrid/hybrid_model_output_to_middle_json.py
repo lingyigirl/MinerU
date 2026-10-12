@@ -114,6 +114,21 @@ def blocks_to_page_info(
             )
             span = cut_image_and_table(span, crop_src, page_img_md5, page_index, image_writer, scale=scale)
 
+    # [自定义] 表格内联图（VLM 误判为 image 的手写字段）OCR 文本补回。
+    # 必须在 replace_inline_table_images 之前：此时 HTML 内仍是 data URI
+    # （页面像素精确子图，可模板匹配反查 bbox），且 page_pil_img 仍在内存
+    # （finalize 阶段页面图已关闭，无法事后重裁）。
+    # 合并上游时注意：此 hook 只依赖 mineru/utils/custom/ 下的自定义模块
+    try:
+        from mineru.utils.custom.table_utils.inline_image_ocr import (
+            supplement_table_inline_images_with_ocr,
+        )
+        supplement_table_inline_images_with_ocr(
+            table_blocks, page_pil_img, scale, page_index=page_index
+        )
+    except Exception as exc:
+        logger.warning(f"表格内联图 OCR 补充执行失败，将跳过: {exc}")
+
     replace_inline_table_images(table_blocks, image_writer, page_index)
 
     page_blocks = []
