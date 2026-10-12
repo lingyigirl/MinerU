@@ -1,0 +1,27 @@
+================================================================
+  MinerU fork（develop）海光 BW1000 部署物料清单（方式 A）
+  生成时间: 2026-09-30 14:47:35
+  加速卡: 海光 BW1000（深算三号 DCU）/ 驱动 rock-6.3.8+ / DTK 25.04+
+  镜像 TAG: mineru:bw1000-fork-3.4.4
+  镜像大小: 30.2GB（导出压缩后 12G）
+================================================================
+
+文件:
+  - mineru-bw1000-fork-3.4.4.tar.gz    自包含镜像（fork 代码 + 模型烤入）
+  - compose-bw1000.yaml                Docker Compose 启动配置
+  - check_server_env.sh                环境检查脚本（部署前先跑）
+  - README-bw1000-deploy.md            部署操作指南（部署人员读这个）
+  - MANIFEST-bw1000.txt                本文件
+  - (创建指令见 README-bw1000-build.md / 脚本 build-bw1000.sh)
+
+镜像内模型:
+  - Pipeline: 2.5G
+  - VLM: 2.2G
+  - OriCls: 已包含
+
+部署步骤:
+  1. bash check_server_env.sh
+  2. gunzip -c /zhangbo/MinerU/offline-package-bw1000/mineru-bw1000-fork-3.4.4.tar.gz | docker load
+  3. 修改 compose-bw1000.yaml（DCU 卡号 + 路径）
+  4. docker compose -f compose-bw1000.yaml up -d
+================================================================

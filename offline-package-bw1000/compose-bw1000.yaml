@@ -1,0 +1,69 @@
+# ============================================================
+# MinerU fork（develop）海光 BW1000（深算三号）Docker Compose（方式 A）
+#
+# 使用前修改:
+#   1. CUDA_VISIBLE_DEVICES — 指定 DCU 卡号（dcu-smi 查看）
+#   2. 设备节点 — /dev/hycu* 是否与服务器实际路径一致
+#   3. 输出目录 — MINERU_API_OUTPUT_ROOT 落到持久化路径下
+#
+# 启动:
+#   docker compose -f compose-bw1000.yaml up -d
+# ============================================================
+services:
+  mineru-api:
+    image: mineru:bw1000-fork-3.4.4
+    container_name: mineru-bw1000
+    restart: always
+    privileged: true                 # DCU 设备访问需要
+    network_mode: host               # host 网络，服务直接监听宿主机端口
+    ipc: host
+    shm_size: "500g"                 # vLLM 需要的大共享内存
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    devices:
+      # rock-6.3.x+ 驱动（hycu 模块）设备节点
+      - "/dev/hycu0:/dev/hycu0"
+      # 如驱动版本使用 /dev/dri/* 设备节点，改为：
+      # - "/dev/dri:/dev/dri"
+      # 如驱动版本使用 /dev/hydcu* 节点（6.2.x 及以下），改为：
+      # - "/dev/hydcu0:/dev/hydcu0"
+    environment:
+      MINERU_MODEL_SOURCE: local
+      # MINERU_BACKEND 环境变量不在任何代码中读取，无实际作用
+      # API 请求的后端由 HTTP Form 参数 backend 控制（默认 hybrid-auto-engine）
+      # BW1000 需要显式传 backend=hybrid-transformers 绕过 vllm-async 引擎选择
+      # （原因：sync 端点内部走异步路径，auto 引擎选择在 is_async=True 时
+      #  选 vllm-async-engine，需 vllm≥0.10 的 AsyncLLM API，而 DCU 镜像
+      #  的 vllm 0.9.2 不支持；hybrid-transformers 直接使用 transformers 引擎，
+      #  已在镜像内验证当前 Qwen2VL 模型加载成功）
+      MINERU_VLM_FORMULA_ENABLE: "true"
+      MINERU_VLM_TABLE_ENABLE: "true"
+      MINERU_TABLE_MERGE_ENABLE: "true"
+      MINERU_PROCESSING_WINDOW_SIZE: "64"
+      CUDA_VISIBLE_DEVICES: "0"              # ← 指定 DCU 卡号（dcu-smi 查看）
+      MINERU_API_OUTPUT_ROOT: /data/mineru_output
+      MINERU_LOG_LEVEL: INFO
+      MINERU_LOG_FILE_ENABLE: "false"
+
+    volumes:
+      # ---- 输出目录（挂载宿主机目录，持久化） ----
+      - /data/mineru_output:/data/mineru_output
+
+    command:
+      mineru-api
+      --host 0.0.0.0
+      --port 8000
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
